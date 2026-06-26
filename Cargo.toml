@@ -1,0 +1,71 @@
+[package]
+name = "thunderstore-engine"
+version = "0.1.0"
+edition = "2024"
+description = "Game-agnostic Thunderstore engine: API client, caching, dependency resolution, zip extraction, and schema-driven mod-loader install rules"
+authors = ["Endoze <endoze@endozemedia.com>"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/endoze/thunderstore-engine"
+documentation = "https://docs.rs/thunderstore-engine"
+homepage = "https://github.com/endoze/thunderstore-engine"
+rust-version = "1.94.0"
+categories = ["game-development", "api-bindings"]
+keywords = ["thunderstore", "mod", "manager", "bepinex", "modding"]
+# Keep CI/release/dev tooling out of the published crate; consumers only need the
+# library sources and the bundled ecosystem snapshot.
+exclude = [
+  ".github/",
+  "dist-workspace.toml",
+  "cliff.toml",
+  "tarpaulin.toml",
+  "rustfmt.toml",
+]
+
+[lib]
+name = "thunderstore_engine"
+path = "src/lib.rs"
+
+[dependencies]
+chrono = "0.4.45"
+crc32fast = "1.5"
+futures = "0.3.32"
+reqwest = { version = "0.13.4", features = ["json", "stream"], default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+time = { version = "0.3.51", features = ["serde-well-known"] }
+tokio = { version = "1.32", features = ["full"] }
+tracing = "0.1.44"
+zip = "8.6"
+bincode = { version = "2.0", features = ["serde"] }
+zstd = "0.13.3"
+lasso = { version = "0.7", features = ["serialize"] }
+serde_yaml_ng = "0.10.0"
+base64 = "0.22"
+
+[dev-dependencies]
+mockito = "1.7"
+tempfile = "3.10.1"
+
+[features]
+# TLS backend selection. Pick exactly one. The default, `rustls-tls`, uses
+# rustls with the `aws-lc-rs` crypto provider, which needs a C toolchain to
+# build; `native-tls` links the platform's TLS stack instead and avoids that
+# build dependency. To choose native-tls, depend on this crate with
+# `default-features = false, features = ["native-tls"]`.
+default = ["rustls-tls"]
+rustls-tls = ["reqwest/rustls"]
+native-tls = ["reqwest/native-tls"]
+
+# Build docs.rs with the default `rustls-tls` backend. `native-tls` links the
+# platform OpenSSL, which a plain `--all-features` docs build cannot assume, so
+# the TLS features are never enabled together here.
+[package.metadata.docs.rs]
+all-features = false
+no-default-features = false
+
+# The profile that 'cargo dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
