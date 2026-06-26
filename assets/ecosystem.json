@@ -1,0 +1,65 @@
+{
+  "games": [
+    {
+      "slug": "valheim",
+      "display_name": "Valheim",
+      "steam_app_id": 892970,
+      "exe_names": ["valheim.exe", "valheim.x86_64"],
+      "mod_loader": {
+        "package_name": "denikson-BepInExPack_Valheim",
+        "file_target": "winhttp.dll",
+        "kind": "bepinex",
+        "default_subdir": "plugins",
+        "loader_root": "BepInExPack_Valheim",
+        "ignored_files": [],
+        "subdirs": [
+          { "name": "plugins", "target": "BepInEx/plugins", "mode": "separated" },
+          { "name": "patchers", "target": "BepInEx/patchers", "mode": "separated" },
+          { "name": "monomod", "target": "BepInEx/monomod", "mode": "separated", "extension": ".mm.dll" },
+          { "name": "core", "target": "BepInEx/core", "mode": "separated" },
+          { "name": "config", "target": "BepInEx/config", "mode": "untracked", "mutable": true }
+        ]
+      }
+    },
+    {
+      "slug": "lethal-company",
+      "display_name": "Lethal Company",
+      "steam_app_id": 1966720,
+      "exe_names": ["Lethal Company.exe"],
+      "mod_loader": {
+        "package_name": "BepInEx-BepInExPack",
+        "file_target": "winhttp.dll",
+        "kind": "bepinex",
+        "default_subdir": "plugins",
+        "loader_root": "BepInExPack",
+        "ignored_files": [],
+        "subdirs": [
+          { "name": "plugins", "target": "BepInEx/plugins", "mode": "separated" },
+          { "name": "patchers", "target": "BepInEx/patchers", "mode": "separated" },
+          { "name": "monomod", "target": "BepInEx/monomod", "mode": "separated", "extension": ".mm.dll" },
+          { "name": "core", "target": "BepInEx/core", "mode": "separated" },
+          { "name": "config", "target": "BepInEx/config", "mode": "untracked", "mutable": true }
+        ]
+      }
+    },
+    {
+      "slug": "boneworks",
+      "display_name": "BONEWORKS",
+      "steam_app_id": 823500,
+      "exe_names": ["BONEWORKS.exe"],
+      "mod_loader": {
+        "package_name": "LavaGang-MelonLoader",
+        "file_target": "version.dll",
+        "kind": "melonloader",
+        "default_subdir": "Mods",
+        "ignored_files": ["manifest.json", "icon.png", "README.md"],
+        "subdirs": [
+          { "name": "Mods", "target": "Mods", "mode": "flat", "extension": ".dll" },
+          { "name": "Plugins", "target": "Plugins", "mode": "flat" },
+          { "name": "UserLibs", "target": "UserLibs", "mode": "flat", "extension": ".lib.dll" },
+          { "name": "UserData", "target": "UserData", "mode": "flat" }
+        ]
+      }
+    }
+  ]
+}
