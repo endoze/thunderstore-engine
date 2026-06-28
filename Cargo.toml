@@ -7,6 +7,8 @@ authors = ["Endoze <endoze@endozemedia.com>"]
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/endoze/thunderstore-engine"
+documentation = "https://docs.rs/thunderstore-engine"
+homepage = "https://github.com/endoze/thunderstore-engine"
 rust-version = "1.94.0"
 categories = ["game-development", "api-bindings"]
 keywords = ["thunderstore", "mod", "manager", "bepinex", "modding"]
@@ -51,3 +53,8 @@ required-features = ["bench"]
 name = "search_benchmark"
 harness = false
 required-features = ["bench"]
+
+# The profile that 'cargo dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
