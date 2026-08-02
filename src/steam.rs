@@ -1,4 +1,15 @@
-//! Whether the running Steam client can resolve a path a caller hands it.
+//! Host facts about the Steam client: where its executable lives, and whether it
+//! can resolve a path a caller hands it.
+//!
+//! # Locating the executable
+//!
+//! [`crate::steam::steam_exe`] answers "what program starts Steam on this
+//! machine". Steam is on `PATH` on Linux, so a bare `steam` is correct there,
+//! but its Windows installer adds nothing to `PATH`: `CreateProcess` appends
+//! `.exe` to a bare program name yet still has nowhere to look, so the spawn
+//! fails outright and the ordinary Steam configuration cannot launch at all.
+//!
+//! # Namespace visibility
 //!
 //! Steam's launch options are a string the caller never opens itself: it names
 //! a wrapper script and a target directory, and *Steam* is what has to resolve
@@ -167,6 +178,128 @@ pub fn visibility(path: &Path) -> Visibility {
   Visibility::Unreachable { steam_pid }
 }
 
+/// The registry key Steam's Windows installer writes its own location into.
+const STEAM_REGISTRY_KEY: &str = r"Software\Valve\Steam";
+
+/// The value under [`STEAM_REGISTRY_KEY`] holding the full path to `steam.exe`.
+const STEAM_REGISTRY_VALUE: &str = "SteamExe";
+
+/// Environment variables naming the roots Steam installs under, in the order its
+/// installer prefers: a 32-bit application on 64-bit Windows lands in
+/// `Program Files (x86)`, and Steam is one.
+const PROGRAM_FILES_VARS: [&str; 2] = ["ProgramFiles(x86)", "ProgramFiles"];
+
+/// The directory Steam creates under a Program Files root.
+const STEAM_INSTALL_DIR: &str = "Steam";
+
+/// The Steam client executable's file name on Windows.
+const STEAM_EXE_NAME: &str = "steam.exe";
+
+/// The program name used when no executable can be located.
+///
+/// Correct on Linux and macOS, where the client is on `PATH`, and no worse than a
+/// bare `steam` on a Windows host that has had Steam put on `PATH` by hand.
+const STEAM_FALLBACK: &str = "steam";
+
+/// `steam.exe` under each root's `Steam` directory, in the order given.
+///
+/// Pure: proposes paths without touching the filesystem, so the preference order
+/// can be asserted on any host.
+fn steam_exe_candidates(roots: &[PathBuf]) -> Vec<PathBuf> {
+  roots
+    .iter()
+    .map(|root| root.join(STEAM_INSTALL_DIR).join(STEAM_EXE_NAME))
+    .collect()
+}
+
+/// The first candidate that is a file, or `None` when none is.
+///
+/// Split out from where the candidates come from so the "which one wins"
+/// decision is testable against an ordinary directory tree, with no Windows and
+/// no Steam.
+fn first_existing(candidates: &[PathBuf]) -> Option<PathBuf> {
+  candidates
+    .iter()
+    .find(|candidate| candidate.is_file())
+    .cloned()
+}
+
+/// The Program Files roots to search, read from the environment.
+///
+/// Guarded at run time rather than with `#[cfg(windows)]` so the resolution path
+/// stays compiled and unit-tested on a Linux CI, which is the only place this can
+/// be tested at all. The guard is load-bearing beyond that: Wine and some CI
+/// images export `ProgramFiles`, and honouring it off Windows would divert a
+/// working launch to a path that cannot be executed.
+fn install_roots() -> Vec<PathBuf> {
+  if !cfg!(windows) {
+    return Vec::new();
+  }
+
+  PROGRAM_FILES_VARS
+    .iter()
+    .filter_map(std::env::var_os)
+    .map(PathBuf::from)
+    .collect()
+}
+
+/// The executable path Steam's installer recorded in the registry.
+///
+/// Preferred over the standard roots because it is the only source that survives
+/// a Steam installed to another drive. Steam writes this value with forward
+/// slashes, which Windows accepts.
+#[cfg(windows)]
+fn registry_steam_exe() -> Option<PathBuf> {
+  let key = windows_registry::CURRENT_USER
+    .open(STEAM_REGISTRY_KEY)
+    .ok()?;
+  let recorded = key.get_string(STEAM_REGISTRY_VALUE).ok()?;
+
+  (!recorded.trim().is_empty()).then(|| PathBuf::from(recorded))
+}
+
+/// No registry to read. See the Windows implementation above.
+#[cfg(not(windows))]
+fn registry_steam_exe() -> Option<PathBuf> {
+  // Referenced so the names stay live off Windows and cannot rot unnoticed.
+  let _ = (STEAM_REGISTRY_KEY, STEAM_REGISTRY_VALUE);
+
+  None
+}
+
+/// Chooses the Steam program from host facts already gathered.
+///
+/// The entire precedence rule, taking the registry value and the install roots as
+/// parameters rather than reading them, so every branch — registry hit, stale
+/// registry, roots order, nothing found at all — is exercised on a Linux CI. That
+/// matters more here than usual: the bug this resolution exists to fix only
+/// reproduces on Windows, which cannot be tested directly.
+///
+/// The registry path is re-checked against the filesystem rather than trusted, so
+/// a stale entry left behind by a moved or uninstalled Steam falls through to the
+/// standard roots instead of yielding a path that cannot be spawned.
+fn resolve_steam_exe(registry: Option<PathBuf>, roots: &[PathBuf]) -> PathBuf {
+  registry
+    .filter(|path| path.is_file())
+    .or_else(|| first_existing(&steam_exe_candidates(roots)))
+    .unwrap_or_else(|| PathBuf::from(STEAM_FALLBACK))
+}
+
+/// The program that starts the Steam client on this machine.
+///
+/// Tries the registry, then the standard install roots, then falls back to a bare
+/// `STEAM_FALLBACK`. Resolution never fails: that fallback is exactly what this
+/// crate passed unconditionally before, so a machine this cannot resolve is left
+/// no worse off than it was.
+///
+/// [`crate::profile::launch::LaunchPlan::to_command`] calls this for
+/// [`crate::profile::launch::LaunchProgram::Steam`], so a caller spawning a
+/// computed plan gets it without asking. It is public for callers assembling a
+/// command themselves.
+pub fn steam_exe() -> PathBuf {
+  resolve_steam_exe(registry_steam_exe(), &install_roots())
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -249,6 +382,142 @@ mod tests {
     assert!(
       !matches!(verdict, Visibility::Unreachable { .. }),
       "a home path should never be proven unreachable, got: {verdict:?}"
+    );
+  }
+
+  #[test]
+  fn steam_exe_candidates_names_steam_exe_under_each_root_in_order() {
+    let roots = vec![
+      PathBuf::from(r"C:\Program Files (x86)"),
+      PathBuf::from(r"C:\Program Files"),
+    ];
+
+    assert_eq!(
+      steam_exe_candidates(&roots),
+      vec![
+        PathBuf::from(r"C:\Program Files (x86)")
+          .join("Steam")
+          .join("steam.exe"),
+        PathBuf::from(r"C:\Program Files")
+          .join("Steam")
+          .join("steam.exe"),
+      ]
+    );
+
+    // No roots to search is not an error; it simply proposes nothing, which is
+    // what the caller sees on every non-Windows host.
+    assert!(steam_exe_candidates(&[]).is_empty());
+  }
+
+  #[test]
+  fn first_existing_returns_the_earliest_candidate_present_on_disk() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let absent = root.join("absent.exe");
+    let present = root.join("present.exe");
+    let also_present = root.join("also_present.exe");
+
+    std::fs::write(&present, b"MZ").unwrap();
+    std::fs::write(&also_present, b"MZ").unwrap();
+
+    // Preference order decides, not disk order: the first *present* candidate
+    // wins even though an earlier one was looked for and missing.
+    assert_eq!(
+      first_existing(&[absent.clone(), present.clone(), also_present]),
+      Some(present)
+    );
+
+    assert_eq!(first_existing(&[absent]), None);
+
+    // A directory is not an executable, so it must not satisfy a candidate.
+    assert_eq!(first_existing(&[root.to_path_buf()]), None);
+  }
+
+  /// The precedence the Windows fix turns on, asserted end to end on a host that
+  /// has neither a registry nor a Steam. Each branch is reached by varying only
+  /// the two inputs.
+  #[test]
+  fn resolve_steam_exe_prefers_the_registry_then_the_roots_then_the_fallback() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+
+    // A Steam relocated to another drive: only the registry knows about it, and
+    // it must win even when a standard root would also have resolved.
+    let relocated = root.join("D_drive").join("Steam").join("steam.exe");
+    let standard = root.join("ProgramFilesX86");
+    let secondary = root.join("ProgramFiles");
+
+    std::fs::create_dir_all(relocated.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(standard.join("Steam")).unwrap();
+    std::fs::create_dir_all(secondary.join("Steam")).unwrap();
+    std::fs::write(&relocated, b"MZ").unwrap();
+    std::fs::write(standard.join("Steam").join("steam.exe"), b"MZ").unwrap();
+    std::fs::write(secondary.join("Steam").join("steam.exe"), b"MZ").unwrap();
+
+    let roots = vec![standard.clone(), secondary.clone()];
+
+    assert_eq!(
+      resolve_steam_exe(Some(relocated.clone()), &roots),
+      relocated,
+      "a registry-recorded Steam must win over a standard root"
+    );
+
+    assert_eq!(
+      resolve_steam_exe(None, &roots),
+      standard.join("Steam").join("steam.exe"),
+      "with no registry value the first root wins"
+    );
+
+    // A registry entry left behind by a moved or uninstalled Steam must not be
+    // handed back: spawning it would fail where the standard root would work.
+    assert_eq!(
+      resolve_steam_exe(Some(root.join("gone").join("steam.exe")), &roots),
+      standard.join("Steam").join("steam.exe"),
+      "a stale registry entry must fall through to the roots"
+    );
+
+    assert_eq!(
+      resolve_steam_exe(None, std::slice::from_ref(&secondary)),
+      secondary.join("Steam").join("steam.exe"),
+      "the second root resolves when it is the only one offered"
+    );
+
+    // Nothing resolvable is not an error. The bare name is what this crate always
+    // passed, and it still works wherever Steam is on PATH.
+    assert_eq!(
+      resolve_steam_exe(None, &[root.join("empty")]),
+      PathBuf::from("steam")
+    );
+    assert_eq!(resolve_steam_exe(None, &[]), PathBuf::from("steam"));
+  }
+
+  /// The whole resolution path stays compiled and exercised off Windows, so the
+  /// runtime guard is what keeps it inert there. `install_roots` is the only
+  /// route the environment takes into resolution, so a host that happens to
+  /// export `ProgramFiles` — Wine and some CI images do — cannot divert a launch
+  /// as long as this stays empty.
+  ///
+  /// Asserted by calling the shim rather than by setting the variable, because
+  /// the crate is `#![forbid(unsafe_code)]` and `std::env::set_var` is `unsafe`.
+  #[test]
+  fn resolution_is_inert_off_windows() {
+    if cfg!(windows) {
+      return;
+    }
+
+    assert!(
+      install_roots().is_empty(),
+      "no install roots may be proposed off Windows"
+    );
+    assert_eq!(
+      registry_steam_exe(),
+      None,
+      "there is no registry to read off Windows"
+    );
+    assert_eq!(
+      steam_exe(),
+      PathBuf::from("steam"),
+      "off Windows the bare program name is correct and must be preserved"
     );
   }
 
