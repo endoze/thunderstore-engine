@@ -1357,6 +1357,24 @@ pub fn wrapper_path(base: &Path, game: &str) -> PathBuf {
   base.join(game).join("steam-wrapper.sh")
 }
 
+/// Builds the invocation that asks a running Steam client to start
+/// `steam_app_id`.
+///
+/// Takes the program as a parameter rather than resolving it, so the argv this
+/// produces can be asserted on any host — including one with no Steam installed,
+/// which is every CI runner this crate is tested on.
+///
+/// Sets no environment: `steam -applaunch <id>` only messages an already-running
+/// client, which starts the game with its own environment, so anything set here
+/// would silently reach nothing. See [`LaunchPlan::env`].
+fn steam_command(program: &Path, steam_app_id: u32) -> std::process::Command {
+  let mut command = std::process::Command::new(program);
+
+  command.arg("-applaunch").arg(steam_app_id.to_string());
+
+  command
+}
+
 impl LaunchPlan {
   /// Translates this plan into the process to spawn.
   ///
@@ -1370,17 +1388,22 @@ impl LaunchPlan {
   /// `-D warnings`. Adding a variant therefore breaks this build deliberately,
   /// which is the point: a new launch shape must be translated, not silently
   /// rejected at run time.
+  ///
+  /// This is where the host is read, which is why the two variants that need a
+  /// real path both resolve one here rather than in [`launch_plan_in`]: the plan
+  /// stays a pure computation, and translating it into a process is the step
+  /// allowed to look at the machine. [`LaunchProgram::GameExe`] and
+  /// [`LaunchProgram::ProfileScript`] resolve their binary out of `game_dir`, and
+  /// [`LaunchProgram::Steam`] resolves the Steam client through
+  /// [`crate::steam::steam_exe`] — a bare `steam` resolves on Linux but never on
+  /// Windows, whose Steam installer adds nothing to `PATH`.
   pub fn to_command(&self, game_dir: &Path) -> Result<std::process::Command> {
     let mut command = match &self.program {
       LaunchProgram::GameExe { exe_names } => {
         std::process::Command::new(resolve_game_exe(game_dir, exe_names)?)
       }
       LaunchProgram::Steam { steam_app_id } => {
-        let mut command = std::process::Command::new("steam");
-
-        command.arg("-applaunch").arg(steam_app_id.to_string());
-
-        command
+        steam_command(&crate::steam::steam_exe(), *steam_app_id)
       }
       LaunchProgram::ProfileScript { path, exe_names } => {
         let mut command = std::process::Command::new(path);
@@ -3367,6 +3390,78 @@ mod tests {
         .get_envs()
         .any(|(key, value)| key == std::ffi::OsStr::new("KEY")
           && value == Some(std::ffi::OsStr::new("VALUE")))
+    );
+  }
+
+  /// `-applaunch <id>` must lead, with the plan's own argv after it, whatever
+  /// path the Steam executable resolved to. Asserted against an explicit program
+  /// so the ordering is checked on any host, including one with no Steam at all.
+  #[test]
+  fn a_steam_command_leads_with_applaunch_and_keeps_the_plan_argv_after_it() {
+    let program = Path::new(r"C:\Program Files (x86)\Steam\steam.exe");
+    let mut command = steam_command(program, 892970);
+
+    command.args(["-console".to_string(), "--ts-target".to_string()]);
+
+    assert_eq!(command.get_program(), program.as_os_str());
+    assert_eq!(
+      command.get_args().collect::<Vec<_>>(),
+      vec![
+        std::ffi::OsStr::new("-applaunch"),
+        std::ffi::OsStr::new("892970"),
+        std::ffi::OsStr::new("-console"),
+        std::ffi::OsStr::new("--ts-target"),
+      ]
+    );
+  }
+
+  /// The Steam arm resolves its program through [`crate::steam::steam_exe`]
+  /// rather than hardcoding `steam`, which never resolves on Windows.
+  ///
+  /// `LaunchPlan::env` is asserted *unchanged* here: it is documented as not
+  /// reaching a game started through `-applaunch`, so this fix must keep setting
+  /// exactly what the plan carried and add nothing that would silently do
+  /// nothing.
+  #[test]
+  fn a_steam_plan_spawns_the_resolved_steam_executable() {
+    let dir = tempfile::tempdir().unwrap();
+    let game_dir = dir.path();
+
+    let plan = LaunchPlan {
+      program: LaunchProgram::Steam {
+        steam_app_id: 892970,
+      },
+      args: vec!["-console".to_string()],
+      env: vec![("KEY".to_string(), "VALUE".to_string())],
+      working_dir: None,
+      steam_wrapper: None,
+    };
+
+    let command = plan.to_command(game_dir).unwrap();
+
+    assert_eq!(
+      command.get_program(),
+      crate::steam::steam_exe().as_os_str(),
+      "the Steam arm must use the resolved executable"
+    );
+    assert_eq!(
+      command.get_args().collect::<Vec<_>>(),
+      vec![
+        std::ffi::OsStr::new("-applaunch"),
+        std::ffi::OsStr::new("892970"),
+        std::ffi::OsStr::new("-console"),
+      ]
+    );
+
+    let envs = command.get_envs().collect::<Vec<_>>();
+
+    assert_eq!(
+      envs,
+      vec![(
+        std::ffi::OsStr::new("KEY"),
+        Some(std::ffi::OsStr::new("VALUE"))
+      )],
+      "the plan's env must reach the command unchanged, with nothing added"
     );
   }
 }

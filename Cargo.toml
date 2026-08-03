@@ -69,3 +69,10 @@ no-default-features = false
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+# Steam's Windows installer puts nothing on `PATH`, so `steam.exe` has to be
+# located before it can be spawned. The registry records the full path and is the
+# only source that survives a Steam installed to another drive. Target-gated, so
+# no Unix build ever sees it.
+[target."cfg(windows)".dependencies]
+windows-registry = "0.6.1"
