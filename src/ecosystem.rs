@@ -351,7 +351,9 @@ pub struct ModloaderPackage {
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum TrackingMethod {
-  /// Namespaced under `route/<Owner-Name>/`, flattened. The default.
+  /// Namespaced under `route/<Owner-Name>/`. The contents of a matched override
+  /// folder keep their structure; a file reached outside one (by extension or
+  /// the default location) is flattened to its base name. The default.
   #[default]
   Subdir,
   /// Written directly under `route/`, shared and untracked (e.g. config).

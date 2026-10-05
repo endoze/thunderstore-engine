@@ -63,12 +63,12 @@ use crate::ecosystem::Ecosystem;
 use crate::error::{Error, Result};
 use crate::extract::parse_package_filename;
 use crate::install::{
-  apply_install, plan_install, remove_delisted, remove_state_payload, state_tracker_from_plan,
-  write_state_file,
+  apply_install, clear_state_files, plan_install, remove_delisted, remove_mod_folders,
+  remove_state_file, remove_state_payload, state_tracker_from_plan, write_state_file,
 };
 use crate::models::{DependencyGraph, PackageIndex, Version};
 use modlist::{ProfileMod, SemVer};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 /// Builds a [`ProfileMod`] from a Thunderstore [`Version`], applying the same
@@ -138,6 +138,11 @@ pub struct BatchOutcome {
   /// worked", is wrong for install by however many dependencies were pulled
   /// in.
   pub succeeded: Vec<String>,
+  /// Identifiers left alone because the version already recorded in `mods.yml`
+  /// is the one that would be installed. Only [`install_batch`] fills this;
+  /// like `succeeded` it covers the dependency closure, sorted and
+  /// deduplicated, and never names anything `succeeded` or `failed` also names.
+  pub unchanged: Vec<String>,
   /// Identifiers that failed, each with the reason.
   pub failed: Vec<(String, Error)>,
 }
@@ -161,9 +166,19 @@ pub struct InstallBatch {
   ///
   /// An install upserts every dependency-closure member with `enabled: true` and
   /// `modlist::upsert` replaces the entry wholesale, so without this a mod the
-  /// user disabled is silently re-enabled and its `.old` files are orphaned
-  /// beside the freshly written ones.
+  /// user disabled is silently re-enabled by a reinstall.
   pub protect_disabled: Vec<String>,
+  /// Mods the caller wants enabled after the batch (e.g. the ones it named).
+  ///
+  /// A reinstall already leaves them enabled, but one skipped because its
+  /// recorded version is current is not reinstalled at all, so without this
+  /// naming a disabled mod would leave it disabled. A name that is already
+  /// enabled, or was not skipped, is left alone.
+  pub enable_requested: Vec<String>,
+  /// Reinstall each `desired` mod even when `mods.yml` already records the
+  /// version that would be installed. Applies to the `desired` names only, so
+  /// their dependencies are still skipped at a recorded version.
+  pub force: bool,
 }
 
 impl InstallBatch {
@@ -174,6 +189,7 @@ impl InstallBatch {
     Self {
       desired,
       protect_disabled,
+      ..Self::default()
     }
   }
 }
@@ -181,10 +197,10 @@ impl InstallBatch {
 /// Plans an install batch against `target_dir`'s current record.
 ///
 /// `desired` is everything to install. `explicit` is the subset the caller named
-/// directly, which is excluded from `protect_disabled`: asking for a mod by name
-/// is a request to have it active. Pass an empty `explicit` when the batch is run
-/// on the user's behalf rather than at their request, so every disabled mod is
-/// restored.
+/// directly: asking for a mod by name is a request to have it active, so a
+/// disabled one goes to `enable_requested` rather than `protect_disabled`. Pass
+/// an empty `explicit` when the batch is run on the user's behalf rather than at
+/// their request, so every disabled mod is restored.
 pub fn plan_install_batch(
   target_dir: &Path,
   desired: &[String],
@@ -192,16 +208,17 @@ pub fn plan_install_batch(
 ) -> Result<InstallBatch> {
   let recorded = modlist::read(target_dir)?;
 
-  let protect_disabled = recorded
+  let (enable_requested, protect_disabled): (Vec<String>, Vec<String>) = recorded
     .iter()
     .filter(|entry| !entry.enabled)
-    .filter(|entry| !explicit.iter().any(|name| name == &entry.name))
     .map(|entry| entry.name.clone())
-    .collect();
+    .partition(|name| explicit.contains(name));
 
   Ok(InstallBatch {
     desired: desired.to_vec(),
     protect_disabled,
+    enable_requested,
+    force: false,
   })
 }
 
@@ -224,9 +241,16 @@ pub fn reapply_batch_disabled(
   Ok(())
 }
 
-/// Installs an already-extracted package into `target_dir`: plans and applies
-/// the file copy, writes the `_state` tracker for any `State`-tracked files,
-/// and upserts the `mods.yml` entry.
+/// Installs an already-extracted package into `target_dir`: plans the file copy,
+/// removes any copy already installed (its namespaced `<route>/<ident>/` folders
+/// and `State`-tracked files, as r2modman uninstalls before installing), applies
+/// the copy, writes the `_state` tracker for any `State`-tracked files, and
+/// upserts the `mods.yml` entry.
+///
+/// Shared `none`-tracked files (config) are left in place, and an existing one is
+/// not overwritten. A failure after the removal leaves the mod without files
+/// while `mods.yml` and its `_state` record still name it; reinstalling repairs
+/// that, and uninstalling still works.
 ///
 /// This is the apply-only, target-directory primitive; the full download
 /// pipeline ([`install_mod_in`]) is layered on top of it.
@@ -249,10 +273,18 @@ pub fn install_extracted_in(
 
   let plan = plan_install(eco, game_profile, full_name, extracted_dir, archive)?;
 
+  // Planned first so a package that cannot be routed fails before anything of
+  // the installed copy is removed. Shared `none` routes are never named here,
+  // so user config survives. The `_state` record outlives its payload until the
+  // copy lands, so a failed apply still leaves the mod uninstallable, which
+  // `ensure_removable` refuses for a loader with no record.
+  clear_state_files(target_dir, full_name)?;
+  remove_mod_folders(game_profile, target_dir, full_name)?;
   apply_install(&plan, target_dir)?;
 
-  if let Some(tracker) = state_tracker_from_plan(&plan, full_name) {
-    write_state_file(target_dir, &tracker)?;
+  match state_tracker_from_plan(&plan, full_name) {
+    Some(tracker) => write_state_file(target_dir, &tracker)?,
+    None => remove_state_file(target_dir, full_name)?,
   }
 
   let mut mods = modlist::read(target_dir)?;
@@ -582,8 +614,14 @@ pub fn disable_mod(
 /// Installs a mod and its full dependency closure into `target_dir`: resolves
 /// the download set against `index`, downloads the archives via `client`,
 /// extracts each into `cache_base`'s per-game package cache, and installs
-/// each into `target_dir` (updating `mods.yml`). Returns the sorted
-/// `Owner-Name` identifiers installed.
+/// each into `target_dir` (updating `mods.yml`).
+///
+/// A package whose version `mods.yml` already records, and whose files that
+/// version installs are still on disk, is skipped before it is downloaded, as
+/// r2modman does, unless it is `full_name` itself and `force` is set. A recorded
+/// package with missing files is reinstalled, which repairs a failed install or
+/// a hand-deleted folder. Returns the sorted `Owner-Name` identifiers installed
+/// and those skipped.
 ///
 /// `cache_base` is deliberately independent of `target_dir`: packages are
 /// extracted *from* it, never installed *into* it. See the module docs for
@@ -598,8 +636,9 @@ async fn install_one(
   client: &ThunderstoreClient,
   game: &str,
   full_name: &str,
+  force: bool,
   installed_at_time: u64,
-) -> Result<Vec<String>> {
+) -> Result<(Vec<String>, Vec<String>)> {
   let resolution = DependencyGraph::new(vec![full_name.to_string()]).resolve_report(index);
 
   if !resolution.unresolved.is_empty() {
@@ -609,11 +648,42 @@ async fn install_one(
     )));
   }
 
-  let urls = resolution.urls;
+  let recorded = modlist::read(target_dir)?;
+  let forced = force.then(|| crate::util::full_name_prefix(full_name));
+  let downloads = client.cache_dir().join("downloads");
+  let mut urls = HashMap::new();
+  let mut unchanged = Vec::new();
+
+  for (filename, url) in resolution.urls {
+    let (pkg_full_name, version_str) = parse_package_filename(&filename)
+      .ok_or_else(|| Error::Profile(format!("unparseable package filename {filename:?}")))?;
+
+    let version = SemVer::parse(&version_str);
+    let current = forced != Some(pkg_full_name.as_str())
+      && recorded
+        .iter()
+        .find(|entry| entry.name == pkg_full_name && entry.version_number == version)
+        .is_some_and(|entry| {
+          recorded_files_present(
+            target_dir,
+            cache_base,
+            eco,
+            game,
+            entry,
+            &version_str,
+            &downloads.join(&filename),
+          )
+        });
+
+    if current {
+      unchanged.push(pkg_full_name);
+    } else {
+      urls.insert(filename, url);
+    }
+  }
 
   client.download_files(urls.clone()).await?;
 
-  let downloads = client.cache_dir().join("downloads");
   let mut installed = Vec::new();
 
   for filename in urls.keys() {
@@ -653,8 +723,39 @@ async fn install_one(
   }
 
   installed.sort();
+  unchanged.sort();
 
-  Ok(installed)
+  Ok((installed, unchanged))
+}
+
+/// Whether the files `entry` installed at `version` are still in place, judged
+/// from the package's cached extraction. A missing cache, an unknown game or a
+/// package that no longer plans counts as not in place, so the install runs and
+/// either repairs the mod or reports why it cannot.
+fn recorded_files_present(
+  target_dir: &Path,
+  cache_base: &Path,
+  eco: &Ecosystem,
+  game: &str,
+  entry: &ProfileMod,
+  version: &str,
+  archive: &Path,
+) -> bool {
+  let extracted = cache::package_cache_dir(cache_base, game, &entry.name, version);
+
+  if !extracted.is_dir() {
+    return false;
+  }
+
+  let Some(game_profile) = eco.game(game).and_then(|g| g.profile()) else {
+    return false;
+  };
+
+  let archive = archive.exists().then_some(archive);
+
+  plan_install(eco, game_profile, &entry.name, &extracted, archive).is_ok_and(|plan| {
+    crate::install::plan_is_on_disk(&plan, target_dir, &entry.name, entry.enabled)
+  })
 }
 
 /// Installs every identifier in `batch`, restoring protected disabled state
@@ -663,7 +764,8 @@ async fn install_one(
 /// Failures do not abort the batch: each item is attempted and its reason
 /// recorded, because an operation that already installed earlier items has to
 /// say which ones. The disabled-state restore runs regardless, since items
-/// installed before a failure are already enabled.
+/// installed before a failure are already enabled. A requested enable that
+/// fails is recorded the same way.
 #[allow(clippy::too_many_arguments)]
 pub async fn install_batch(
   target_dir: &Path,
@@ -686,11 +788,15 @@ pub async fn install_batch(
       client,
       game,
       full_name,
+      batch.force,
       installed_at_time,
     )
     .await
     {
-      Ok(installed) => outcome.succeeded.extend(installed),
+      Ok((installed, unchanged)) => {
+        outcome.succeeded.extend(installed);
+        outcome.unchanged.extend(unchanged);
+      }
       Err(error) => outcome.failed.push((full_name.clone(), error)),
     }
   }
@@ -699,6 +805,34 @@ pub async fn install_batch(
 
   outcome.succeeded.sort();
   outcome.succeeded.dedup();
+  outcome.unchanged.sort();
+  outcome.unchanged.dedup();
+  outcome
+    .unchanged
+    .retain(|name| outcome.succeeded.binary_search(name).is_err());
+
+  // A reinstalled mod is already enabled; only one skipped as current can still
+  // carry the disabled state the caller asked to clear.
+  let recorded = modlist::read(target_dir)?;
+  let disabled: BTreeSet<&str> = recorded
+    .iter()
+    .filter(|entry| !entry.enabled)
+    .map(|entry| entry.name.as_str())
+    .collect();
+
+  for full_name in &batch.enable_requested {
+    if disabled.contains(full_name.as_str())
+      && outcome.unchanged.binary_search(full_name).is_ok()
+      && let Err(error) = set_enabled_in(target_dir, eco, game, full_name, true)
+    {
+      outcome.failed.push((full_name.clone(), error));
+    }
+  }
+
+  // A mod whose enable failed is reported as failed, not also as unchanged.
+  let failed: BTreeSet<&String> = outcome.failed.iter().map(|(name, _)| name).collect();
+
+  outcome.unchanged.retain(|name| !failed.contains(name));
 
   Ok(outcome)
 }
@@ -707,8 +841,10 @@ pub async fn install_batch(
 /// every recorded mod it did not name. See [`install_batch`].
 ///
 /// Returns every `Owner-Name` actually installed, which is the named package
-/// plus its transitive dependencies, so it is normally longer than the one name
-/// passed in.
+/// plus its transitive dependencies. A package already recorded at the version
+/// that would be installed, with its files still on disk, is skipped and not
+/// listed, so this is empty when the whole closure is current; use
+/// [`install_batch`] with [`InstallBatch::force`] to reinstall regardless.
 ///
 /// `cache_base` must not be `target_dir` or a directory inside it, or extracted
 /// packages would land inside the installed mod tree.
@@ -770,8 +906,40 @@ pub async fn install_mod_in(
   full_name: &str,
   installed_at_time: u64,
 ) -> Result<Vec<String>> {
+  install_named_in(
+    target_dir,
+    cache_base,
+    eco,
+    index,
+    client,
+    game,
+    full_name,
+    false,
+    installed_at_time,
+  )
+  .await
+}
+
+/// Installs one named mod and its dependency closure, surfacing the first
+/// per-item failure as the error. With `force`, the named mod is reinstalled
+/// even when `mods.yml` already records its version. Shared by
+/// [`install_mod_in`] and adoption, which forces the loader reinstall.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn install_named_in(
+  target_dir: &Path,
+  cache_base: &Path,
+  eco: &Ecosystem,
+  index: &PackageIndex,
+  client: &ThunderstoreClient,
+  game: &str,
+  full_name: &str,
+  force: bool,
+  installed_at_time: u64,
+) -> Result<Vec<String>> {
   let named = [full_name.to_string()];
-  let batch = plan_install_batch(target_dir, &named, &named)?;
+  let mut batch = plan_install_batch(target_dir, &named, &named)?;
+
+  batch.force = force;
 
   let outcome = install_batch(
     target_dir,
@@ -2124,5 +2292,647 @@ mod tests {
 
     assert!(error.to_string().contains("Author-Gone"));
     assert!(error.to_string().contains("is not installed"));
+  }
+
+  /// Install batches run end to end against a mock Thunderstore: real downloads,
+  /// extraction, routing and `mods.yml`, so skip, clean and force are checked
+  /// on disk rather than against a stub.
+  mod reinstall {
+    use super::*;
+    use crate::models::Package;
+
+    const MOD: &str = "Author-Mod";
+    const DEP: &str = "Author-Dep";
+    const LOADER: &str = "denikson-BepInExPack_Valheim";
+
+    /// One published version of a package.
+    struct Pkg<'a> {
+      full_name: &'a str,
+      version: &'a str,
+      deps: &'a [&'a str],
+      files: &'a [(&'a str, &'a [u8])],
+    }
+
+    struct Repo {
+      server: mockito::ServerGuard,
+      mocks: Vec<mockito::Mock>,
+      client: ThunderstoreClient,
+      _http_cache: tempfile::TempDir,
+      cache_base: tempfile::TempDir,
+      target: tempfile::TempDir,
+      eco: Ecosystem,
+      rt: tokio::runtime::Runtime,
+      clock: u64,
+    }
+
+    impl Repo {
+      fn new() -> Self {
+        let server = mockito::Server::new();
+        let http_cache = tempdir().unwrap();
+        let client = ThunderstoreClient::builder()
+          .package_index_url(format!("{}/pkg/", server.url()))
+          .cache_dir(http_cache.path())
+          .build()
+          .unwrap();
+
+        Self {
+          server,
+          mocks: Vec::new(),
+          client,
+          _http_cache: http_cache,
+          cache_base: tempdir().unwrap(),
+          target: tempdir().unwrap(),
+          eco: Ecosystem::bundled(),
+          rt: tokio::runtime::Runtime::new().unwrap(),
+          clock: 0,
+        }
+      }
+
+      /// Serves each package's archive and returns an index in which that
+      /// version is the only, and so the latest, one.
+      fn publish(&mut self, pkgs: &[Pkg<'_>]) -> PackageIndex {
+        let mut packages = Vec::new();
+
+        for pkg in pkgs {
+          let path = format!("/dl/{}-{}.zip", pkg.full_name, pkg.version);
+          let mock = self
+            .server
+            .mock("GET", path.as_str())
+            .with_status(200)
+            .with_header("Content-Type", "application/zip")
+            .with_body(zip_of(pkg.files))
+            .create();
+
+          self.mocks.push(mock);
+
+          let (owner, name) = pkg.full_name.split_once('-').unwrap();
+          let json = serde_json::json!({
+            "name": name, "full_name": pkg.full_name, "owner": owner,
+            "package_url": "https://example.com", "date_created": "2024-01-01T12:00:00Z",
+            "date_updated": "2024-01-02T12:00:00Z", "uuid4": "pkg", "rating_score": 1,
+            "is_pinned": false, "is_deprecated": false, "has_nsfw_content": false,
+            "categories": [],
+            "versions": [{
+              "name": name, "full_name": pkg.full_name, "description": "d", "icon": "i",
+              "version_number": pkg.version, "dependencies": pkg.deps,
+              "download_url": format!("{}{path}", self.server.url()), "downloads": 1,
+              "date_created": "2024-01-01T12:00:00Z", "website_url": "", "is_active": true,
+              "uuid4": "ver", "file_size": 1
+            }]
+          });
+
+          packages.push(serde_json::from_value::<Package>(json).unwrap());
+        }
+
+        PackageIndex::from(packages)
+      }
+
+      /// Plans a batch for `desired` (naming `explicit`) and runs it.
+      fn install(
+        &mut self,
+        index: &PackageIndex,
+        desired: &[&str],
+        explicit: &[&str],
+        force: bool,
+      ) -> BatchOutcome {
+        let desired: Vec<String> = desired.iter().map(|s| s.to_string()).collect();
+        let explicit: Vec<String> = explicit.iter().map(|s| s.to_string()).collect();
+        let mut batch = plan_install_batch(self.target.path(), &desired, &explicit).unwrap();
+
+        batch.force = force;
+        self.clock += 1;
+
+        let outcome = self
+          .rt
+          .block_on(install_batch(
+            self.target.path(),
+            self.cache_base.path(),
+            &self.eco,
+            index,
+            &self.client,
+            "valheim",
+            &batch,
+            self.clock,
+          ))
+          .unwrap();
+
+        assert!(outcome.is_ok(), "batch failed: {:?}", outcome.failed);
+
+        outcome
+      }
+
+      fn path(&self, rel: &str) -> PathBuf {
+        self.target.path().join(rel)
+      }
+
+      fn entry(&self, name: &str) -> ProfileMod {
+        modlist::read(self.target.path())
+          .unwrap()
+          .into_iter()
+          .find(|m| m.name == name)
+          .unwrap()
+      }
+    }
+
+    fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {
+      let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+      let opts: FileOptions<'_, ()> =
+        FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+
+      for (name, body) in files {
+        zip.start_file(*name, opts).unwrap();
+        zip.write_all(body).unwrap();
+      }
+
+      zip.finish().unwrap().into_inner()
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+      list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn an_install_at_the_recorded_version_is_skipped() {
+      let mut repo = Repo::new();
+      let index = repo.publish(&[Pkg {
+        full_name: MOD,
+        version: "1.0.0",
+        deps: &[],
+        files: &[("plugins/Mod.dll", b"v1")],
+      }]);
+
+      repo.install(&index, &[MOD], &[MOD], false);
+
+      let user_file = repo.path("BepInEx/plugins/Author-Mod/user.txt");
+
+      write_file(&user_file, b"mine");
+
+      let installed_at = repo.entry(MOD).installed_at_time;
+      let outcome = repo.install(&index, &[MOD], &[MOD], false);
+
+      assert!(outcome.succeeded.is_empty());
+      assert_eq!(outcome.unchanged, names(&[MOD]));
+      assert!(user_file.exists(), "a skipped install must not touch files");
+      assert_eq!(repo.entry(MOD).installed_at_time, installed_at);
+    }
+
+    #[test]
+    fn a_version_change_removes_files_only_the_old_version_had() {
+      let mut repo = Repo::new();
+      let v1 = repo.publish(&[Pkg {
+        full_name: MOD,
+        version: "1.0.0",
+        deps: &[],
+        files: &[
+          ("plugins/Old.dll", b"old"),
+          ("plugins/german.json", b"flat"),
+        ],
+      }]);
+
+      repo.install(&v1, &[MOD], &[MOD], false);
+
+      assert!(repo.path("BepInEx/plugins/Author-Mod/german.json").exists());
+
+      let v2 = repo.publish(&[Pkg {
+        full_name: MOD,
+        version: "2.0.0",
+        deps: &[],
+        files: &[
+          ("plugins/Mod.dll", b"new"),
+          ("plugins/Translations/German/german.json", b"nested"),
+        ],
+      }]);
+      let outcome = repo.install(&v2, &[MOD], &[MOD], false);
+
+      assert_eq!(outcome.succeeded, names(&[MOD]));
+      assert!(!repo.path("BepInEx/plugins/Author-Mod/Old.dll").exists());
+      assert!(!repo.path("BepInEx/plugins/Author-Mod/german.json").exists());
+      assert!(
+        repo
+          .path("BepInEx/plugins/Author-Mod/Translations/German/german.json")
+          .exists()
+      );
+      assert_eq!(repo.entry(MOD).version_number.to_string(), "2.0.0");
+    }
+
+    #[test]
+    fn force_reinstalls_the_recorded_version_from_a_clean_folder() {
+      let mut repo = Repo::new();
+      let index = repo.publish(&[Pkg {
+        full_name: MOD,
+        version: "1.0.0",
+        deps: &[],
+        files: &[("plugins/Translations/German/german.json", b"nested")],
+      }]);
+
+      repo.install(&index, &[MOD], &[MOD], false);
+
+      // What an install made before nested folders were kept left behind.
+      let stale = repo.path("BepInEx/plugins/Author-Mod/german.json");
+
+      write_file(&stale, b"flat");
+
+      let outcome = repo.install(&index, &[MOD], &[MOD], true);
+
+      assert_eq!(outcome.succeeded, names(&[MOD]));
+      assert!(outcome.unchanged.is_empty());
+      assert!(!stale.exists());
+      assert!(
+        repo
+          .path("BepInEx/plugins/Author-Mod/Translations/German/german.json")
+          .exists()
+      );
+    }
+
+    #[test]
+    fn force_reinstalls_only_the_named_mod_not_its_dependencies() {
+      let mut repo = Repo::new();
+      let index = repo.publish(&[
+        Pkg {
+          full_name: MOD,
+          version: "1.0.0",
+          deps: &["Author-Dep-1.0.0"],
+          files: &[("plugins/Mod.dll", b"mod")],
+        },
+        Pkg {
+          full_name: DEP,
+          version: "1.0.0",
+          deps: &[],
+          files: &[("plugins/Dep.dll", b"dep")],
+        },
+      ]);
+
+      repo.install(&index, &[MOD], &[MOD], false);
+
+      let dep_marker = repo.path("BepInEx/plugins/Author-Dep/user.txt");
+
+      write_file(&dep_marker, b"mine");
+
+      let outcome = repo.install(&index, &[MOD], &[MOD], true);
+
+      assert_eq!(outcome.succeeded, names(&[MOD]));
+      assert_eq!(outcome.unchanged, names(&[DEP]));
+      assert!(
+        dep_marker.exists(),
+        "the dependency must not be reinstalled"
+      );
+    }
+
+    #[test]
+    fn a_disabled_mod_stays_disabled_through_force_and_an_update() {
+      let mut repo = Repo::new();
+      let v1 = repo.publish(&[Pkg {
+        full_name: MOD,
+        version: "1.0.0",
+        deps: &[],
+        files: &[("plugins/Mod.dll", b"v1"), ("plugins/Old.dll", b"v1")],
+      }]);
+
+      repo.install(&v1, &[MOD], &[MOD], false);
+
+      set_enabled_in(repo.target.path(), &repo.eco, "valheim", MOD, false).unwrap();
+
+      // Not named, as an update on the user's behalf runs it.
+      repo.install(&v1, &[MOD], &[], true);
+
+      assert!(!repo.entry(MOD).enabled);
+      assert!(repo.path("BepInEx/plugins/Author-Mod/Mod.dll.old").exists());
+      assert!(!repo.path("BepInEx/plugins/Author-Mod/Mod.dll").exists());
+
+      let v2 = repo.publish(&[Pkg {
+        full_name: MOD,
+        version: "2.0.0",
+        deps: &[],
+        files: &[("plugins/Mod.dll", b"v2")],
+      }]);
+
+      repo.install(&v2, &[MOD], &[], false);
+
+      assert!(!repo.entry(MOD).enabled);
+      assert!(repo.path("BepInEx/plugins/Author-Mod/Mod.dll.old").exists());
+      assert!(!repo.path("BepInEx/plugins/Author-Mod/Mod.dll").exists());
+      assert!(!repo.path("BepInEx/plugins/Author-Mod/Old.dll.old").exists());
+    }
+
+    #[test]
+    fn naming_a_disabled_mod_at_its_recorded_version_enables_it() {
+      let mut repo = Repo::new();
+      let index = repo.publish(&[Pkg {
+        full_name: MOD,
+        version: "1.0.0",
+        deps: &[],
+        files: &[("plugins/Mod.dll", b"v1")],
+      }]);
+
+      repo.install(&index, &[MOD], &[MOD], false);
+
+      set_enabled_in(repo.target.path(), &repo.eco, "valheim", MOD, false).unwrap();
+
+      let outcome = repo.install(&index, &[MOD], &[MOD], false);
+
+      assert_eq!(outcome.unchanged, names(&[MOD]));
+      assert!(repo.entry(MOD).enabled);
+      assert!(repo.path("BepInEx/plugins/Author-Mod/Mod.dll").exists());
+      assert!(!repo.path("BepInEx/plugins/Author-Mod/Mod.dll.old").exists());
+    }
+
+    #[test]
+    fn shared_config_survives_force_and_an_update() {
+      let mut repo = Repo::new();
+      let v1 = repo.publish(&[Pkg {
+        full_name: MOD,
+        version: "1.0.0",
+        deps: &[],
+        files: &[("plugins/Mod.dll", b"v1"), ("config/Mod.cfg", b"default")],
+      }]);
+
+      repo.install(&v1, &[MOD], &[MOD], false);
+
+      let cfg = repo.path("BepInEx/config/Mod.cfg");
+
+      write_file(&cfg, b"edited");
+      repo.install(&v1, &[MOD], &[MOD], true);
+
+      assert_eq!(std::fs::read(&cfg).unwrap(), b"edited");
+
+      let v2 = repo.publish(&[Pkg {
+        full_name: MOD,
+        version: "2.0.0",
+        deps: &[],
+        files: &[("plugins/Mod.dll", b"v2"), ("config/Mod.cfg", b"default")],
+      }]);
+
+      repo.install(&v2, &[MOD], &[MOD], false);
+
+      assert_eq!(std::fs::read(&cfg).unwrap(), b"edited");
+    }
+
+    #[test]
+    fn force_reinstalls_a_loader_pack_and_keeps_its_config() {
+      let mut repo = Repo::new();
+      let index = repo.publish(&[Pkg {
+        full_name: LOADER,
+        version: "5.4.2333",
+        deps: &[],
+        files: &[
+          ("BepInExPack_Valheim/winhttp.dll", b"proxy"),
+          ("BepInExPack_Valheim/BepInEx/core/BepInEx.dll", b"core"),
+          ("BepInExPack_Valheim/BepInEx/config/BepInEx.cfg", b"default"),
+        ],
+      }]);
+
+      repo.install(&index, &[LOADER], &[LOADER], false);
+
+      let cfg = repo.path("BepInEx/config/BepInEx.cfg");
+      let core = repo.path("BepInEx/core/BepInEx.dll");
+
+      write_file(&cfg, b"edited");
+      write_file(&core, b"tampered");
+
+      let outcome = repo.install(&index, &[LOADER], &[LOADER], true);
+
+      assert_eq!(outcome.succeeded, names(&[LOADER]));
+      assert_eq!(std::fs::read(&core).unwrap(), b"core");
+      assert!(repo.path("winhttp.dll").exists());
+      assert_eq!(std::fs::read(&cfg).unwrap(), b"edited");
+      assert!(state_file_path(repo.target.path(), LOADER).exists());
+    }
+
+    #[test]
+    fn a_recorded_mod_whose_folder_is_gone_is_reinstalled() {
+      let mut repo = Repo::new();
+      let index = repo.publish(&[Pkg {
+        full_name: MOD,
+        version: "1.0.0",
+        deps: &[],
+        files: &[("plugins/Mod.dll", b"v1")],
+      }]);
+
+      repo.install(&index, &[MOD], &[MOD], false);
+
+      std::fs::remove_dir_all(repo.path("BepInEx/plugins/Author-Mod")).unwrap();
+
+      let outcome = repo.install(&index, &[MOD], &[MOD], false);
+
+      assert_eq!(outcome.succeeded, names(&[MOD]));
+      assert!(outcome.unchanged.is_empty());
+      assert!(repo.path("BepInEx/plugins/Author-Mod/Mod.dll").exists());
+    }
+
+    #[test]
+    fn a_loader_pack_missing_a_tracked_file_is_reinstalled() {
+      let mut repo = Repo::new();
+      let index = repo.publish(&[Pkg {
+        full_name: LOADER,
+        version: "5.4.2333",
+        deps: &[],
+        files: &[
+          ("BepInExPack_Valheim/winhttp.dll", b"proxy"),
+          ("BepInExPack_Valheim/BepInEx/core/BepInEx.dll", b"core"),
+        ],
+      }]);
+
+      repo.install(&index, &[LOADER], &[LOADER], false);
+
+      std::fs::remove_file(repo.path("winhttp.dll")).unwrap();
+
+      let outcome = repo.install(&index, &[LOADER], &[LOADER], false);
+
+      assert_eq!(outcome.succeeded, names(&[LOADER]));
+      assert!(repo.path("winhttp.dll").exists());
+    }
+
+    #[test]
+    fn a_recorded_mod_with_no_files_to_place_is_skipped() {
+      let mut repo = Repo::new();
+      let index = repo.publish(&[Pkg {
+        full_name: MOD,
+        version: "1.0.0",
+        deps: &[],
+        files: &[("manifest.json", b"{}"), ("README.md", b"modpack")],
+      }]);
+
+      repo.install(&index, &[MOD], &[MOD], false);
+
+      let outcome = repo.install(&index, &[MOD], &[MOD], false);
+
+      assert!(outcome.succeeded.is_empty());
+      assert_eq!(outcome.unchanged, names(&[MOD]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_enable_is_reported_per_item_without_losing_the_batch() {
+      use std::os::unix::fs::PermissionsExt;
+
+      let mut repo = Repo::new();
+      let index = repo.publish(&[
+        Pkg {
+          full_name: MOD,
+          version: "1.0.0",
+          deps: &[],
+          files: &[("plugins/Mod.dll", b"v1")],
+        },
+        Pkg {
+          full_name: DEP,
+          version: "1.0.0",
+          deps: &[],
+          files: &[("plugins/Dep.dll", b"dep")],
+        },
+      ]);
+
+      repo.install(&index, &[MOD], &[MOD], false);
+
+      set_enabled_in(repo.target.path(), &repo.eco, "valheim", MOD, false).unwrap();
+
+      // A read-only folder makes the `.old` rename fail, as a locked file would.
+      let folder = repo.path("BepInEx/plugins/Author-Mod");
+
+      std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+      if std::fs::write(folder.join("probe"), b"").is_ok() {
+        // Running as root: permissions cannot force the failure.
+        return;
+      }
+
+      let desired = names(&[MOD, DEP]);
+      let batch = plan_install_batch(repo.target.path(), &desired, &desired).unwrap();
+      let result = repo.rt.block_on(install_batch(
+        repo.target.path(),
+        repo.cache_base.path(),
+        &repo.eco,
+        &index,
+        &repo.client,
+        "valheim",
+        &batch,
+        1,
+      ));
+
+      std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+      let outcome = result.expect("a failed enable must not discard the batch");
+      let failed: Vec<&str> = outcome.failed.iter().map(|(n, _)| n.as_str()).collect();
+
+      assert_eq!(failed, vec![MOD]);
+      assert_eq!(outcome.succeeded, names(&[DEP]));
+      assert!(outcome.unchanged.is_empty());
+    }
+
+    #[test]
+    fn a_disabled_mod_not_named_is_still_skipped() {
+      let mut repo = Repo::new();
+      let index = repo.publish(&[Pkg {
+        full_name: MOD,
+        version: "1.0.0",
+        deps: &[],
+        files: &[("plugins/Mod.dll", b"v1")],
+      }]);
+
+      repo.install(&index, &[MOD], &[MOD], false);
+
+      set_enabled_in(repo.target.path(), &repo.eco, "valheim", MOD, false).unwrap();
+
+      let outcome = repo.install(&index, &[MOD], &[], false);
+
+      assert_eq!(outcome.unchanged, names(&[MOD]));
+      assert!(!repo.entry(MOD).enabled);
+      assert!(repo.path("BepInEx/plugins/Author-Mod/Mod.dll.old").exists());
+    }
+
+    #[test]
+    fn a_mod_left_half_disabled_is_reinstalled() {
+      let mut repo = Repo::new();
+      let index = repo.publish(&[Pkg {
+        full_name: MOD,
+        version: "1.0.0",
+        deps: &[],
+        files: &[("plugins/Mod.dll", b"v1"), ("plugins/Extra.dll", b"v1")],
+      }]);
+
+      repo.install(&index, &[MOD], &[MOD], false);
+
+      // A disable that failed after its first rename: one file toggled, the
+      // other not, and `mods.yml` still recording the mod as enabled.
+      let extra = repo.path("BepInEx/plugins/Author-Mod/Extra.dll");
+
+      std::fs::rename(
+        &extra,
+        repo.path("BepInEx/plugins/Author-Mod/Extra.dll.old"),
+      )
+      .unwrap();
+
+      let outcome = repo.install(&index, &[MOD], &[MOD], false);
+
+      assert_eq!(outcome.succeeded, names(&[MOD]));
+      assert!(outcome.unchanged.is_empty());
+      assert!(extra.exists());
+      assert!(
+        !repo
+          .path("BepInEx/plugins/Author-Mod/Extra.dll.old")
+          .exists()
+      );
+      assert!(repo.path("BepInEx/plugins/Author-Mod/Mod.dll").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_loader_reinstall_keeps_it_uninstallable() {
+      let mut repo = Repo::new();
+      let v1 = repo.publish(&[Pkg {
+        full_name: LOADER,
+        version: "5.4.2333",
+        deps: &[],
+        files: &[
+          ("BepInExPack_Valheim/winhttp.dll", b"proxy"),
+          ("BepInExPack_Valheim/BepInEx/core/BepInEx.dll", b"core"),
+        ],
+      }]);
+
+      repo.install(&v1, &[LOADER], &[LOADER], false);
+
+      let v2 = repo.publish(&[Pkg {
+        full_name: LOADER,
+        version: "5.4.2334",
+        deps: &[],
+        files: &[
+          ("BepInExPack_Valheim/winhttp.dll", b"proxy"),
+          ("BepInExPack_Valheim/BepInEx/core/BepInEx.dll", b"core"),
+          ("BepInExPack_Valheim/BepInEx/core/Extra.dll", b"extra"),
+        ],
+      }]);
+
+      // A symlink at a destination only the new version writes makes the apply
+      // refuse after the old payload is already gone.
+      std::os::unix::fs::symlink(
+        repo.path("elsewhere.dll"),
+        repo.path("BepInEx/core/Extra.dll"),
+      )
+      .unwrap();
+
+      let desired = names(&[LOADER]);
+      let batch = plan_install_batch(repo.target.path(), &desired, &desired).unwrap();
+      let outcome = repo
+        .rt
+        .block_on(install_batch(
+          repo.target.path(),
+          repo.cache_base.path(),
+          &repo.eco,
+          &v2,
+          &repo.client,
+          "valheim",
+          &batch,
+          2,
+        ))
+        .unwrap();
+      let failed: Vec<&str> = outcome.failed.iter().map(|(n, _)| n.as_str()).collect();
+
+      assert_eq!(failed, vec![LOADER]);
+      assert!(state_file_path(repo.target.path(), LOADER).exists());
+
+      uninstall_mod_in(repo.target.path(), &repo.eco, "valheim", LOADER).unwrap();
+
+      assert!(modlist::read(repo.target.path()).unwrap().is_empty());
+      assert!(!state_file_path(repo.target.path(), LOADER).exists());
+    }
   }
 }

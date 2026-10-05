@@ -111,6 +111,75 @@ fn export_then_import_round_trips_into_a_new_target() {
   idx.assert();
 }
 
+/// A mod that fails stops an import before its configs are extracted, so the
+/// error has to say the import is unfinished and that retrying completes it.
+#[test]
+fn a_failed_import_tells_the_user_to_retry_to_finish_it() {
+  let mut server = Server::new();
+
+  let _dl = server
+    .mock("GET", "/dl/mod.zip")
+    .with_status(200)
+    .with_body(build_mod_zip())
+    .create();
+  let _idx = server
+    .mock("GET", "/pkg/")
+    .with_status(200)
+    .with_header("Content-Type", "application/json")
+    .with_header("Last-Modified", "Wed, 21 Feb 2024 15:30:45 GMT")
+    .with_body(index_json(&server.url()))
+    .create();
+
+  let cache = tempdir().unwrap();
+  let base = tempdir().unwrap();
+
+  let client = ThunderstoreClient::builder()
+    .package_index_url(format!("{}/pkg/", server.url()))
+    .base_url(server.url())
+    .cache_dir(cache.path())
+    .build()
+    .unwrap();
+
+  let rt = Runtime::new().unwrap();
+  let eco = Ecosystem::bundled();
+  let index = rt.block_on(client.get_manifest()).unwrap();
+
+  let source = base.path().join("source");
+
+  rt.block_on(profile::install_mod_in(
+    &source,
+    base.path(),
+    &eco,
+    &index,
+    &client,
+    "valheim",
+    "Author-CoolMod",
+    1,
+  ))
+  .unwrap();
+
+  let r2z = profile::portability::build_r2z_in(&source, "Shared").unwrap();
+
+  // An index without the exported mod makes its install fail.
+  let empty = thunderstore_engine::models::PackageIndex::from(Vec::new());
+  let error = rt
+    .block_on(profile::portability::import_r2z_in(
+      &base.path().join("target"),
+      base.path(),
+      &eco,
+      &empty,
+      &client,
+      "valheim",
+      &r2z,
+      2,
+    ))
+    .unwrap_err()
+    .to_string();
+
+  assert!(error.contains("Author-CoolMod"), "{error}");
+  assert!(error.contains("retry the import"), "{error}");
+}
+
 /// `import_in` has to route one source string to the same place a caller
 /// classifying it by hand would, and read the archive itself rather than being
 /// handed its bytes. Both routes are driven here from the string alone.
@@ -292,7 +361,11 @@ fn install_batch_reapplies_disabled_state_despite_a_mid_batch_failure() {
   // "Author-Missing" resolves to nothing in the index, so the batch fails on
   // it after Author-CoolMod has already been reinstalled.
   let desired = vec!["Author-CoolMod".to_string(), "Author-Missing".to_string()];
-  let batch = profile::plan_install_batch(&target, &desired, &[]).unwrap();
+  let mut batch = profile::plan_install_batch(&target, &desired, &[]).unwrap();
+
+  // Forced so Author-CoolMod is really reinstalled at its recorded version,
+  // which is the re-enable the restore has to undo.
+  batch.force = true;
 
   assert_eq!(batch.protect_disabled, vec!["Author-CoolMod".to_string()]);
 
@@ -936,6 +1009,95 @@ fn import_r2z_in_lets_an_exported_per_mod_config_survive_the_reinstall() {
 
   dl.assert();
   idx.assert();
+}
+
+#[test]
+fn import_r2z_in_enables_a_mod_the_target_has_disabled_at_the_same_version() {
+  let mut server = Server::new();
+
+  let _dl = server
+    .mock("GET", "/dl/mod.zip")
+    .with_status(200)
+    .with_body(build_mod_zip())
+    .create();
+  let _idx = server
+    .mock("GET", "/pkg/")
+    .with_status(200)
+    .with_header("Content-Type", "application/json")
+    .with_header("Last-Modified", "Wed, 21 Feb 2024 15:30:45 GMT")
+    .with_body(index_json(&server.url()))
+    .create();
+
+  let cache = tempdir().unwrap();
+  let base = tempdir().unwrap();
+
+  let client = ThunderstoreClient::builder()
+    .package_index_url(format!("{}/pkg/", server.url()))
+    .base_url(server.url())
+    .cache_dir(cache.path())
+    .build()
+    .unwrap();
+
+  let rt = Runtime::new().unwrap();
+  let eco = Ecosystem::bundled();
+  let index = rt.block_on(client.get_manifest()).unwrap();
+  let source = base.path().join("source");
+  let target = base.path().join("target");
+
+  for dir in [&source, &target] {
+    rt.block_on(profile::install_mod_in(
+      dir,
+      base.path(),
+      &eco,
+      &index,
+      &client,
+      "valheim",
+      "Author-CoolMod",
+      1,
+    ))
+    .unwrap();
+  }
+
+  profile::set_enabled_in(&target, &eco, "valheim", "Author-CoolMod", false).unwrap();
+
+  let r2z = profile::portability::build_r2z_in(&source, "Shared").unwrap();
+
+  // The target already records this version, so the import skips the
+  // reinstall that used to re-enable the mod as a side effect.
+  let imported = rt
+    .block_on(profile::portability::import_r2z_in(
+      &target,
+      base.path(),
+      &eco,
+      &index,
+      &client,
+      "valheim",
+      &r2z,
+      2,
+    ))
+    .unwrap();
+
+  assert_eq!(
+    imported,
+    vec!["Author-CoolMod".to_string()],
+    "a mod skipped as current is still part of the imported profile"
+  );
+
+  let mods = profile::modlist::read(&target).unwrap();
+
+  assert!(
+    mods
+      .iter()
+      .find(|m| m.name == "Author-CoolMod")
+      .unwrap()
+      .enabled,
+    "the export records the mod enabled, so the import must leave it enabled"
+  );
+  assert!(
+    target
+      .join("BepInEx/plugins/Author-CoolMod/CoolMod.dll")
+      .exists()
+  );
 }
 
 /// `fs::copy(p, p)` opens the destination with `O_TRUNC` before reading the

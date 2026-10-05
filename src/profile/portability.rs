@@ -623,12 +623,15 @@ pub fn extract_configs_in(target_dir: &Path, zip_bytes: &[u8]) -> Result<Vec<Pat
 ///
 /// These three steps run in this order deliberately:
 ///
-/// 1. **Install first, extract configs second.** A per-mod config under
-///    `BepInEx/plugins/<Owner-Name>/` is `Subdir`-tracked, so installing a
-///    package always (re)writes its packaged default. Extracting configs
-///    before installing would let that default clobber the user's exported
-///    config the moment its owning mod is installed; extracting after
-///    ensures the exported config is what's left on disk.
+/// 1. **Install first, extract configs second.** Most configs live in the
+///    shared `BepInEx/config/`, which an install never removes. A few mods
+///    keep settings inside their own `BepInEx/plugins/<Owner-Name>/` folder
+///    instead, and installing (or updating) a mod deletes that folder and
+///    writes the package's files fresh, as r2modman does. Extracting configs
+///    before installing would lose those exported files the moment their
+///    owning mod is installed; extracting after ensures the exported config
+///    is what's left on disk. A mod skipped as already current is not
+///    touched.
 /// 2. **Disable pass runs after every install, inside the batch.** It still
 ///    runs only once every mod in the batch is installed, which is what
 ///    makes it immune to a dependency installed later re-enabling an entry
@@ -645,7 +648,10 @@ pub fn extract_configs_in(target_dir: &Path, zip_bytes: &[u8]) -> Result<Vec<Pat
 /// warning.
 ///
 /// `cache_base` is the package cache root and must not be `target_dir` — see
-/// [`crate::profile::install_mod_in`]. Returns the sorted identifiers installed.
+/// [`crate::profile::install_mod_in`]. Returns the sorted identifiers the
+/// import covers, dependencies included: those installed and those skipped as
+/// already current, so importing a profile the target already matches still
+/// lists every mod.
 #[allow(clippy::too_many_arguments)]
 pub async fn import_r2z_in(
   target_dir: &Path,
@@ -666,7 +672,17 @@ pub async fn import_r2z_in(
     .filter(|entry| !entry.enabled)
     .map(|entry| entry.name.clone())
     .collect();
-  let batch = crate::profile::InstallBatch::new(desired, protect);
+  let mut batch = crate::profile::InstallBatch::new(desired, protect);
+
+  // A mod already recorded at its latest version is skipped rather than
+  // reinstalled, so one the export has enabled but the target has disabled
+  // would otherwise stay disabled.
+  batch.enable_requested = export
+    .mods
+    .iter()
+    .filter(|entry| entry.enabled)
+    .map(|entry| entry.name.clone())
+    .collect();
 
   let outcome = crate::profile::install_batch(
     target_dir,
@@ -680,20 +696,27 @@ pub async fn import_r2z_in(
   )
   .await?;
 
+  // Configs are not extracted after a failure, so the import is unfinished.
+  // A retry skips the mods already installed and completes it.
   if let Some((name, error)) = outcome.failed.into_iter().next() {
-    return Err(Error::Profile(format!("importing {name}: {error}")));
+    return Err(Error::Profile(format!(
+      "importing {name}: {error}; the import is unfinished (its config files were \
+       not restored), retry the import to finish it"
+    )));
   }
 
   // Configs are extracted after every install, so an exported per-mod config
   // wins over the package default the install just wrote.
   extract_configs_in(target_dir, zip_bytes)?;
 
-  let mut installed = outcome.succeeded;
+  // A mod skipped as already current is still part of the imported profile.
+  let mut imported = outcome.succeeded;
 
-  installed.sort();
-  installed.dedup();
+  imported.extend(outcome.unchanged);
+  imported.sort();
+  imported.dedup();
 
-  Ok(installed)
+  Ok(imported)
 }
 
 /// Imports a shared profile by its Thunderstore code. See [`import_r2z_in`].
@@ -851,8 +874,11 @@ pub async fn adopt_r2modman_dir_in(
 
   let index = client.get_manifest().await?;
 
+  // Forced: the copied mods.yml already records each loader, usually at the
+  // version that would be installed, which an ordinary install skips. The
+  // reinstall is the point, since it is what writes the record.
   for full_name in &unrecorded {
-    crate::profile::install_mod_in(
+    crate::profile::install_named_in(
       target_dir,
       cache_base,
       eco,
@@ -860,6 +886,7 @@ pub async fn adopt_r2modman_dir_in(
       client,
       game,
       full_name,
+      true,
       installed_at_time,
     )
     .await?;
@@ -921,10 +948,9 @@ pub fn needs_adoption(target_dir: &Path, desired: &[String]) -> Result<bool> {
 
 /// Adopts `desired` into `target_dir`'s record, then reconciles once complete.
 ///
-/// Installing rewrites whatever an older folder-based installer placed, so this
-/// is safe over an existing install and safe to retry after a partial failure: an
-/// already-recorded entry is simply reinstalled, which is cheap once its archive
-/// is cached.
+/// Installing clears and rewrites whatever an older folder-based installer
+/// placed, so this is safe over an existing install and safe to retry after a
+/// partial failure: an entry already recorded at its latest version is skipped.
 ///
 /// The delisted sweep runs **only** when every desired name is adopted. Running
 /// it against a partial record would delete mods that have not been reached yet.
