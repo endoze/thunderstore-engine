@@ -1,6 +1,6 @@
 [package]
 name = "thunderstore-engine"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Game-agnostic Thunderstore engine: API client, caching, dependency resolution, zip extraction, and schema-driven mod-loader install rules"
 authors = ["Endoze <endoze@endozemedia.com>"]
