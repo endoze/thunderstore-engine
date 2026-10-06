@@ -26,7 +26,7 @@ use crate::ecosystem::{Ecosystem, GameProfile, InstallRule, ModloaderPackage, Tr
 use crate::error::{Error, Result};
 use crate::util::io_context;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -65,6 +65,44 @@ pub fn state_tracker_from_plan(plan: &InstallPlan, mod_name: &str) -> Option<Mod
   Some(ModFileTracker {
     mod_name: mod_name.to_string(),
     files,
+  })
+}
+
+/// Whether every file `plan` tracks is still on disk under `root`, so a mod
+/// recorded at the planned version can be skipped instead of reinstalled.
+///
+/// A namespaced file must be at `name` while the mod is `enabled` and at
+/// `name.old` while it is not, since disabling renames it. A name that already
+/// ends in `.old` is never renamed, so it is checked as is. A mix of the two (a
+/// toggle that failed partway) is not on disk, so the reinstall repairs it. A
+/// `State` file needs the mod's `_state` tracker, and is only required on
+/// disk while the mod is `enabled`, since disabling removes it. Shared `none`
+/// files are not checked: a user may delete a config on purpose. A plan that
+/// tracks nothing (a modpack of only metadata) is trivially on disk.
+pub fn plan_is_on_disk(plan: &InstallPlan, root: &Path, mod_name: &str, enabled: bool) -> bool {
+  let has_tracker = state_file_path(root, mod_name).exists();
+
+  plan.entries.iter().all(|entry| {
+    let dest = root.join(&entry.dest_relative);
+
+    match entry.tracking {
+      TrackingMethod::None => true,
+      TrackingMethod::State => has_tracker && (!enabled || dest.exists()),
+      tracking if tracking.is_namespaced() => {
+        let already_old = dest.to_string_lossy().to_lowercase().ends_with(".old");
+
+        if enabled || already_old {
+          return dest.exists();
+        }
+
+        let mut disabled = dest.clone().into_os_string();
+
+        disabled.push(".old");
+
+        Path::new(&disabled).exists()
+      }
+      _ => dest.exists(),
+    }
   })
 }
 
@@ -115,14 +153,30 @@ pub fn read_state_file(profile_dir: &Path, mod_name: &str) -> Result<Option<ModF
 /// skipped. Unlike [`disable_mod`], this also deletes the tracker itself, since
 /// after an uninstall there is nothing left to restore.
 pub fn remove_state_payload(profile_dir: &Path, mod_name: &str) -> Result<()> {
-  let tracker = match read_state_file(profile_dir, mod_name)? {
-    Some(tracker) => tracker,
-    None => return Ok(()),
-  };
+  clear_state_files(profile_dir, mod_name)?;
 
-  remove_state_files(profile_dir, &tracker)?;
+  remove_state_file(profile_dir, mod_name)
+}
 
+/// Removes a mod's `State`-tracked payload files but keeps its `_state` file, so
+/// a reinstall that fails before writing a new one still leaves the record that
+/// [`remove_state_payload`] needs to uninstall the mod. A missing `_state` file
+/// is a no-op.
+pub fn clear_state_files(profile_dir: &Path, mod_name: &str) -> Result<()> {
+  match read_state_file(profile_dir, mod_name)? {
+    Some(tracker) => remove_state_files(profile_dir, &tracker),
+    None => Ok(()),
+  }
+}
+
+/// Removes a mod's `_state` file, if it has one, leaving any payload files it
+/// names in place.
+pub fn remove_state_file(profile_dir: &Path, mod_name: &str) -> Result<()> {
   let path = state_file_path(profile_dir, mod_name);
+
+  if !path.exists() {
+    return Ok(());
+  }
 
   fs::remove_file(&path).map_err(|e| io_context(format!("removing {}", path.display()), e))
 }
@@ -301,6 +355,7 @@ fn plan_regular_mod(
   }
 
   let mut entries = Vec::new();
+  let mut claimed: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
 
   for file in walk_files(extracted_root)? {
     let rel = file
@@ -312,16 +367,42 @@ fn plan_regular_mod(
       RouteOutcome::Route {
         dest_relative,
         tracking,
-      } => entries.push(InstallEntry {
-        source: file,
-        dest_relative,
-        tracking,
-      }),
+      } => {
+        if let Some(earlier) = claimed.insert(dest_relative.clone(), rel.clone()) {
+          return Err(colliding_files(&earlier, &rel, &dest_relative));
+        }
+
+        entries.push(InstallEntry {
+          source: file,
+          dest_relative,
+          tracking,
+        });
+      }
       RouteOutcome::Skip(reason) => log_route_skip(&rel, reason),
     }
   }
 
   Ok(InstallPlan { entries })
+}
+
+/// The error for two package files routed onto one destination, which would
+/// otherwise let the later copy silently overwrite the earlier one.
+///
+/// This happens when files sit in ordinary folders: like r2modman, those files
+/// are flattened to their name under the mod's folder, so only an override
+/// folder such as `plugins/` keeps them apart. Refusing the package names the
+/// conflict instead of installing a mod that is missing a file.
+fn colliding_files(first: &Path, second: &Path, dest: &Path) -> Error {
+  let show = |path: &Path| path.to_string_lossy().replace('\\', "/");
+
+  Error::Install(format!(
+    "package files {} and {} would both install to {}; files outside an override \
+     folder such as plugins/ are flattened to their name, so the package must ship \
+     them under one to keep them apart",
+    show(first),
+    show(second),
+    show(dest)
+  ))
 }
 
 /// The outcome of routing a single extracted file through a profile's rules.
@@ -375,9 +456,9 @@ fn route_file(
     return Ok(RouteOutcome::Skip(SkipReason::Excluded));
   }
 
-  let resolution = resolve_dir(&profile.install_rules, Path::new(""), rel)
+  let resolution = resolve_override(&profile.install_rules, rel)
     .or_else(|| loose_file_route(flat, name))
-    .or_else(|| default_route(flat, rel));
+    .or_else(|| default_route(flat, rel, name));
 
   let RouteResolution {
     route,
@@ -475,13 +556,40 @@ fn flatten_rules<'a>(rules: &'a [InstallRule], parent: &Path, out: &mut Vec<Flat
   }
 }
 
+/// Resolves a file through an override folder at any depth. When the top folder
+/// is not one (e.g. a wrapper such as `BepInEx/` or `ZenUI/`), the walk steps
+/// inside it and tries again, dropping the wrapper, as r2modman's
+/// buildInstallForRuleSubtype recurses into ordinary folders. Once a folder
+/// matches, everything beneath it is placed by [`resolve_dir`].
+fn resolve_override(rules: &[InstallRule], rel: &Path) -> Option<RouteResolution> {
+  let mut current = rel;
+
+  loop {
+    if let Some(found) = resolve_dir(rules, Path::new(""), current) {
+      return Some(found);
+    }
+
+    let mut comps = current.components();
+
+    comps.next()?;
+    current = comps.as_path();
+  }
+}
+
 /// Resolves a file whose top component names an override folder (recursively into
 /// subroutes), returning the destination route, its tracking, and the remaining
 /// path to place under it.
+///
+/// Only a directory matches an override folder: a lone file named like one (e.g.
+/// a root file called `plugins`) has nothing beneath it to place, so it is left
+/// to extension or default routing.
 fn resolve_dir(rules: &[InstallRule], parent_full: &Path, rel: &Path) -> Option<RouteResolution> {
   let mut comps = rel.components();
   let first = comps.next()?.as_os_str().to_str()?;
   let rest = comps.as_path();
+
+  // A lone file (nothing beneath `first`) is not a folder match.
+  rest.components().next()?;
 
   for rule in rules {
     if !route_leaf(&rule.route).eq_ignore_ascii_case(first) {
@@ -490,7 +598,7 @@ fn resolve_dir(rules: &[InstallRule], parent_full: &Path, rel: &Path) -> Option<
 
     let full = join_route(parent_full, &rule.route);
 
-    if !rule.sub_routes.is_empty() && rest.components().next().is_some() {
+    if !rule.sub_routes.is_empty() {
       if let Some(found) = resolve_dir(&rule.sub_routes, &full, rest) {
         return Some(found);
       }
@@ -539,15 +647,24 @@ fn loose_file_route(flat: &[FlatRule<'_>], name: &str) -> Option<RouteResolution
   })
 }
 
-/// Routes a file that matched nothing to the profile's default-location rule,
-/// preserving its full relative path under that route.
-fn default_route(flat: &[FlatRule<'_>], rel: &Path) -> Option<RouteResolution> {
+/// Routes a file that matched nothing to the profile's default-location rule.
+///
+/// A `subdir` default flattens the file to its base name (`name`), as r2modman's
+/// installSubDir does for a file it reached by walking into ordinary folders;
+/// every other method preserves the full relative path under the route.
+fn default_route(flat: &[FlatRule<'_>], rel: &Path, name: &str) -> Option<RouteResolution> {
   let matched = flat.iter().find(|r| r.rule.is_default_location)?;
+  let tracking = matched.rule.tracking_method;
+
+  let remainder = match tracking {
+    TrackingMethod::Subdir => PathBuf::from(name),
+    _ => rel.to_path_buf(),
+  };
 
   Some(RouteResolution {
     route: matched.full_route.clone(),
-    tracking: matched.rule.tracking_method,
-    remainder: rel.to_path_buf(),
+    tracking,
+    remainder,
   })
 }
 
@@ -571,8 +688,7 @@ fn best_extension<'a>(flat: &'a [FlatRule<'a>], name: &str) -> Option<&'a FlatRu
 
 /// Computes the destination for a routed file, applying `<ident>` namespacing for
 /// per-mod tracking methods. Returns `None` for methods with no per-file placement
-/// (`package-zip`, unknown) and for a flattened `subdir` remainder that has no file
-/// name, all of which the caller skips.
+/// (`package-zip`, unknown), which the caller skips.
 fn build_dest(
   route: &Path,
   tracking: TrackingMethod,
@@ -580,14 +696,12 @@ fn build_dest(
   remainder: &Path,
 ) -> Option<PathBuf> {
   match tracking {
-    // `subdir` flattens: the matched file lands at `route/<ident>/<basename>`,
-    // dropping any intermediate directories (mirrors r2modman's installSubDir).
-    // A remainder with no file name (defensive) has no placement, so skip it.
-    TrackingMethod::Subdir => remainder
-      .file_name()
-      .map(|name| route.join(ident).join(name)),
-    // `subdir-no-flatten` namespaces the file but preserves its relative sub-path.
-    TrackingMethod::SubdirNoFlatten => Some(route.join(ident).join(remainder)),
+    // Both namespace the file under `route/<ident>/` and keep the remainder as
+    // resolved. Where `subdir` flattens (a file outside an override folder),
+    // the resolver has already reduced the remainder to the base name.
+    TrackingMethod::Subdir | TrackingMethod::SubdirNoFlatten => {
+      Some(route.join(ident).join(remainder))
+    }
     TrackingMethod::None | TrackingMethod::State => Some(route.join(remainder)),
     TrackingMethod::PackageZip | TrackingMethod::Other => None,
   }
@@ -923,6 +1037,56 @@ pub fn remove_delisted(
   }
 
   Ok(planned)
+}
+
+/// Removes one mod's `<route>/<ident>/` folder under every namespaced route, so
+/// a reinstall starts from an empty folder instead of writing beside files the
+/// new version no longer ships (or a disabled install's `.old` files).
+///
+/// Shared routes (`none`, `state`) are untouched; a mod's `State`-tracked files
+/// are removed by [`remove_state_payload`] instead. A symlink where the folder
+/// would be is left alone, never followed, as [`remove_delisted`] does.
+pub fn remove_mod_folders(profile: &GameProfile, root: &Path, ident: &str) -> Result<()> {
+  let mut components = Path::new(ident).components();
+
+  if !matches!(
+    (components.next(), components.next()),
+    (Some(Component::Normal(_)), None)
+  ) {
+    return Err(Error::Install(format!(
+      "refusing to remove folders for unsafe mod name {ident:?}"
+    )));
+  }
+
+  let mut routes = Vec::new();
+
+  collect_routes(
+    &profile.install_rules,
+    Path::new(""),
+    &|rule| rule.tracking_method.is_namespaced(),
+    &mut routes,
+  );
+
+  for route in routes {
+    let relative = route.join(ident);
+
+    ensure_safe_relative(&relative)?;
+
+    let path = root.join(&relative);
+
+    let is_real_dir = match fs::symlink_metadata(&path) {
+      Ok(metadata) => metadata.is_dir(),
+      Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+      Err(e) => return Err(io_context(format!("inspecting {}", path.display()), e)),
+    };
+
+    if is_real_dir {
+      fs::remove_dir_all(&path)
+        .map_err(|e| io_context(format!("removing mod folder {}", path.display()), e))?;
+    }
+  }
+
+  Ok(())
 }
 
 /// Decides which directories under a namespaced route should be removed, given a
@@ -1363,22 +1527,221 @@ mod tests {
   }
 
   #[test]
-  fn test_subdir_tracking_flattens_nested_file() {
+  fn test_subdir_override_folder_preserves_subpath() {
     let eco = eco();
     let profile = profile(&eco, "valheim");
 
     let pkg = tempdir().unwrap();
     let root = pkg.path();
 
-    // A file nested inside the subdir-tracked plugins override folder is flattened
-    // into the mod's namespaced folder, dropping the intermediate directory.
+    // A file nested inside the subdir-tracked plugins override folder keeps its
+    // path beneath that folder; only the matched `plugins/` itself is stripped.
     write(&root.join("plugins/nested/Deep.dll"), b"deep");
+    write(&root.join("plugins/Translations/German/german.json"), b"de");
 
     let plan = plan_install(&eco, &profile, "Author-MyMod", root, None).unwrap();
     let dests = dest_set(&plan);
 
-    assert!(dests.contains(&"BepInEx/plugins/Author-MyMod/Deep.dll".to_string()));
-    assert!(!dests.iter().any(|d| d.contains("nested")));
+    assert!(dests.contains(&"BepInEx/plugins/Author-MyMod/nested/Deep.dll".to_string()));
+    assert!(
+      dests.contains(&"BepInEx/plugins/Author-MyMod/Translations/German/german.json".to_string())
+    );
+  }
+
+  #[test]
+  fn test_subdir_override_folder_keeps_same_named_files_apart() {
+    let eco = eco();
+    let profile = profile(&eco, "valheim");
+
+    let pkg = tempdir().unwrap();
+    let root = pkg.path();
+
+    write(&root.join("plugins/English/strings.json"), b"en");
+    write(&root.join("plugins/German/strings.json"), b"de");
+
+    let plan = plan_install(&eco, &profile, "Author-MyMod", root, None).unwrap();
+    let dests = dest_set(&plan);
+
+    assert_eq!(
+      dests,
+      vec![
+        "BepInEx/plugins/Author-MyMod/English/strings.json".to_string(),
+        "BepInEx/plugins/Author-MyMod/German/strings.json".to_string(),
+      ]
+    );
+  }
+
+  #[test]
+  fn test_override_folder_inside_a_wrapper_folder_is_matched() {
+    let eco = eco();
+    let profile = profile(&eco, "valheim");
+
+    let pkg = tempdir().unwrap();
+    let root = pkg.path();
+
+    // r2modman walks into a folder that is not an override folder and matches
+    // one further down, dropping the wrapper.
+    write(&root.join("BepInEx/plugins/Mod.dll"), b"dll");
+    write(&root.join("BepInEx/config/Mod.cfg"), b"cfg");
+    write(
+      &root.join("ZenUI/plugins/Translations/German/strings.json"),
+      b"de",
+    );
+    write(
+      &root.join("ZenUI/plugins/Translations/English/strings.json"),
+      b"en",
+    );
+
+    let plan = plan_install(&eco, &profile, "Author-Mod", root, None).unwrap();
+    let dests = dest_set(&plan);
+
+    assert_eq!(
+      dests,
+      vec![
+        "BepInEx/config/Mod.cfg".to_string(),
+        "BepInEx/plugins/Author-Mod/Mod.dll".to_string(),
+        "BepInEx/plugins/Author-Mod/Translations/English/strings.json".to_string(),
+        "BepInEx/plugins/Author-Mod/Translations/German/strings.json".to_string(),
+      ]
+    );
+
+    let cfg = plan
+      .entries
+      .iter()
+      .find(|e| e.dest_relative == Path::new("BepInEx/config/Mod.cfg"))
+      .unwrap();
+
+    assert_eq!(cfg.tracking, TrackingMethod::None);
+  }
+
+  #[test]
+  fn test_wrapper_folder_without_an_override_folder_still_flattens() {
+    let eco = eco();
+    let profile = profile(&eco, "valheim");
+
+    let pkg = tempdir().unwrap();
+    let root = pkg.path();
+
+    write(&root.join("Wrapper/assets/bundle.dat"), b"data");
+    write(&root.join("Wrapper/Hook.mm.dll"), b"hook");
+
+    let plan = plan_install(&eco, &profile, "Author-Mod", root, None).unwrap();
+    let dests = dest_set(&plan);
+
+    assert_eq!(
+      dests,
+      vec![
+        "BepInEx/monomod/Author-Mod/Hook.mm.dll".to_string(),
+        "BepInEx/plugins/Author-Mod/bundle.dat".to_string(),
+      ]
+    );
+  }
+
+  #[test]
+  fn test_subdir_default_route_flattens_nested_file() {
+    let eco = eco();
+    let profile = profile(&eco, "valheim");
+
+    let pkg = tempdir().unwrap();
+    let root = pkg.path();
+
+    // `web` is not an override folder, so its files fall through to the default
+    // (subdir-tracked) plugins route one by one and land by base name, matching
+    // r2modman, which flattens files it reaches by walking into ordinary folders.
+    write(&root.join("web/js/card.js"), b"card");
+
+    let plan = plan_install(&eco, &profile, "Author-Mod", root, None).unwrap();
+    let dests = dest_set(&plan);
+
+    assert_eq!(
+      dests,
+      vec!["BepInEx/plugins/Author-Mod/card.js".to_string()]
+    );
+  }
+
+  #[test]
+  fn test_plan_refuses_files_flattened_onto_the_same_destination() {
+    let eco = eco();
+    let profile = profile(&eco, "valheim");
+
+    let pkg = tempdir().unwrap();
+    let root = pkg.path();
+
+    write(&root.join("web/a/index.js"), b"a");
+    write(&root.join("web/b/index.js"), b"b");
+
+    let error = plan_install(&eco, &profile, "Author-Mod", root, None).unwrap_err();
+    let message = error.to_string();
+
+    assert!(
+      message.contains("BepInEx/plugins/Author-Mod/index.js"),
+      "{message}"
+    );
+    assert!(message.contains("web/a/index.js"), "{message}");
+    assert!(message.contains("web/b/index.js"), "{message}");
+  }
+
+  #[test]
+  fn test_root_file_named_like_override_folder_is_not_a_folder_match() {
+    let eco = eco();
+    let profile = profile(&eco, "valheim");
+
+    let pkg = tempdir().unwrap();
+    let root = pkg.path();
+
+    // Only a directory matches an override folder. A loose file that happens to be
+    // named `plugins` routes like any other file instead of resolving to an empty
+    // remainder (which would place it at the route folder itself).
+    write(&root.join("plugins"), b"not a folder");
+
+    let plan = plan_install(&eco, &profile, "Author-Mod", root, None).unwrap();
+    let dests = dest_set(&plan);
+
+    assert_eq!(
+      dests,
+      vec!["BepInEx/plugins/Author-Mod/plugins".to_string()]
+    );
+  }
+
+  #[test]
+  fn test_toggle_and_uninstall_handle_nested_subdir_files() {
+    let eco = eco();
+    let profile = profile(&eco, "valheim");
+
+    let pkg = tempdir().unwrap();
+    write(&pkg.path().join("plugins/Mod.dll"), b"dll");
+    write(
+      &pkg.path().join("plugins/Translations/German/german.json"),
+      b"de",
+    );
+
+    let plan = plan_install(&eco, &profile, "Author-Mod", pkg.path(), None).unwrap();
+
+    let profile_dir = tempdir().unwrap();
+    let root = profile_dir.path();
+
+    apply_install(&plan, root).unwrap();
+
+    let mod_dir = root.join("BepInEx/plugins/Author-Mod");
+    let nested = mod_dir.join("Translations/German/german.json");
+
+    assert!(nested.exists());
+
+    disable_mod(&profile, root, "Author-Mod").unwrap();
+
+    assert!(!nested.exists());
+    assert!(mod_dir.join("Translations/German/german.json.old").exists());
+    assert!(mod_dir.join("Mod.dll.old").exists());
+
+    enable_mod(&profile, root, "Author-Mod").unwrap();
+
+    assert!(nested.exists());
+    assert!(!mod_dir.join("Translations/German/german.json.old").exists());
+    assert!(mod_dir.join("Mod.dll").exists());
+
+    remove_delisted(&profile, root, &BTreeSet::new()).unwrap();
+
+    assert!(!mod_dir.exists());
   }
 
   #[test]
