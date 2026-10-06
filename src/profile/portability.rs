@@ -648,10 +648,11 @@ pub fn extract_configs_in(target_dir: &Path, zip_bytes: &[u8]) -> Result<Vec<Pat
 /// warning.
 ///
 /// `cache_base` is the package cache root and must not be `target_dir` — see
-/// [`crate::profile::install_mod_in`]. Returns the sorted identifiers the
-/// import covers, dependencies included: those installed and those skipped as
-/// already current, so importing a profile the target already matches still
-/// lists every mod.
+/// [`crate::profile::install_mod_in`]. Returns the identifiers the import
+/// covers, dependencies included, split into those it installed and those it
+/// skipped as already current, so importing a profile the target already
+/// matches reports every mod as unchanged. A listed mod the package index no
+/// longer has resolves to nothing to install and is in neither list.
 #[allow(clippy::too_many_arguments)]
 pub async fn import_r2z_in(
   target_dir: &Path,
@@ -662,7 +663,7 @@ pub async fn import_r2z_in(
   game: &str,
   zip_bytes: &[u8],
   installed_at_time: u64,
-) -> Result<Vec<String>> {
+) -> Result<ImportedMods> {
   let export = read_export(zip_bytes)?;
 
   let desired: Vec<String> = export.mods.iter().map(|entry| entry.name.clone()).collect();
@@ -709,14 +710,30 @@ pub async fn import_r2z_in(
   // wins over the package default the install just wrote.
   extract_configs_in(target_dir, zip_bytes)?;
 
-  // A mod skipped as already current is still part of the imported profile.
-  let mut imported = outcome.succeeded;
+  // `install_batch` already sorts, dedups, and keeps the two lists disjoint.
+  Ok(ImportedMods {
+    installed: outcome.succeeded,
+    unchanged: outcome.unchanged,
+  })
+}
 
-  imported.extend(outcome.unchanged);
-  imported.sort();
-  imported.dedup();
-
-  Ok(imported)
+/// What [`import_r2z_in`] and [`import_code_in`] did with each mod the import
+/// covers.
+///
+/// Both lists include the dependency closure, are sorted and deduplicated, and
+/// never name the same identifier.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ImportedMods {
+  /// Identifiers this import installed or reinstalled.
+  pub installed: Vec<String>,
+  /// Identifiers skipped because the target already recorded the version that
+  /// would be installed, with its files in place.
+  ///
+  /// Skipped means not reinstalled, not untouched: the import still applies the
+  /// export's enabled state, so a mod listed here may have been enabled or
+  /// disabled to match it.
+  pub unchanged: Vec<String>,
 }
 
 /// Imports a shared profile by its Thunderstore code. See [`import_r2z_in`].
@@ -730,7 +747,7 @@ pub async fn import_code_in(
   game: &str,
   code: &str,
   installed_at_time: u64,
-) -> Result<Vec<String>> {
+) -> Result<ImportedMods> {
   let body = client.fetch_profile_code(code).await?;
   let zip_bytes = decode_profile_payload(&body)?;
 
@@ -906,14 +923,22 @@ pub async fn adopt_r2modman_dir_in(
 #[derive(Debug, Default)]
 #[non_exhaustive]
 pub struct AdoptOutcome {
-  /// Identifiers now recorded, sorted.
+  /// Desired identifiers this adoption installed, sorted.
   pub adopted: Vec<String>,
+  /// Desired identifiers already recorded and left alone, sorted: either at the
+  /// version that would be installed, or absent from the index so there was
+  /// nothing to install.
+  pub unchanged: Vec<String>,
   /// Identifiers still missing from the record, sorted. Their files may be on
   /// disk from an older installer, unrecorded, where a reconcile would sweep
   /// them as delisted.
+  ///
+  /// `adopted`, `unchanged`, and `remaining` never name the same identifier. A
+  /// desired name that is recorded but whose install failed, such as a failed
+  /// upgrade, is in none of them, only in `failed`.
   pub remaining: Vec<String>,
   /// Root-relative folders the completing sweep removed. Empty unless every
-  /// desired name was adopted.
+  /// desired name is recorded, that is unless `remaining` is empty.
   pub swept: Vec<PathBuf>,
   /// Each desired name that errored while installing, with the reason
   /// (unresolvable dependency, network error, checksum mismatch, and so on).
@@ -952,8 +977,15 @@ pub fn needs_adoption(target_dir: &Path, desired: &[String]) -> Result<bool> {
 /// placed, so this is safe over an existing install and safe to retry after a
 /// partial failure: an entry already recorded at its latest version is skipped.
 ///
-/// The delisted sweep runs **only** when every desired name is adopted. Running
-/// it against a partial record would delete mods that have not been reached yet.
+/// The delisted sweep runs **only** when every desired name is recorded, whether
+/// this run installed it or found it already current. Running it against a
+/// partial record would delete mods that have not been reached yet.
+///
+/// A name counts as adopted when its record carries this run's
+/// `installed_at_time`, since every install stamps it and a skipped mod keeps its
+/// old one. A caller must therefore pass a fresh time
+/// ([`now_millis`](crate::profile::modlist::now_millis)); reusing one from an
+/// earlier install reports the mods that install placed as adopted again.
 #[allow(clippy::too_many_arguments)]
 pub async fn adopt_names_in(
   target_dir: &Path,
@@ -980,28 +1012,52 @@ pub async fn adopt_names_in(
   .await?;
 
   let failed = batch_outcome.failed;
+  let failed_names: std::collections::BTreeSet<&str> =
+    failed.iter().map(|(name, _)| name.as_str()).collect();
 
-  // Which names made it is read back from the record rather than from the batch
-  // outcome: a name can be missing because its own install failed or because it
-  // resolved to nothing, and the record is the authority either way.
+  // Everything is read back from the record rather than from the batch outcome.
+  // A name can be missing because its own install failed or because it resolved
+  // to nothing. And a name another desired mod installed as a dependency before
+  // that mod's install errored is absent from `succeeded`, then found current by
+  // its own attempt and listed as unchanged, so only the record's install time
+  // tells this run's installs apart from mods it left alone.
   let recorded = crate::profile::modlist::read(target_dir).unwrap_or_default();
 
   let mut adopted: Vec<String> = Vec::new();
+  let mut unchanged: Vec<String> = Vec::new();
   let mut remaining: Vec<String> = Vec::new();
 
   for name in desired {
-    match crate::profile::modlist::find(&recorded, name) {
-      Some(_) => adopted.push(name.clone()),
-      None => remaining.push(name.clone()),
+    let Some(entry) = crate::profile::modlist::find(&recorded, name) else {
+      remaining.push(name.clone());
+
+      continue;
+    };
+
+    if failed_names.contains(name.as_str()) {
+      // Recorded, but its own install failed (a failed upgrade, say), so it is
+      // reported in `failed` alone.
+      continue;
+    }
+
+    if entry.installed_at_time == installed_at_time {
+      adopted.push(name.clone());
+    } else {
+      unchanged.push(name.clone());
     }
   }
 
   adopted.sort();
+  adopted.dedup();
+  unchanged.sort();
+  unchanged.dedup();
   remaining.sort();
+  remaining.dedup();
 
   if !remaining.is_empty() {
     return Ok(AdoptOutcome {
       adopted,
+      unchanged,
       remaining,
       swept: Vec::new(),
       failed,
@@ -1018,6 +1074,7 @@ pub async fn adopt_names_in(
 
   Ok(AdoptOutcome {
     adopted,
+    unchanged,
     remaining,
     swept,
     failed,
@@ -1234,8 +1291,16 @@ impl ImportSource {
 pub struct ImportOutcome {
   /// How `source` was classified, and therefore which route ran.
   pub source: ImportSource,
-  /// Identifiers now recorded in the target.
+  /// Identifiers this import installed, sorted. Dependencies are included for
+  /// [`ImportSource::Archive`] and [`ImportSource::Code`]; for
+  /// [`ImportSource::R2modmanDir`] it is every identifier the copied `mods.yml`
+  /// names.
   pub installed: Vec<String>,
+  /// Identifiers skipped because the target already recorded the version that
+  /// would be installed, sorted and never also in `installed`. See
+  /// [`ImportedMods::unchanged`]. Always empty for
+  /// [`ImportSource::R2modmanDir`], which copies every file regardless.
+  pub unchanged: Vec<String>,
   /// Identifiers reinstalled at their latest version so they would have an
   /// install record. Only ever non-empty for [`ImportSource::R2modmanDir`]; see
   /// [`AdoptedProfile::reinstalled`].
@@ -1280,17 +1345,22 @@ pub async fn import_in(
       installed_at_time,
     )
     .await?;
+    let mut installed = adopted.adopted;
+
+    installed.sort();
+    installed.dedup();
 
     return Ok(ImportOutcome {
       source,
-      installed: adopted.adopted,
+      installed,
+      unchanged: Vec::new(),
       reinstalled: adopted.reinstalled,
     });
   }
 
   let index = client.get_manifest().await?;
 
-  let installed = match &source {
+  let imported = match &source {
     ImportSource::Archive(path) => {
       let bytes =
         fs::read(path).map_err(|e| Error::Profile(format!("reading {}: {}", path.display(), e)))?;
@@ -1331,7 +1401,8 @@ pub async fn import_in(
 
   Ok(ImportOutcome {
     source,
-    installed,
+    installed: imported.installed,
+    unchanged: imported.unchanged,
     reinstalled: Vec::new(),
   })
 }
@@ -1347,7 +1418,7 @@ pub async fn import_r2z(
   client: &ThunderstoreClient,
   zip_bytes: &[u8],
   installed_at_time: u64,
-) -> Result<Vec<String>> {
+) -> Result<ImportedMods> {
   import_r2z_in(
     &crate::profile::layout::profile_dir(base, game, profile_name),
     base,
@@ -1373,7 +1444,7 @@ pub async fn import_code(
   client: &ThunderstoreClient,
   code: &str,
   installed_at_time: u64,
-) -> Result<Vec<String>> {
+) -> Result<ImportedMods> {
   import_code_in(
     &crate::profile::layout::profile_dir(base, game, profile_name),
     base,
