@@ -85,7 +85,7 @@ fn export_then_import_round_trips_into_a_new_target() {
 
   // Import into a fresh target.
   let target = base.path().join("target");
-  let installed = rt
+  let imported = rt
     .block_on(profile::portability::import_r2z_in(
       &target,
       base.path(),
@@ -98,7 +98,8 @@ fn export_then_import_round_trips_into_a_new_target() {
     ))
     .unwrap();
 
-  assert_eq!(installed, vec!["Author-CoolMod".to_string()]);
+  assert_eq!(imported.installed, vec!["Author-CoolMod".to_string()]);
+  assert!(imported.unchanged.is_empty());
   assert!(
     target
       .join("BepInEx/plugins/Author-CoolMod/CoolMod.dll")
@@ -256,6 +257,7 @@ fn import_in_routes_a_file_path_and_a_directory_from_the_source_string_alone() {
     profile::portability::ImportSource::Archive(r2z_path.clone())
   );
   assert_eq!(outcome.installed, vec!["Author-CoolMod".to_string()]);
+  assert!(outcome.unchanged.is_empty());
   assert!(outcome.reinstalled.is_empty());
   assert!(!outcome.source.preserves_versions());
   assert!(
@@ -284,6 +286,7 @@ fn import_in_routes_a_file_path_and_a_directory_from_the_source_string_alone() {
     profile::portability::ImportSource::R2modmanDir(source.clone())
   );
   assert_eq!(outcome.installed, vec!["Author-CoolMod".to_string()]);
+  assert!(outcome.unchanged.is_empty());
   assert!(outcome.source.preserves_versions());
   assert!(
     from_dir
@@ -469,6 +472,7 @@ fn adoption_does_not_sweep_until_every_name_is_adopted() {
     .unwrap();
 
   assert_eq!(outcome.adopted, vec!["Author-CoolMod".to_string()]);
+  assert!(outcome.unchanged.is_empty());
   assert_eq!(outcome.remaining, vec!["Author-Missing".to_string()]);
   assert!(
     outcome.swept.is_empty(),
@@ -793,6 +797,39 @@ fn index_json_base_and_top(server_url: &str) -> String {
   )
 }
 
+/// Serves the [`index_json_base_and_top`] index and both archives, returning the
+/// mocks so a test can assert each archive was fetched exactly as often as it
+/// expects. `top_zip` is the body served for `Author-Top`, so a test can make
+/// that install fail.
+fn serve_base_and_top(
+  server: &mut Server,
+  top_zip: Vec<u8>,
+  base_hits: usize,
+  top_hits: usize,
+) -> (mockito::Mock, mockito::Mock, mockito::Mock) {
+  let base_dl = server
+    .mock("GET", "/dl/base.zip")
+    .with_status(200)
+    .with_body(build_mod_zip_named("BaseMod.dll"))
+    .expect(base_hits)
+    .create();
+  let top_dl = server
+    .mock("GET", "/dl/top.zip")
+    .with_status(200)
+    .with_body(top_zip)
+    .expect(top_hits)
+    .create();
+  let idx = server
+    .mock("GET", "/pkg/")
+    .with_status(200)
+    .with_header("Content-Type", "application/json")
+    .with_header("Last-Modified", "Wed, 21 Feb 2024 15:30:45 GMT")
+    .with_body(index_json_base_and_top(&server.url()))
+    .create();
+
+  (base_dl, top_dl, idx)
+}
+
 /// Regression guard for the property that an entry the export marked
 /// disabled stays disabled even when a later mod pulls it in as a
 /// dependency: the export lists a disabled entry (`Author-Base`) before an
@@ -804,26 +841,8 @@ fn index_json_base_and_top(server_url: &str) -> String {
 #[test]
 fn import_r2z_in_keeps_a_disabled_entry_disabled_despite_a_later_dependency_install() {
   let mut server = Server::new();
-
-  let base_dl = server
-    .mock("GET", "/dl/base.zip")
-    .with_status(200)
-    .with_body(build_mod_zip_named("BaseMod.dll"))
-    .expect_at_least(1)
-    .create();
-  let top_dl = server
-    .mock("GET", "/dl/top.zip")
-    .with_status(200)
-    .with_body(build_mod_zip_named("TopMod.dll"))
-    .expect_at_least(1)
-    .create();
-  let idx = server
-    .mock("GET", "/pkg/")
-    .with_status(200)
-    .with_header("Content-Type", "application/json")
-    .with_header("Last-Modified", "Wed, 21 Feb 2024 15:30:45 GMT")
-    .with_body(index_json_base_and_top(&server.url()))
-    .create();
+  let (base_dl, top_dl, idx) =
+    serve_base_and_top(&mut server, build_mod_zip_named("TopMod.dll"), 1, 1);
 
   let cache = tempdir().unwrap();
   let base = tempdir().unwrap();
@@ -868,7 +887,7 @@ fn import_r2z_in_keeps_a_disabled_entry_disabled_despite_a_later_dependency_inst
   // Import into a fresh target, exercising the real install + dependency
   // resolution path.
   let target = base.path().join("target");
-  let installed = rt
+  let imported = rt
     .block_on(profile::portability::import_r2z_in(
       &target,
       base.path(),
@@ -882,7 +901,7 @@ fn import_r2z_in_keeps_a_disabled_entry_disabled_despite_a_later_dependency_inst
     .unwrap();
 
   assert_eq!(
-    installed,
+    imported.installed,
     vec!["Author-Base".to_string(), "Author-Top".to_string()]
   );
 
@@ -1077,10 +1096,15 @@ fn import_r2z_in_enables_a_mod_the_target_has_disabled_at_the_same_version() {
     ))
     .unwrap();
 
+  assert!(
+    imported.installed.is_empty(),
+    "got: {:?}",
+    imported.installed
+  );
   assert_eq!(
-    imported,
+    imported.unchanged,
     vec!["Author-CoolMod".to_string()],
-    "a mod skipped as current is still part of the imported profile"
+    "a mod skipped as current is reported as unchanged, not installed"
   );
 
   let mods = profile::modlist::read(&target).unwrap();
@@ -1223,7 +1247,7 @@ fn import_r2z_in_accepts_a_bare_r2x_manifest_with_no_configs() {
   let yaml = profile::portability::export_r2x_to_string(&export).unwrap();
 
   let target = base.path().join("target");
-  let installed = rt
+  let imported = rt
     .block_on(profile::portability::import_r2z_in(
       &target,
       base.path(),
@@ -1236,13 +1260,301 @@ fn import_r2z_in_accepts_a_bare_r2x_manifest_with_no_configs() {
     ))
     .unwrap();
 
-  assert_eq!(installed, vec!["Author-CoolMod".to_string()]);
+  assert_eq!(imported.installed, vec!["Author-CoolMod".to_string()]);
   assert!(target.join("mods.yml").exists());
   assert!(
     target
       .join("BepInEx/plugins/Author-CoolMod/CoolMod.dll")
       .exists()
   );
+
+  dl.assert();
+  idx.assert();
+}
+
+/// An import over a target that already holds part of the profile has to say
+/// which mods it installed and which it left alone, so a caller can report
+/// "already installed" the way a plain install does. Importing the same profile
+/// a second time installs nothing.
+#[test]
+fn import_in_reports_mods_the_target_already_has_as_unchanged() {
+  let mut server = Server::new();
+  let (base_dl, top_dl, idx) =
+    serve_base_and_top(&mut server, build_mod_zip_named("TopMod.dll"), 1, 1);
+  let cache = tempdir().unwrap();
+  let base = tempdir().unwrap();
+
+  let client = ThunderstoreClient::builder()
+    .package_index_url(format!("{}/pkg/", server.url()))
+    .base_url(server.url())
+    .cache_dir(cache.path())
+    .build()
+    .unwrap();
+
+  let rt = Runtime::new().unwrap();
+  let eco = Ecosystem::bundled();
+  let index = rt.block_on(client.get_manifest()).unwrap();
+  let source = base.path().join("source");
+  let target = base.path().join("target");
+
+  rt.block_on(profile::install_mod_in(
+    &source,
+    base.path(),
+    &eco,
+    &index,
+    &client,
+    "valheim",
+    "Author-Top",
+    1,
+  ))
+  .unwrap();
+  rt.block_on(profile::install_mod_in(
+    &target,
+    base.path(),
+    &eco,
+    &index,
+    &client,
+    "valheim",
+    "Author-Base",
+    1,
+  ))
+  .unwrap();
+
+  let r2z_path = base.path().join("Shared.r2z");
+
+  std::fs::write(
+    &r2z_path,
+    profile::portability::build_r2z_in(&source, "Shared").unwrap(),
+  )
+  .unwrap();
+
+  let first = rt
+    .block_on(profile::portability::import_in(
+      &target,
+      base.path(),
+      &eco,
+      &client,
+      "valheim",
+      r2z_path.to_str().unwrap(),
+      2,
+    ))
+    .unwrap();
+
+  assert_eq!(first.installed, vec!["Author-Top".to_string()]);
+  assert_eq!(first.unchanged, vec!["Author-Base".to_string()]);
+
+  let second = rt
+    .block_on(profile::portability::import_in(
+      &target,
+      base.path(),
+      &eco,
+      &client,
+      "valheim",
+      r2z_path.to_str().unwrap(),
+      3,
+    ))
+    .unwrap();
+
+  assert!(second.installed.is_empty(), "got: {:?}", second.installed);
+  assert_eq!(
+    second.unchanged,
+    vec!["Author-Base".to_string(), "Author-Top".to_string()]
+  );
+
+  base_dl.assert();
+  top_dl.assert();
+  idx.assert();
+}
+
+/// A desired name the record already holds at the version that would be
+/// installed is left alone, and the outcome has to keep it apart from the names
+/// this adoption actually installed.
+#[test]
+fn adopt_names_in_reports_an_already_recorded_name_as_unchanged() {
+  let mut server = Server::new();
+  let (base_dl, top_dl, idx) =
+    serve_base_and_top(&mut server, build_mod_zip_named("TopMod.dll"), 1, 1);
+  let cache = tempdir().unwrap();
+  let base = tempdir().unwrap();
+
+  let client = ThunderstoreClient::builder()
+    .package_index_url(format!("{}/pkg/", server.url()))
+    .base_url(server.url())
+    .cache_dir(cache.path())
+    .build()
+    .unwrap();
+
+  let rt = Runtime::new().unwrap();
+  let eco = Ecosystem::bundled();
+  let index = rt.block_on(client.get_manifest()).unwrap();
+  let target = base.path().join("target");
+
+  rt.block_on(profile::install_mod_in(
+    &target,
+    base.path(),
+    &eco,
+    &index,
+    &client,
+    "valheim",
+    "Author-Base",
+    1,
+  ))
+  .unwrap();
+
+  let desired = vec!["Author-Base".to_string(), "Author-Top".to_string()];
+  let outcome = rt
+    .block_on(profile::portability::adopt_names_in(
+      &target,
+      base.path(),
+      &eco,
+      &index,
+      &client,
+      "valheim",
+      &desired,
+      2,
+    ))
+    .unwrap();
+
+  assert_eq!(outcome.adopted, vec!["Author-Top".to_string()]);
+  assert_eq!(outcome.unchanged, vec!["Author-Base".to_string()]);
+  assert!(outcome.remaining.is_empty(), "got: {:?}", outcome.remaining);
+  assert!(outcome.failed.is_empty(), "got: {:?}", outcome.failed);
+
+  base_dl.assert();
+  top_dl.assert();
+  idx.assert();
+}
+
+/// A desired mod installed as a dependency of another desired mod whose own
+/// install then fails was still installed by this run, so it has to be reported
+/// as adopted, not as unchanged. The batch outcome cannot say so on its own: the
+/// failed install drops what it installed before erroring, and the dependency's
+/// own attempt then finds it current.
+#[test]
+fn adopt_names_in_reports_a_dependency_installed_before_its_dependent_failed_as_adopted() {
+  let mut server = Server::new();
+  let (base_dl, top_dl, idx) = serve_base_and_top(&mut server, b"not a zip archive".to_vec(), 1, 1);
+  let cache = tempdir().unwrap();
+  let base = tempdir().unwrap();
+
+  let client = ThunderstoreClient::builder()
+    .package_index_url(format!("{}/pkg/", server.url()))
+    .base_url(server.url())
+    .cache_dir(cache.path())
+    .build()
+    .unwrap();
+
+  let rt = Runtime::new().unwrap();
+  let eco = Ecosystem::bundled();
+  let index = rt.block_on(client.get_manifest()).unwrap();
+  let target = base.path().join("target");
+
+  // Top first, so its failing install is the one that reaches Base.
+  let desired = vec!["Author-Top".to_string(), "Author-Base".to_string()];
+  let outcome = rt
+    .block_on(profile::portability::adopt_names_in(
+      &target,
+      base.path(),
+      &eco,
+      &index,
+      &client,
+      "valheim",
+      &desired,
+      2,
+    ))
+    .unwrap();
+
+  let failed: Vec<&str> = outcome
+    .failed
+    .iter()
+    .map(|(name, _)| name.as_str())
+    .collect();
+
+  assert_eq!(outcome.adopted, vec!["Author-Base".to_string()]);
+  assert!(outcome.unchanged.is_empty(), "got: {:?}", outcome.unchanged);
+  assert_eq!(outcome.remaining, vec!["Author-Top".to_string()]);
+  assert_eq!(failed, vec!["Author-Top"]);
+
+  base_dl.assert();
+  top_dl.assert();
+  idx.assert();
+}
+
+/// A desired name the record already holds, whose upgrade to the latest version
+/// fails, is not adopted (nothing was installed), not unchanged (it is out of
+/// date), and not remaining (it is recorded). It is reported in `failed` alone.
+#[test]
+fn adopt_names_in_reports_a_failed_upgrade_only_as_failed() {
+  let mut server = Server::new();
+
+  let dl = server
+    .mock("GET", "/dl/mod.zip")
+    .with_status(200)
+    .with_body(b"not a zip archive")
+    .expect(1)
+    .create();
+  let idx = server
+    .mock("GET", "/pkg/")
+    .with_status(200)
+    .with_header("Content-Type", "application/json")
+    .with_header("Last-Modified", "Wed, 21 Feb 2024 15:30:45 GMT")
+    .with_body(index_json(&server.url()))
+    .create();
+
+  let cache = tempdir().unwrap();
+  let base = tempdir().unwrap();
+
+  let client = ThunderstoreClient::builder()
+    .package_index_url(format!("{}/pkg/", server.url()))
+    .base_url(server.url())
+    .cache_dir(cache.path())
+    .build()
+    .unwrap();
+
+  let rt = Runtime::new().unwrap();
+  let eco = Ecosystem::bundled();
+  let index = rt.block_on(client.get_manifest()).unwrap();
+  let target = base.path().join("target");
+
+  // Recorded at 0.9.0 while the index offers 1.0.0, so adoption tries to
+  // upgrade it, and the unreadable archive makes that upgrade fail.
+  let mut old_version = index
+    .get_package_by_full_name("Author-CoolMod")
+    .unwrap()
+    .latest_version()
+    .unwrap()
+    .clone();
+
+  old_version.version_number = Some("0.9.0".to_string());
+
+  let entry = profile::mod_entry_from_version("Author-CoolMod", "Author", &old_version, 1);
+
+  profile::modlist::write(&target, &[entry]).unwrap();
+
+  let desired = vec!["Author-CoolMod".to_string()];
+  let outcome = rt
+    .block_on(profile::portability::adopt_names_in(
+      &target,
+      base.path(),
+      &eco,
+      &index,
+      &client,
+      "valheim",
+      &desired,
+      2,
+    ))
+    .unwrap();
+
+  let failed: Vec<&str> = outcome
+    .failed
+    .iter()
+    .map(|(name, _)| name.as_str())
+    .collect();
+
+  assert!(outcome.adopted.is_empty(), "got: {:?}", outcome.adopted);
+  assert!(outcome.unchanged.is_empty(), "got: {:?}", outcome.unchanged);
+  assert!(outcome.remaining.is_empty(), "got: {:?}", outcome.remaining);
+  assert_eq!(failed, vec!["Author-CoolMod"]);
 
   dl.assert();
   idx.assert();
