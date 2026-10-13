@@ -231,14 +231,22 @@ pub fn plan_install_batch(
 /// Must run after the whole batch, never interleaved: a mod later in a batch can
 /// pull an earlier one back in as a dependency, so only a final pass catches
 /// every re-enable. Runs even when the batch failed partway, since items
-/// installed before the failure are already enabled.
+/// installed before the failure are already enabled. A protected mod that is not
+/// installed, because its own install failed, has nothing to disable and is
+/// skipped, so the install's failure is the one reported.
 pub fn reapply_batch_disabled(
   target_dir: &Path,
   eco: &Ecosystem,
   game: &str,
   batch: &InstallBatch,
 ) -> Result<()> {
+  let recorded = modlist::read(target_dir)?;
+
   for full_name in &batch.protect_disabled {
+    if !recorded.iter().any(|entry| &entry.name == full_name) {
+      continue;
+    }
+
     set_enabled_in(target_dir, eco, game, full_name, false)?;
   }
 

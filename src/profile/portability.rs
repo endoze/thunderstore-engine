@@ -9,14 +9,8 @@
 //! wrapper, so a game server can export its tracked mod set just as a desktop
 //! client exports a named profile.
 //!
-//! **Import installs each mod's latest version, not the exported one.** The
-//! manifest's `version` field is recorded and re-exported faithfully, but on
-//! import every mod resolves through
-//! [`crate::models::DependencyGraph::resolve`], which is version-agnostic: the
-//! version suffix is discarded and the *latest* available version is
-//! installed instead. There is no version pinning, so a recipient importing an
-//! export pinned to `version: 1.2.3` may receive `2.0.0` installed, with no
-//! warning.
+//! **Import installs each mod at its exported version.** An exported version
+//! Thunderstore no longer serves fails that mod.
 
 #![deny(missing_docs)]
 
@@ -640,19 +634,14 @@ pub fn extract_configs_in(target_dir: &Path, zip_bytes: &[u8]) -> Result<Vec<Pat
 ///    harmless because disabling renames a mod's files rather than
 ///    rewriting its config.
 ///
-/// **Installs the latest version, not the exported one.** Each entry's
-/// `version` is not honored on import: resolution goes through
-/// [`crate::models::DependencyGraph::resolve`], which is version-agnostic and
-/// always installs a mod's latest available version. There is no version
-/// pinning — importing an export pinned to `1.2.3` can install `2.0.0` with no
-/// warning.
+/// **Installs the exported version, not the latest.** A mod or version the
+/// index no longer has fails the import.
 ///
 /// `cache_base` is the package cache root and must not be `target_dir` — see
 /// [`crate::profile::install_mod_in`]. Returns the identifiers the import
 /// covers, dependencies included, split into those it installed and those it
 /// skipped as already current, so importing a profile the target already
-/// matches reports every mod as unchanged. A listed mod the package index no
-/// longer has resolves to nothing to install and is in neither list.
+/// matches reports every mod as unchanged.
 #[allow(clippy::too_many_arguments)]
 pub async fn import_r2z_in(
   target_dir: &Path,
@@ -666,7 +655,11 @@ pub async fn import_r2z_in(
 ) -> Result<ImportedMods> {
   let export = read_export(zip_bytes)?;
 
-  let desired: Vec<String> = export.mods.iter().map(|entry| entry.name.clone()).collect();
+  let desired: Vec<String> = export
+    .mods
+    .iter()
+    .map(|entry| format!("{}-{}", entry.name, entry.version))
+    .collect();
   let protect: Vec<String> = export
     .mods
     .iter()
@@ -675,7 +668,7 @@ pub async fn import_r2z_in(
     .collect();
   let mut batch = crate::profile::InstallBatch::new(desired, protect);
 
-  // A mod already recorded at its latest version is skipped rather than
+  // A mod already recorded at its exported version is skipped rather than
   // reinstalled, so one the export has enabled but the target has disabled
   // would otherwise stay disabled.
   batch.enable_requested = export
@@ -698,11 +691,13 @@ pub async fn import_r2z_in(
   .await?;
 
   // Configs are not extracted after a failure, so the import is unfinished.
-  // A retry skips the mods already installed and completes it.
+  // Importing again once the cause is fixed skips the mods already installed
+  // and completes it. A missing exported version is never fixed by a retry
+  // alone, so the message does not promise one will.
   if let Some((name, error)) = outcome.failed.into_iter().next() {
     return Err(Error::Profile(format!(
       "importing {name}: {error}; the import is unfinished (its config files were \
-       not restored), retry the import to finish it"
+       not restored)"
     )));
   }
 
@@ -837,7 +832,7 @@ pub struct AdoptedProfile {
 /// delete a file the loader never placed.
 ///
 /// **Reinstalls the latest version, not the adopted one.** Resolution goes
-/// through [`crate::models::DependencyGraph`], which is version-agnostic, so a
+/// through [`crate::models::DependencyGraph`] with a bare `Owner-Name`, so a
 /// version the source profile had pinned is not preserved. The returned
 /// [`AdoptedProfile::reinstalled`] names exactly which packages this happened to,
 /// so a caller can disclose it.
@@ -1264,28 +1259,14 @@ impl ImportSource {
 
     Self::Code(source.to_string())
   }
-
-  /// Whether this route keeps the versions the source recorded.
-  ///
-  /// True only for [`Self::R2modmanDir`], which copies files as they are. The
-  /// other two resolve every entry through
-  /// [`DependencyGraph`](crate::models::DependencyGraph) and install each mod's
-  /// latest version instead. Even an adoption reinstalls an unrecorded loader at
-  /// latest, which is why [`ImportOutcome::reinstalled`] is reported separately.
-  ///
-  /// Exposed because it is the one thing a caller has to tell a user before they
-  /// wonder why a pinned version changed, and deriving it from the variant is
-  /// the sort of rule that goes stale in a client.
-  pub fn preserves_versions(&self) -> bool {
-    matches!(self, Self::R2modmanDir(_))
-  }
 }
 
 /// What an import installed, by which route.
 ///
-/// Carries `source` so a caller can word the outcome per route, e.g. disclosing
-/// that versions were not preserved, without classifying the source string a
-/// second time.
+/// Carries `source` so a caller can word the outcome per route without
+/// classifying the source string a second time. Every route keeps the versions
+/// the source recorded, except a loader an adoption reinstalls at latest; see
+/// [`Self::reinstalled`].
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct ImportOutcome {
@@ -1508,18 +1489,6 @@ mod tests {
       ImportSource::classify("/no/such/path.r2z"),
       ImportSource::Code(_)
     ));
-  }
-
-  #[test]
-  fn import_source_reports_whether_versions_survive() {
-    let dir = tempfile::tempdir().unwrap();
-
-    // The distinction a caller has to disclose: adoption keeps the source's
-    // versions apart from a reinstalled loader, while the other two always
-    // install each mod's latest.
-    assert!(ImportSource::R2modmanDir(dir.path().to_path_buf()).preserves_versions());
-    assert!(!ImportSource::Archive(dir.path().join("e.r2z")).preserves_versions());
-    assert!(!ImportSource::Code("abc123".to_string()).preserves_versions());
   }
 
   #[test]
