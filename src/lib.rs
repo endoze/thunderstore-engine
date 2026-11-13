@@ -2,7 +2,7 @@
 #![cfg_attr(feature = "io", doc = include_str!("../README.md"))]
 #![cfg_attr(
   not(feature = "io"),
-  doc = "Game-agnostic Thunderstore engine, built without the `io` feature: the data models, dependency resolver, game definitions, plan types, and pure planners. See the crate README for the full feature list."
+  doc = "Game-agnostic Thunderstore engine, built without the `io` feature: the data models, dependency resolver, game definitions, plan types, pure planners, and pure queries. See the crate README for the full feature list."
 )]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![forbid(unsafe_code)]
@@ -41,6 +41,8 @@ pub mod models;
 pub mod profile;
 /// UI-agnostic progress reporting.
 pub mod progress;
+/// Pure queries over the package index and a profile's installed packages.
+pub mod query;
 /// Dependency-graph resolution.
 pub mod resolve;
 /// Bounded retry policy for transient network failures.

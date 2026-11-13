@@ -91,7 +91,17 @@ archive library, and keeps what does no IO:
   `install::plan_delisted_from`, `profile::plan_install_batch_from`,
   `profile::plan_set_enabled_batch_from`,
   `profile::plan_uninstall_batch_from`, and
-  `profile::launch::launch_plan_from` (a target's `LaunchFacts`).
+  `profile::launch::launch_plan_from` (a target's `LaunchFacts`);
+- queries over installed packages: `query::dependants` (every installed
+  package that requires a given one, directly or transitively) and
+  `query::outdated` (installed packages the index has a newer version of),
+  with "newer" defined by the total ordering on `profile::modlist::SemVer`;
+- browsing the package index: `query::browse` searches, filters, and sorts
+  it into package indices per a `query::BrowseQuery` (r2modman's defaults:
+  NSFW and deprecated hidden, community-pinned first, newest update first,
+  or `query::SortKey::BestMatch` to rank the closest match to the search
+  first), and `query::PackageRow` reads one package's list fields without building
+  its versions.
 
 Each `io` function with a pure counterpart reads its inputs and calls that
 counterpart, so the two decide identically. To depend on the pure part only:

@@ -27,6 +27,11 @@ impl StringInterner {
     InternKey(self.0.get_or_intern(s))
   }
 
+  /// The key of `s` if it has been interned, without interning it.
+  pub fn get(&self, s: &str) -> Option<InternKey> {
+    self.0.get(s).map(InternKey)
+  }
+
   /// Resolves a key back to its string.
   ///
   /// # Panics

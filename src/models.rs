@@ -4,10 +4,12 @@ use crate::error::Error;
 use crate::intern::{
   InternKey, StringInterner, intern_option, intern_vec, resolve_option, resolve_vec,
 };
+use crate::query::search::SearchIndex;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::OnceLock;
 use time::OffsetDateTime;
 
 /// An in-memory index of every package (and all of their versions) in a
@@ -45,6 +47,7 @@ pub struct PackageIndex {
   pub(crate) categories: Vec<Vec<InternKey>>,
   pub(crate) version_ranges: Vec<(usize, usize)>,
   pub(crate) versions: VersionTable,
+  pub(crate) search: OnceLock<SearchIndex>,
 }
 
 /// Struct-of-Arrays representation of version data with interned strings.
@@ -153,6 +156,12 @@ impl PackageIndex {
   /// Returns the number of packages in the index.
   pub fn len(&self) -> usize {
     self.names.len()
+  }
+
+  /// The folded search text best-match browsing compares, built on first use
+  /// and kept for the life of the index.
+  pub(crate) fn search_index(&self) -> &SearchIndex {
+    self.search.get_or_init(|| SearchIndex::new(self))
   }
 
   /// Returns true if the index contains no packages.
@@ -333,6 +342,15 @@ impl PackageIndex {
       self.versions.version_numbers[ver_idx].map(|key| self.interner.resolve(&key))
         == Some(version_number)
     })
+  }
+
+  /// Borrows the version number of the package at `idx`'s latest version, as
+  /// [`get_latest_version_at`](Self::get_latest_version_at) chooses it.
+  pub(crate) fn latest_version_number_at(&self, idx: usize) -> Option<&str> {
+    let ver_idx = self.get_latest_version_at(idx)?;
+    let key = self.versions.version_numbers[ver_idx]?;
+
+    Some(self.interner.resolve(&key))
   }
 
   /// Builds a map from each package's full name (`Owner-Name`) to its index,
@@ -1031,6 +1049,7 @@ impl From<Vec<Package>> for PackageIndex {
         uuid4s: version_uuid4s,
         file_sizes,
       },
+      search: OnceLock::new(),
     }
   }
 }
@@ -1258,6 +1277,7 @@ impl TryFrom<SerializedPackageIndex> for PackageIndex {
         uuid4s: version_uuid4s,
         file_sizes: manifest.versions.file_sizes,
       },
+      search: OnceLock::new(),
     };
 
     result.validate()?;

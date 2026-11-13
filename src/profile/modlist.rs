@@ -17,7 +17,20 @@ use std::path::Path;
 
 /// The `major.minor.patch` version object, serialized as a nested mapping to
 /// match r2modman's `VersionNumber`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Versions are totally ordered by major, then minor, then patch, each compared
+/// as a number, and one version is newer than another when it compares greater.
+/// A component [`parse`](Self::parse) fills in as `0` orders as `0`, so `1.2`
+/// equals `1.2.0`.
+///
+/// ```
+/// use thunderstore_engine::profile::modlist::SemVer;
+///
+/// assert!(SemVer::parse("1.0.10") > SemVer::parse("1.0.9"));
+/// assert!(SemVer::parse("1.2.1") > SemVer::parse("1.2"));
+/// ```
+// Field order is the comparison order the derived `Ord` uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SemVer {
   /// The major component, or `0` if the source string had none.
   pub major: u32,
@@ -209,6 +222,7 @@ pub fn now_millis() -> u64 {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::cmp::Ordering;
   #[cfg(feature = "io")]
   use tempfile::tempdir;
 
@@ -402,6 +416,37 @@ mod tests {
     assert_eq!(mods.len(), 1);
     assert!(!find(&mods, "bbepis-BepInExPack").unwrap().enabled);
     assert!(find(&mods, "nope").is_none());
+  }
+
+  #[test]
+  fn semver_orders_each_component_numerically() {
+    assert!(SemVer::parse("1.0.10") > SemVer::parse("1.0.9"));
+    assert!(SemVer::parse("1.10.0") > SemVer::parse("1.9.99"));
+    assert!(SemVer::parse("10.0.0") > SemVer::parse("9.99.99"));
+    assert!(SemVer::parse("2.0.0") > SemVer::parse("1.99.99"));
+    assert!(SemVer::parse("1.2.4") > SemVer::parse("1.2.3"));
+  }
+
+  #[test]
+  fn semver_missing_components_order_as_zero() {
+    assert_eq!(
+      SemVer::parse("1.2").cmp(&SemVer::parse("1.2.0")),
+      Ordering::Equal
+    );
+    assert!(SemVer::parse("1.2.1") > SemVer::parse("1.2"));
+    assert!(SemVer::parse("1") < SemVer::parse("1.0.1"));
+  }
+
+  #[test]
+  fn semver_sorts_into_a_total_order() {
+    let mut versions = ["1.0.10", "0.9", "1.0.9", "1.0.0", "1.10.0", "1.2"].map(SemVer::parse);
+
+    versions.sort();
+
+    assert_eq!(
+      versions.map(|v| v.to_string()),
+      ["0.9.0", "1.0.0", "1.0.9", "1.0.10", "1.2.0", "1.10.0"]
+    );
   }
 
   #[test]

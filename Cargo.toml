@@ -53,8 +53,10 @@ tempfile = "3.10.1"
 default = ["io", "rustls-tls"]
 # Everything that touches disk or network: the HTTP client, the index cache,
 # zip extraction, and every profile operation. With it off, the crate keeps the
-# data models, the resolver, the game definitions, the plan types, and the pure
-# planners, and builds without an HTTP client or an async runtime.
+# data models, the resolver, the game definitions, the plan types, the pure
+# planners, the dependants and outdated queries, and the package-index browse
+# query (search, filter, sort, list rows), and builds without an HTTP client or
+# an async runtime.
 io = [
   "dep:base64",
   "dep:bincode",
