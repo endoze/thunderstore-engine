@@ -56,19 +56,28 @@ pub mod modlist;
 /// `.r2z` export/import and Thunderstore profile codes.
 pub mod portability;
 /// Where an install goes: a named profile, or the game directory itself.
+#[cfg(feature = "io")]
 pub mod target;
 
+#[cfg(feature = "io")]
 use crate::client::ThunderstoreClient;
 use crate::ecosystem::Ecosystem;
 use crate::error::{Error, Result};
+#[cfg(feature = "io")]
 use crate::extract::parse_package_filename;
+#[cfg(feature = "io")]
 use crate::install::{
   apply_install, clear_state_files, plan_install, remove_delisted, remove_mod_folders,
   remove_state_file, remove_state_payload, state_tracker_from_plan, write_state_file,
 };
-use crate::models::{DependencyGraph, PackageIndex, Version};
+use crate::models::Version;
+#[cfg(feature = "io")]
+use crate::models::{DependencyGraph, PackageIndex};
 use modlist::{ProfileMod, SemVer};
-use std::collections::{BTreeSet, HashMap};
+#[cfg(feature = "io")]
+use std::collections::BTreeSet;
+#[cfg(feature = "io")]
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Builds a [`ProfileMod`] from a Thunderstore [`Version`], applying the same
@@ -201,6 +210,9 @@ impl InstallBatch {
 /// disabled one goes to `enable_requested` rather than `protect_disabled`. Pass
 /// an empty `explicit` when the batch is run on the user's behalf rather than at
 /// their request, so every disabled mod is restored.
+///
+/// Reads `target_dir`'s `mods.yml` and plans with [`plan_install_batch_from`].
+#[cfg(feature = "io")]
 pub fn plan_install_batch(
   target_dir: &Path,
   desired: &[String],
@@ -208,6 +220,21 @@ pub fn plan_install_batch(
 ) -> Result<InstallBatch> {
   let recorded = modlist::read(target_dir)?;
 
+  Ok(plan_install_batch_from(&recorded, desired, explicit))
+}
+
+/// Plans an install batch against an already-read record, without touching
+/// disk.
+///
+/// `recorded` is the target's `mods.yml` entries. `desired` and `explicit` mean
+/// what they do for [`plan_install_batch`]: a disabled mod named in `explicit`
+/// goes to [`InstallBatch::enable_requested`], and every other disabled mod to
+/// [`InstallBatch::protect_disabled`].
+pub fn plan_install_batch_from(
+  recorded: &[ProfileMod],
+  desired: &[String],
+  explicit: &[String],
+) -> InstallBatch {
   let (enable_requested, protect_disabled): (Vec<String>, Vec<String>) = recorded
     .iter()
     .filter(|entry| !entry.enabled)
@@ -218,12 +245,12 @@ pub fn plan_install_batch(
         .any(|requested| crate::util::full_name_prefix(requested) == name.as_str())
     });
 
-  Ok(InstallBatch {
+  InstallBatch {
     desired: desired.to_vec(),
     protect_disabled,
     enable_requested,
     force: false,
-  })
+  }
 }
 
 /// Re-disables everything `batch` protects, after the installs have run.
@@ -234,6 +261,7 @@ pub fn plan_install_batch(
 /// installed before the failure are already enabled. A protected mod that is not
 /// installed, because its own install failed, has nothing to disable and is
 /// skipped, so the install's failure is the one reported.
+#[cfg(feature = "io")]
 pub fn reapply_batch_disabled(
   target_dir: &Path,
   eco: &Ecosystem,
@@ -267,6 +295,7 @@ pub fn reapply_batch_disabled(
 /// This is the apply-only, target-directory primitive; the full download
 /// pipeline ([`install_mod_in`]) is layered on top of it.
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "io")]
 pub fn install_extracted_in(
   target_dir: &Path,
   eco: &Ecosystem,
@@ -312,6 +341,7 @@ pub fn install_extracted_in(
 /// Installs an already-extracted package into an r2modman-layout profile
 /// (`<base>/<game>/profiles/<profile_name>`). See [`install_extracted_in`].
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "io")]
 pub fn install_extracted(
   base: &Path,
   eco: &Ecosystem,
@@ -431,15 +461,64 @@ impl From<NotRemovable> for Error {
 /// Takes no `game`: the only schema consulted is the mod-loader registry, which
 /// [`Ecosystem::modloader_package`] keys on package identity rather than on a
 /// game, so a `game` argument would go unread.
+///
+/// Reads the record with [`read_record_state`] and decides with
+/// [`check_removable_from`].
+#[cfg(feature = "io")]
 pub fn ensure_removable(
   target_dir: &Path,
   eco: &Ecosystem,
   full_name: &str,
 ) -> std::result::Result<(), NotRemovable> {
+  check_removable_from(
+    target_dir,
+    eco,
+    full_name,
+    read_record_state(target_dir, full_name),
+  )
+}
+
+/// What reading a mod's `_state` install record found.
+///
+/// The input [`check_removable_from`] and [`plan_uninstall_batch_from`] decide
+/// from, so a caller that reads the record itself can hand over what it found.
+#[derive(Debug)]
+pub enum RecordState {
+  /// The record exists and parses.
+  Present,
+  /// There is no record.
+  Absent,
+  /// The record exists but could not be read or parsed, for this reason.
+  Unreadable(Error),
+}
+
+/// Reads `full_name`'s `_state` record in `target_dir` and reports what it
+/// found.
+#[cfg(feature = "io")]
+pub fn read_record_state(target_dir: &Path, full_name: &str) -> RecordState {
   match crate::install::read_state_file(target_dir, full_name) {
-    Ok(Some(_)) => return Ok(()),
-    Ok(None) => {}
-    Err(source) => {
+    Ok(Some(_)) => RecordState::Present,
+    Ok(None) => RecordState::Absent,
+    Err(source) => RecordState::Unreadable(source),
+  }
+}
+
+/// Whether `full_name`'s files can be removed exactly, given what its install
+/// record holds, without touching disk.
+///
+/// The rules are [`ensure_removable`]'s: an unreadable record always refuses,
+/// and a missing one refuses only for a recognised mod loader. `target_dir` only
+/// names the record's path in a refusal.
+pub fn check_removable_from(
+  target_dir: &Path,
+  eco: &Ecosystem,
+  full_name: &str,
+  record: RecordState,
+) -> std::result::Result<(), NotRemovable> {
+  match record {
+    RecordState::Present => return Ok(()),
+    RecordState::Absent => {}
+    RecordState::Unreadable(source) => {
       return Err(NotRemovable::RecordUnreadable {
         name: full_name.to_string(),
         path: crate::install::state_file_path(target_dir, full_name),
@@ -476,6 +555,7 @@ pub fn ensure_removable(
 /// such as `vmm uninstall --all` uninstall it. Only shared config
 /// (`none`-tracked) is unconditionally left untouched, since nothing this
 /// function does ever names it for removal.
+#[cfg(feature = "io")]
 pub fn uninstall_mod_in(
   target_dir: &Path,
   eco: &Ecosystem,
@@ -506,6 +586,7 @@ pub fn uninstall_mod_in(
 }
 
 /// Uninstalls a mod from an r2modman-layout profile. See [`uninstall_mod_in`].
+#[cfg(feature = "io")]
 pub fn uninstall_mod(
   base: &Path,
   eco: &Ecosystem,
@@ -528,6 +609,7 @@ pub fn uninstall_mod(
 /// A mod-loader pack (see [`Ecosystem::modloader_package`]) is a no-op here,
 /// matching r2modman: loaders can't be disabled, so neither the on-disk files
 /// nor its `enabled` flag are touched.
+#[cfg(feature = "io")]
 pub fn set_enabled_in(
   target_dir: &Path,
   eco: &Ecosystem,
@@ -564,6 +646,7 @@ pub fn set_enabled_in(
 
 /// Enables or disables an installed mod in an r2modman-layout profile. See
 /// [`set_enabled_in`].
+#[cfg(feature = "io")]
 pub fn set_enabled(
   base: &Path,
   eco: &Ecosystem,
@@ -582,6 +665,7 @@ pub fn set_enabled(
 }
 
 /// Enables an installed mod in `target_dir`. See [`set_enabled_in`].
+#[cfg(feature = "io")]
 pub fn enable_mod_in(
   target_dir: &Path,
   eco: &Ecosystem,
@@ -592,6 +676,7 @@ pub fn enable_mod_in(
 }
 
 /// Disables an installed mod in `target_dir`. See [`set_enabled_in`].
+#[cfg(feature = "io")]
 pub fn disable_mod_in(
   target_dir: &Path,
   eco: &Ecosystem,
@@ -602,6 +687,7 @@ pub fn disable_mod_in(
 }
 
 /// Enables an installed mod. See [`set_enabled`].
+#[cfg(feature = "io")]
 pub fn enable_mod(
   base: &Path,
   eco: &Ecosystem,
@@ -613,6 +699,7 @@ pub fn enable_mod(
 }
 
 /// Disables an installed mod. See [`set_enabled`].
+#[cfg(feature = "io")]
 pub fn disable_mod(
   base: &Path,
   eco: &Ecosystem,
@@ -640,6 +727,7 @@ pub fn disable_mod(
 /// why it must persist across installs and, in server mode, must not be
 /// `target_dir` itself.
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "io")]
 async fn install_one(
   target_dir: &Path,
   cache_base: &Path,
@@ -758,6 +846,7 @@ async fn install_one(
 /// from the package's cached extraction. A missing cache, an unknown game or a
 /// package that no longer plans counts as not in place, so the install runs and
 /// either repairs the mod or reports why it cannot.
+#[cfg(feature = "io")]
 fn recorded_files_present(
   target_dir: &Path,
   cache_base: &Path,
@@ -796,6 +885,7 @@ fn recorded_files_present(
 /// A `desired` entry of `Owner-Name-Version` installs exactly that version, and
 /// the pin holds for the rest of the batch.
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "io")]
 pub async fn install_batch(
   target_dir: &Path,
   cache_base: &Path,
@@ -926,6 +1016,7 @@ pub async fn install_batch(
 /// # }
 /// ```
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "io")]
 pub async fn install_mod_in(
   target_dir: &Path,
   cache_base: &Path,
@@ -955,6 +1046,7 @@ pub async fn install_mod_in(
 /// even when `mods.yml` already records its version. Shared by
 /// [`install_mod_in`] and adoption, which forces the loader reinstall.
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "io")]
 pub(crate) async fn install_named_in(
   target_dir: &Path,
   cache_base: &Path,
@@ -994,6 +1086,7 @@ pub(crate) async fn install_named_in(
 /// base (matching this pipeline's pre-existing behavior). See
 /// [`install_mod_in`].
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "io")]
 pub async fn install_mod(
   base: &Path,
   eco: &Ecosystem,
@@ -1042,6 +1135,7 @@ pub struct UninstallBatch {
 /// can list every problem at once instead of discovering them one at a time. The
 /// reason is a [`NotRemovable`] rather than an [`Error`] so a caller can word
 /// each kind of refusal without re-deriving which kind it is.
+#[cfg(feature = "io")]
 pub fn check_removable_batch(
   target_dir: &Path,
   eco: &Ecosystem,
@@ -1062,6 +1156,10 @@ pub fn check_removable_batch(
 /// any mod that cannot be removed exactly, is an error rather than a per-item
 /// failure: this runs before any mutation, so refusing the whole request is what
 /// keeps a batch from failing partway through.
+///
+/// Reads `mods.yml`, each subject's install record, and the namespaced route
+/// folders, and decides with [`plan_uninstall_batch_from`].
+#[cfg(feature = "io")]
 pub fn plan_uninstall_batch(
   target_dir: &Path,
   eco: &Ecosystem,
@@ -1075,10 +1173,55 @@ pub fn plan_uninstall_batch(
 
   let recorded = modlist::read(target_dir)?;
 
+  let mut batch = plan_uninstall_batch_from(
+    target_dir,
+    eco,
+    game,
+    names,
+    &recorded,
+    |name| read_record_state(target_dir, name),
+    Vec::new(),
+  )?;
+
+  let keep: BTreeSet<String> = recorded.iter().map(|entry| entry.name.clone()).collect();
+
+  batch.untracked = crate::install::plan_delisted(game_profile, target_dir, &keep)?;
+
+  Ok(batch)
+}
+
+/// Plans an uninstall from already-gathered facts, without touching disk.
+///
+/// The rules are [`plan_uninstall_batch`]'s. `recorded` is the target's
+/// `mods.yml` entries. `record_state` reports each subject's install record (see
+/// [`RecordState`]), and is called only until the first refusal. `untracked` is
+/// what the sweep would take, from
+/// [`plan_delisted_from`](crate::install::plan_delisted_from) with every
+/// recorded name kept; it is returned as [`UninstallBatch::untracked`].
+/// `target_dir` only names record paths in a refusal.
+///
+/// # Errors
+///
+/// [`Error::Profile`] if `game` has no ecosystem profile, if a name in `names`
+/// is not recorded, or if a subject cannot be removed exactly.
+pub fn plan_uninstall_batch_from(
+  target_dir: &Path,
+  eco: &Ecosystem,
+  game: &str,
+  names: Option<&[String]>,
+  recorded: &[ProfileMod],
+  mut record_state: impl FnMut(&str) -> RecordState,
+  untracked: Vec<PathBuf>,
+) -> Result<UninstallBatch> {
+  eco
+    .game(game)
+    .and_then(|g| g.profile())
+    .ok_or_else(|| Error::Profile(format!("no ecosystem profile for game {game:?}")))?;
+
   let subjects: Vec<String> = match names {
     Some(names) => {
       for name in names {
-        if modlist::find(&recorded, name).is_none() {
+        if modlist::find(recorded, name).is_none() {
           return Err(Error::Profile(format!("{name} is not installed")));
         }
       }
@@ -1088,13 +1231,12 @@ pub fn plan_uninstall_batch(
     None => recorded.iter().map(|entry| entry.name.clone()).collect(),
   };
 
-  if let Some((name, refusal)) = check_removable_batch(target_dir, eco, &subjects)
-    .into_iter()
-    .next()
-  {
-    return Err(Error::Profile(format!(
-      "{name} cannot be removed: {refusal}"
-    )));
+  for name in &subjects {
+    if let Err(refusal) = check_removable_from(target_dir, eco, name, record_state(name)) {
+      return Err(Error::Profile(format!(
+        "{name} cannot be removed: {refusal}"
+      )));
+    }
   }
 
   let mut mods: Vec<String> = subjects
@@ -1111,9 +1253,6 @@ pub fn plan_uninstall_batch(
   mods.sort();
   loaders.sort();
 
-  let keep: BTreeSet<String> = recorded.iter().map(|entry| entry.name.clone()).collect();
-  let untracked = crate::install::plan_delisted(game_profile, target_dir, &keep)?;
-
   Ok(UninstallBatch {
     mods,
     loaders,
@@ -1126,6 +1265,7 @@ pub fn plan_uninstall_batch(
 /// Each removal re-derives its keep-set from the remaining record, so ordering is
 /// not required for correctness; loaders go last so every intermediate state is
 /// coherent.
+#[cfg(feature = "io")]
 pub fn uninstall_batch(
   target_dir: &Path,
   eco: &Ecosystem,
@@ -1173,6 +1313,9 @@ pub struct ToggleBatch {
 /// producing an empty plan: iterating the record and filtering would let an
 /// unrecorded name simply never appear, indistinguishable from "nothing to
 /// do".
+///
+/// Reads `target_dir`'s `mods.yml` and plans with [`plan_set_enabled_batch_from`].
+#[cfg(feature = "io")]
 pub fn plan_set_enabled_batch(
   target_dir: &Path,
   eco: &Ecosystem,
@@ -1181,9 +1324,27 @@ pub fn plan_set_enabled_batch(
 ) -> Result<ToggleBatch> {
   let recorded = modlist::read(target_dir)?;
 
+  plan_set_enabled_batch_from(&recorded, eco, names, enabled)
+}
+
+/// Plans a bulk enable or disable against an already-read record, without
+/// touching disk.
+///
+/// The rules are [`plan_set_enabled_batch`]'s; `recorded` is the target's
+/// `mods.yml` entries.
+///
+/// # Errors
+///
+/// [`Error::Profile`] if a name in `names` is not recorded.
+pub fn plan_set_enabled_batch_from(
+  recorded: &[ProfileMod],
+  eco: &Ecosystem,
+  names: Option<&[String]>,
+  enabled: bool,
+) -> Result<ToggleBatch> {
   if let Some(names) = names {
     for name in names {
-      if modlist::find(&recorded, name).is_none() {
+      if modlist::find(recorded, name).is_none() {
         return Err(Error::Profile(format!("{name} is not installed")));
       }
     }
@@ -1194,7 +1355,7 @@ pub fn plan_set_enabled_batch(
     ..ToggleBatch::default()
   };
 
-  for entry in &recorded {
+  for entry in recorded {
     if let Some(names) = names
       && !names.iter().any(|name| name == &entry.name)
     {
@@ -1223,6 +1384,7 @@ pub fn plan_set_enabled_batch(
 /// half-applied toggle with nothing reported. Applies `batch.enabled`, the
 /// sense it was planned for, rather than taking its own `enabled` argument, so
 /// the executor cannot disagree with the plan it is executing.
+#[cfg(feature = "io")]
 pub fn set_enabled_batch(
   target_dir: &Path,
   eco: &Ecosystem,
@@ -1241,7 +1403,7 @@ pub fn set_enabled_batch(
   Ok(outcome)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "io"))]
 mod tests {
   use super::*;
   use crate::ecosystem::Ecosystem;
@@ -3099,5 +3261,195 @@ mod tests {
       assert_eq!(outcome.unchanged, names(&[MOD]));
       assert!(repo.entry(MOD).enabled);
     }
+  }
+}
+
+#[cfg(test)]
+mod planning_tests {
+  use super::*;
+  use time::OffsetDateTime;
+
+  const LOADER: &str = "denikson-BepInExPack_Valheim";
+
+  fn recorded(name: &str, enabled: bool) -> ProfileMod {
+    let version = Version {
+      name: None,
+      full_name: Some(name.to_string()),
+      description: None,
+      icon: None,
+      version_number: Some("1.0.0".to_string()),
+      dependencies: Vec::new(),
+      download_url: None,
+      downloads: None,
+      date_created: OffsetDateTime::UNIX_EPOCH,
+      website_url: None,
+      is_active: None,
+      uuid4: None,
+      file_size: None,
+    };
+    let mut entry = mod_entry_from_version(name, "Owner", &version, 0);
+
+    entry.enabled = enabled;
+
+    entry
+  }
+
+  fn names(list: &[&str]) -> Vec<String> {
+    list.iter().map(|name| name.to_string()).collect()
+  }
+
+  #[test]
+  fn install_batch_from_restores_disabled_mods_unless_named() {
+    let record = [
+      recorded("Owner-Named", false),
+      recorded("Owner-Other", false),
+      recorded("Owner-On", true),
+    ];
+
+    let batch = plan_install_batch_from(
+      &record,
+      &names(&["Owner-Named-1.0.0", "Owner-New"]),
+      &names(&["Owner-Named-1.0.0"]),
+    );
+
+    assert_eq!(batch.desired, names(&["Owner-Named-1.0.0", "Owner-New"]));
+    assert_eq!(batch.enable_requested, names(&["Owner-Named"]));
+    assert_eq!(batch.protect_disabled, names(&["Owner-Other"]));
+    assert!(!batch.force);
+  }
+
+  #[test]
+  fn set_enabled_batch_from_sorts_mods_and_sets_loaders_aside() {
+    let eco = Ecosystem::bundled();
+    let record = [
+      recorded("Owner-B", true),
+      recorded("Owner-A", true),
+      recorded("Owner-Off", false),
+      recorded(LOADER, true),
+    ];
+
+    let batch = plan_set_enabled_batch_from(&record, &eco, None, false).unwrap();
+
+    assert_eq!(batch.changing, names(&["Owner-A", "Owner-B"]));
+    assert_eq!(batch.already, names(&["Owner-Off"]));
+    assert_eq!(batch.loaders, names(&[LOADER]));
+    assert!(!batch.enabled);
+  }
+
+  #[test]
+  fn set_enabled_batch_from_refuses_an_unrecorded_name() {
+    let eco = Ecosystem::bundled();
+    let record = [recorded("Owner-A", true)];
+
+    let result = plan_set_enabled_batch_from(&record, &eco, Some(&names(&["Owner-Missing"])), true);
+
+    assert!(matches!(result, Err(Error::Profile(message)) if message.contains("Owner-Missing")));
+  }
+
+  #[test]
+  fn check_removable_from_refuses_only_unknowable_records() {
+    let eco = Ecosystem::bundled();
+    let dir = Path::new("/profiles/main");
+
+    assert!(check_removable_from(dir, &eco, LOADER, RecordState::Present).is_ok());
+    assert!(check_removable_from(dir, &eco, "Owner-Mod", RecordState::Absent).is_ok());
+    assert!(matches!(
+      check_removable_from(dir, &eco, LOADER, RecordState::Absent),
+      Err(NotRemovable::RecordAbsent { path, .. })
+        if path == crate::install::state_file_path(dir, LOADER)
+    ));
+    assert!(matches!(
+      check_removable_from(
+        dir,
+        &eco,
+        "Owner-Mod",
+        RecordState::Unreadable(Error::Install("bad yaml".to_string()))
+      ),
+      Err(NotRemovable::RecordUnreadable { .. })
+    ));
+  }
+
+  #[test]
+  fn uninstall_batch_from_splits_loaders_and_keeps_untracked() {
+    let eco = Ecosystem::bundled();
+    let record = [
+      recorded("Owner-B", true),
+      recorded("Owner-A", true),
+      recorded(LOADER, true),
+    ];
+    let untracked = vec![PathBuf::from("BepInEx/plugins/Stray-Mod")];
+
+    let batch = plan_uninstall_batch_from(
+      Path::new("/profiles/main"),
+      &eco,
+      "valheim",
+      None,
+      &record,
+      |_| RecordState::Present,
+      untracked.clone(),
+    )
+    .unwrap();
+
+    assert_eq!(batch.mods, names(&["Owner-A", "Owner-B"]));
+    assert_eq!(batch.loaders, names(&[LOADER]));
+    assert_eq!(batch.untracked, untracked);
+  }
+
+  #[test]
+  fn uninstall_batch_from_stops_at_the_first_refusal() {
+    let eco = Ecosystem::bundled();
+    let record = [recorded(LOADER, true), recorded("Owner-A", true)];
+    let mut asked = Vec::new();
+
+    let result = plan_uninstall_batch_from(
+      Path::new("/profiles/main"),
+      &eco,
+      "valheim",
+      Some(&names(&[LOADER, "Owner-A"])),
+      &record,
+      |name| {
+        asked.push(name.to_string());
+
+        RecordState::Absent
+      },
+      Vec::new(),
+    );
+
+    assert!(
+      matches!(result, Err(Error::Profile(message)) if message.contains("cannot be removed"))
+    );
+    assert_eq!(asked, names(&[LOADER]));
+  }
+
+  #[test]
+  fn uninstall_batch_from_refuses_unrecorded_names_and_unknown_games() {
+    let eco = Ecosystem::bundled();
+    let record = [recorded("Owner-A", true)];
+
+    let unrecorded = plan_uninstall_batch_from(
+      Path::new("/profiles/main"),
+      &eco,
+      "valheim",
+      Some(&names(&["Owner-Missing"])),
+      &record,
+      |_| RecordState::Present,
+      Vec::new(),
+    );
+    let unknown_game = plan_uninstall_batch_from(
+      Path::new("/profiles/main"),
+      &eco,
+      "no-such-game",
+      None,
+      &record,
+      |_| RecordState::Present,
+      Vec::new(),
+    );
+
+    assert!(
+      matches!(unrecorded, Err(Error::Profile(message)) if message.contains("not installed"))
+    );
+    assert!(
+      matches!(unknown_game, Err(Error::Profile(message)) if message.contains("no ecosystem profile"))
+    );
   }
 }

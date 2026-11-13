@@ -9,17 +9,25 @@
 
 #![deny(missing_docs)]
 
+#[cfg(feature = "io")]
 use crate::error::{Error, Result};
+#[cfg(feature = "io")]
 use crate::manifest::Manifest;
+#[cfg(feature = "io")]
 use std::fs;
+#[cfg(feature = "io")]
 use std::io::{Read, Write};
+#[cfg(feature = "io")]
 use std::path::{Component, Path, PathBuf};
+#[cfg(feature = "io")]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "io")]
 use tracing::{debug, error, warn};
 
 /// Size of the reusable read buffer used to stream each archive entry to disk.
 /// This bounds extraction memory to a constant regardless of entry size; it is an
 /// IO buffer, not a cap on legitimate file size.
+#[cfg(feature = "io")]
 const EXTRACT_CHUNK_SIZE: usize = 64 * 1024;
 
 /// Resource limits enforced while extracting an archive, to defend against
@@ -54,6 +62,7 @@ impl Default for ExtractLimits {
 /// Computes a unique sibling temp path next to `path` so a partially-extracted
 /// entry can be written, CRC-verified, then atomically renamed into place — an
 /// interrupted or corrupt entry never leaves a usable file behind.
+#[cfg(feature = "io")]
 fn temp_sibling_path(path: &Path) -> PathBuf {
   static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -80,6 +89,7 @@ fn temp_sibling_path(path: &Path) -> PathBuf {
 /// Returns [`Error::ChecksumMismatch`] when the computed CRC differs from the one
 /// recorded in the archive. The caller is responsible for renaming `tmp_path` into
 /// place on success and removing it on any error.
+#[cfg(feature = "io")]
 fn write_entry<R: Read>(
   entry: &mut R,
   buffer: &mut [u8],
@@ -139,6 +149,7 @@ fn write_entry<R: Read>(
 /// guard is unit-testable. Returns [`Error::ExtractLimitExceeded`] on breach; this
 /// stays distinct from the network `SizeCap`/[`Error::SizeLimitExceeded`] path
 /// because archive limits also bound a non-byte quantity (entry count).
+#[cfg(feature = "io")]
 fn check_extract_size(
   dest: &Path,
   file_written: u64,
@@ -171,6 +182,7 @@ fn check_extract_size(
 /// absolute, root, drive-prefix, or `..` component itself, so the traversal guard
 /// is a single pure function testable against crafted paths without a real
 /// archive.
+#[cfg(feature = "io")]
 fn safe_join(dest_dir: &Path, entry: Option<&Path>) -> Option<PathBuf> {
   let entry = entry?;
 
@@ -200,7 +212,7 @@ fn safe_join(dest_dir: &Path, entry: Option<&Path>) -> Option<PathBuf> {
 /// world-writable. Widening to a fixed `0o755` can do neither. An entry with no
 /// recorded mode at all, which is every archive built on Windows, is left alone
 /// rather than guessed at.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "io"))]
 fn entry_permissions(unix_mode: Option<u32>) -> Option<fs::Permissions> {
   use std::os::unix::fs::PermissionsExt;
 
@@ -217,6 +229,7 @@ fn entry_permissions(unix_mode: Option<u32>) -> Option<fs::Permissions> {
 /// `path`. See [`entry_permissions`] for why only that bit is honoured.
 ///
 /// A no-op off Unix, where a zip entry's Unix mode has nothing to map onto.
+#[cfg(feature = "io")]
 fn apply_entry_mode(path: &Path, unix_mode: Option<u32>) -> Result<()> {
   #[cfg(unix)]
   if let Some(permissions) = entry_permissions(unix_mode) {
@@ -241,6 +254,7 @@ fn apply_entry_mode(path: &Path, unix_mode: Option<u32>) -> Result<()> {
 /// CRC32 verification fails for any extracted entry ([`Error::ChecksumMismatch`]),
 /// or if the archive exceeds a default extraction limit
 /// ([`Error::ExtractLimitExceeded`]).
+#[cfg(feature = "io")]
 pub fn extract_zip(zip_path: &Path, dest_dir: &Path) -> Result<()> {
   extract_zip_with_limits(zip_path, dest_dir, &ExtractLimits::default())
 }
@@ -260,6 +274,7 @@ pub fn extract_zip(zip_path: &Path, dest_dir: &Path) -> Result<()> {
 /// CRC32 verification fails for any extracted entry ([`Error::ChecksumMismatch`]),
 /// or if the archive exceeds a limit in `limits`
 /// ([`Error::ExtractLimitExceeded`]).
+#[cfg(feature = "io")]
 pub fn extract_zip_with_limits(
   zip_path: &Path,
   dest_dir: &Path,
@@ -363,7 +378,7 @@ pub fn extract_zip_with_limits(
 }
 
 /// Calculates the CRC32 checksum for a byte buffer.
-#[cfg(test)]
+#[cfg(all(test, feature = "io"))]
 fn calculate_crc32(data: &[u8]) -> u32 {
   let mut hasher = crc32fast::Hasher::new();
   hasher.update(data);
@@ -377,6 +392,7 @@ fn calculate_crc32(data: &[u8]) -> u32 {
 /// different `version_number` than `version`, or if its manifest cannot be
 /// parsed. Returns `Ok(false)` only when an existing manifest already records
 /// the same version.
+#[cfg(feature = "io")]
 pub fn should_extract(mod_dir: &Path, version: &str) -> Result<bool> {
   let manifest_path = mod_dir.join("manifest.json");
 
@@ -432,6 +448,7 @@ pub fn should_extract(mod_dir: &Path, version: &str) -> Result<bool> {
 /// Re-extract unless an existing manifest already records exactly the requested
 /// version. Extracted from [`should_extract`] so the decision is testable without
 /// writing manifest files to disk.
+#[cfg(feature = "io")]
 fn should_reextract(existing_version: Option<&str>, requested: &str) -> bool {
   match existing_version {
     Some(existing) => existing != requested,
@@ -463,7 +480,7 @@ pub fn parse_package_filename(file_name: &str) -> Option<(String, String)> {
   Some((full_name, version))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "io"))]
 mod tests {
   use super::*;
   use std::fs::File;

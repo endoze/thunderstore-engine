@@ -21,6 +21,7 @@
 #![deny(missing_docs)]
 
 use crate::error::{Error, Result};
+#[cfg(feature = "io")]
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -49,6 +50,7 @@ pub fn validate_name(name: &str) -> Result<()> {
 
 /// Lists profile names (immediate subdirectories) for a game, sorted. A missing
 /// profiles directory yields an empty list.
+#[cfg(feature = "io")]
 pub fn list(base: &Path, game: &str) -> Result<Vec<String>> {
   let dir = profiles_dir(base, game);
 
@@ -77,6 +79,7 @@ pub fn list(base: &Path, game: &str) -> Result<Vec<String>> {
 
 /// Creates a new, empty profile directory. Errors if it already exists so a
 /// create never silently adopts an existing profile.
+#[cfg(feature = "io")]
 pub fn create(base: &Path, game: &str, name: &str) -> Result<PathBuf> {
   validate_name(name)?;
 
@@ -99,6 +102,7 @@ pub fn create(base: &Path, game: &str, name: &str) -> Result<PathBuf> {
 ///
 /// Errors if the profile does not exist, so deleting an already-deleted profile
 /// is reported rather than treated as success.
+#[cfg(feature = "io")]
 pub fn delete(base: &Path, game: &str, name: &str) -> Result<()> {
   validate_name(name)?;
 
@@ -123,6 +127,7 @@ pub fn delete(base: &Path, game: &str, name: &str) -> Result<()> {
 /// Not transactional: the rename can succeed and the selection update then fail,
 /// leaving the selection naming a profile that no longer exists. Callers that
 /// care can re-read it with [`read_selection`].
+#[cfg(feature = "io")]
 pub fn rename(base: &Path, game: &str, from: &str, to: &str) -> Result<()> {
   validate_name(from)?;
   validate_name(to)?;
@@ -162,6 +167,7 @@ pub fn rename(base: &Path, game: &str, from: &str, to: &str) -> Result<()> {
 ///
 /// Errors if `to` already exists. A failed copy can leave `to` partially
 /// written; it is not cleaned up.
+#[cfg(feature = "io")]
 pub fn duplicate(base: &Path, game: &str, from: &str, to: &str) -> Result<PathBuf> {
   validate_name(from)?;
   validate_name(to)?;
@@ -180,6 +186,7 @@ pub fn duplicate(base: &Path, game: &str, from: &str, to: &str) -> Result<PathBu
 
 /// Recursively copies a directory tree, creating `dst`. Skips symlinks (never
 /// follows them out of the tree), like the install layer's `walk_files`.
+#[cfg(feature = "io")]
 fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
   fs::create_dir_all(dst)
     .map_err(|e| Error::Profile(format!("creating {}: {}", dst.display(), e)))?;
@@ -232,6 +239,7 @@ pub fn selection_path(base: &Path, game: &str) -> PathBuf {
 }
 
 /// The persisted selection, or `None` when absent, empty, or unreadable.
+#[cfg(feature = "io")]
 pub fn read_selection(base: &Path, game: &str) -> Option<String> {
   let text = fs::read_to_string(selection_path(base, game)).ok()?;
   let name = text.trim();
@@ -243,6 +251,7 @@ pub fn read_selection(base: &Path, game: &str) -> Option<String> {
 }
 
 /// Persists `name` as the selected profile.
+#[cfg(feature = "io")]
 pub fn write_selection(base: &Path, game: &str, name: &str) -> Result<()> {
   let path = selection_path(base, game);
 
@@ -256,6 +265,7 @@ pub fn write_selection(base: &Path, game: &str, name: &str) -> Result<()> {
 
 /// Removes the persisted selection, returning to game-directory mode. Absent is
 /// not an error.
+#[cfg(feature = "io")]
 pub fn clear_selection(base: &Path, game: &str) -> Result<()> {
   let path = selection_path(base, game);
 
@@ -314,6 +324,7 @@ impl std::error::Error for BadProfile {}
 /// [`use_profile`] and [`crate::profile::target::InstallTarget::resolve`] go
 /// through it, so they cannot drift apart, and a caller that wants to word the
 /// refusal itself gets the reason rather than a sentence.
+#[cfg(feature = "io")]
 pub fn require_profile(
   base: &Path,
   game: &str,
@@ -336,6 +347,7 @@ pub fn require_profile(
 }
 
 /// Selects `name` as the active profile, refusing one that does not exist.
+#[cfg(feature = "io")]
 pub fn use_profile(base: &Path, game: &str, name: &str) -> Result<()> {
   require_profile(base, game, name)?;
 
@@ -367,7 +379,9 @@ pub fn select_profile(
 #[cfg(test)]
 mod tests {
   use super::*;
+  #[cfg(feature = "io")]
   use std::fs;
+  #[cfg(feature = "io")]
   use tempfile::tempdir;
 
   #[test]
@@ -394,6 +408,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn create_list_rename_duplicate_delete() {
     let dir = tempdir().unwrap();
     let base = dir.path();
@@ -428,6 +443,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn the_selection_follows_a_rename_and_clears_on_delete() {
     let base = tempdir().unwrap();
     let root = base.path();
@@ -469,6 +485,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn require_profile_classifies_why_a_name_is_unusable() {
     let base = tempdir().unwrap();
     let root = base.path();
@@ -499,6 +516,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn use_profile_and_resolve_refuse_a_missing_profile_identically() {
     let base = tempdir().unwrap();
     let root = base.path();

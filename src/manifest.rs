@@ -1,13 +1,17 @@
 #![deny(missing_docs)]
 
+#[cfg(feature = "io")]
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "io")]
 use std::fs;
+#[cfg(feature = "io")]
 use std::path::Path;
 
 /// Maximum size of a `manifest.json` read from disk. A `manifest.json` comes from
 /// an untrusted downloaded archive, so this bounds the memory a hostile or corrupt
 /// file can force `from_file` to allocate.
+#[cfg(feature = "io")]
 const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Manifest metadata for an individual mod package.
@@ -32,6 +36,7 @@ pub struct Manifest {
   pub dependencies: Vec<String>,
 }
 
+#[cfg(feature = "io")]
 impl Manifest {
   /// Loads and parses a `manifest.json` from disk.
   ///
@@ -107,7 +112,7 @@ impl Manifest {
   }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "io"))]
 mod tests {
   use super::*;
   use std::fs::File;

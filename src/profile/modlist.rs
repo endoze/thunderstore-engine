@@ -7,9 +7,12 @@
 
 #![deny(missing_docs)]
 
+#[cfg(feature = "io")]
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "io")]
 use std::fs;
+#[cfg(feature = "io")]
 use std::path::Path;
 
 /// The `major.minor.patch` version object, serialized as a nested mapping to
@@ -135,6 +138,7 @@ pub struct ProfileMod {
 }
 
 /// The `mods.yml` filename within a profile directory.
+#[cfg(feature = "io")]
 const MODS_YML: &str = "mods.yml";
 
 /// Reads `<profile_dir>/mods.yml`. A missing file is an empty list (a fresh
@@ -142,6 +146,7 @@ const MODS_YML: &str = "mods.yml";
 ///
 /// A read or parse failure names the file in its message, so a caller does not
 /// need to prepend the path itself.
+#[cfg(feature = "io")]
 pub fn read(profile_dir: &Path) -> Result<Vec<ProfileMod>> {
   let path = profile_dir.join(MODS_YML);
 
@@ -157,6 +162,7 @@ pub fn read(profile_dir: &Path) -> Result<Vec<ProfileMod>> {
 }
 
 /// Writes `mods` to `<profile_dir>/mods.yml`, creating the directory if needed.
+#[cfg(feature = "io")]
 pub fn write(profile_dir: &Path, mods: &[ProfileMod]) -> Result<()> {
   fs::create_dir_all(profile_dir)
     .map_err(|e| Error::Profile(format!("creating {}: {}", profile_dir.display(), e)))?;
@@ -192,6 +198,7 @@ pub fn upsert(mods: &mut Vec<ProfileMod>, entry: ProfileMod) {
 /// back to `0` rather than failing an install over it: nothing in `mods.yml`
 /// or the install pipeline treats this timestamp as anything but display
 /// metadata, so there is no correctness reason to refuse the install.
+#[cfg(feature = "io")]
 pub fn now_millis() -> u64 {
   std::time::SystemTime::now()
     .duration_since(std::time::UNIX_EPOCH)
@@ -202,6 +209,7 @@ pub fn now_millis() -> u64 {
 #[cfg(test)]
 mod tests {
   use super::*;
+  #[cfg(feature = "io")]
   use tempfile::tempdir;
 
   fn sample() -> ProfileMod {
@@ -284,6 +292,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn read_write_round_trips_and_missing_is_empty() {
     let dir = tempdir().unwrap();
 
@@ -408,6 +417,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn an_unreadable_record_names_its_path() {
     let dir = tempdir().unwrap();
 

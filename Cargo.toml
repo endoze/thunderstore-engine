@@ -27,43 +27,96 @@ name = "thunderstore_engine"
 path = "src/lib.rs"
 
 [dependencies]
-chrono = "0.4.45"
-crc32fast = "1.5"
-futures = "0.3.32"
-reqwest = { version = "0.13.4", features = ["json", "stream"], default-features = false }
+chrono = { version = "0.4.45", optional = true }
+crc32fast = { version = "1.5", optional = true }
+futures = { version = "0.3.32", optional = true }
+reqwest = { version = "0.13.4", features = ["json", "stream"], default-features = false, optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
 time = { version = "0.3.51", features = ["serde-well-known"] }
-tokio = { version = "1.32", features = ["full"] }
+tokio = { version = "1.32", features = ["full"], optional = true }
 tracing = "0.1.44"
-zip = "8.6"
-bincode = { version = "2.0", features = ["serde"] }
+zip = { version = "8.6", optional = true }
+bincode = { version = "2.0", features = ["serde"], optional = true }
 zstd = "0.13.3"
 lasso = { version = "0.7", features = ["serialize"] }
 serde_yaml_ng = "0.10.0"
-base64 = "0.22"
+base64 = { version = "0.22", optional = true }
+mockito = { version = "1.7", optional = true }
 
 [dev-dependencies]
 mockito = "1.7"
 tempfile = "3.10.1"
 
 [features]
+default = ["io", "rustls-tls"]
+# Everything that touches disk or network: the HTTP client, the index cache,
+# zip extraction, and every profile operation. With it off, the crate keeps the
+# data models, the resolver, the game definitions, the plan types, and the pure
+# planners, and builds without an HTTP client or an async runtime.
+io = [
+  "dep:base64",
+  "dep:bincode",
+  "dep:chrono",
+  "dep:crc32fast",
+  "dep:futures",
+  "dep:reqwest",
+  "dep:tokio",
+  "dep:windows-registry",
+  "dep:zip",
+]
 # TLS backend selection. Pick exactly one. The default, `rustls-tls`, uses
 # rustls with the `aws-lc-rs` crypto provider, which needs a C toolchain to
 # build; `native-tls` links the platform's TLS stack instead and avoids that
 # build dependency. To choose native-tls, depend on this crate with
-# `default-features = false, features = ["native-tls"]`.
-default = ["rustls-tls"]
-rustls-tls = ["reqwest/rustls"]
-native-tls = ["reqwest/native-tls"]
+# `default-features = false, features = ["native-tls"]`. Either one turns on
+# `io`, so that spelling keeps every IO function.
+rustls-tls = ["io", "reqwest/rustls"]
+native-tls = ["io", "reqwest/native-tls"]
+# The mock Thunderstore server, package index, and package archives, for tests
+# in this crate and in clients. Never on by default, so normal builds carry
+# neither the fixture nor `mockito`.
+test-support = ["io", "dep:mockito"]
+
+[[test]]
+name = "test_support"
+required-features = ["test-support"]
+
+[[test]]
+name = "end_to_end"
+required-features = ["io"]
+
+[[test]]
+name = "profile_end_to_end"
+required-features = ["test-support"]
+
+[[test]]
+name = "profile_launch_end_to_end"
+required-features = ["io"]
+
+[[test]]
+name = "profile_portability_end_to_end"
+required-features = ["io"]
+
+[[test]]
+name = "send"
+required-features = ["io"]
+
+[[example]]
+name = "launch_probe"
+required-features = ["io"]
 
 # Build docs.rs with the default `rustls-tls` backend. `native-tls` links the
 # platform OpenSSL, which a plain `--all-features` docs build cannot assume, so
-# the TLS features are never enabled together here.
+# the TLS features are never enabled together here. `test-support` is added so
+# the fixture is documented. The `docsrs` cfg labels each item that needs the
+# `io` or `test-support` feature.
 [package.metadata.docs.rs]
 all-features = false
 no-default-features = false
+features = ["test-support"]
+rustdoc-args = ["--cfg", "docsrs"]
 
 # The profile that 'cargo dist' will build with
 [profile.dist]
@@ -75,4 +128,4 @@ lto = "thin"
 # only source that survives a Steam installed to another drive. Target-gated, so
 # no Unix build ever sees it.
 [target."cfg(windows)".dependencies]
-windows-registry = "0.6.1"
+windows-registry = { version = "0.6.1", optional = true }

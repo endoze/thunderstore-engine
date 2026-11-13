@@ -78,6 +78,7 @@ pub(crate) struct VersionTable {
 /// Version 2 switched the cache from the `bincode` serde bridge to `bincode`'s
 /// native `Encode`/`Decode` (so container allocation is bounded by the decode
 /// limit) and stores timestamps as `i128` Unix-nanosecond values.
+#[cfg(feature = "io")]
 pub(crate) const CACHE_FORMAT_VERSION: u32 = 2;
 
 /// On-disk (`bincode`) representation of a [`PackageIndex`].
@@ -99,6 +100,7 @@ pub(crate) const CACHE_FORMAT_VERSION: u32 = 2;
 /// bridge) so the decode limit bounds container allocation, and timestamps are
 /// stored as `i128` Unix nanoseconds (see [`encode_dates`]/[`decode_dates`])
 /// because `time::OffsetDateTime` is not a native `bincode` type.
+#[cfg(feature = "io")]
 #[derive(bincode::Encode, bincode::Decode, Debug, Clone)]
 pub(crate) struct SerializedPackageIndex {
   /// Cache-format tag; must equal [`CACHE_FORMAT_VERSION`]. Kept first so it is
@@ -127,6 +129,7 @@ pub(crate) struct SerializedPackageIndex {
 /// Contains version information with string values represented as u32 indices into
 /// the parent manifest's string table. This allows efficient serialization while
 /// maintaining the benefits of string interning.
+#[cfg(feature = "io")]
 #[derive(bincode::Encode, bincode::Decode, Debug, Clone)]
 pub(crate) struct SerializedVersionTable {
   pub package_indices: Vec<usize>,
@@ -1042,6 +1045,7 @@ impl From<Vec<Package>> for PackageIndex {
 /// Panics if the index exceeds `u32::MAX`, which needs roughly four billion
 /// distinct interned strings. A silent truncation here would corrupt the string
 /// table in release builds, so this fails loudly instead.
+#[cfg(feature = "io")]
 fn key_to_index(_interner: &StringInterner, key: InternKey) -> u32 {
   let index = key.to_index();
 
@@ -1058,6 +1062,7 @@ fn key_to_index(_interner: &StringInterner, key: InternKey) -> u32 {
 /// Returns an [`Error`] (rather than panicking) when the index is out of range
 /// for the string table or otherwise not representable as a key, so a corrupt or
 /// truncated cache file surfaces as a recoverable error.
+#[cfg(feature = "io")]
 fn decode_key(index: u32, table_len: usize) -> Result<InternKey, Error> {
   if index as usize >= table_len {
     return Err(Error::Cache(format!(
@@ -1076,6 +1081,7 @@ fn decode_key(index: u32, table_len: usize) -> Result<InternKey, Error> {
 /// timestamp as its absolute instant in nanoseconds since the Unix epoch. The
 /// offset is not preserved, which is lossless for equality/ordering (both compare
 /// the instant) and matches the UTC timestamps the Thunderstore API returns.
+#[cfg(feature = "io")]
 fn encode_dates(dates: &[OffsetDateTime]) -> Vec<i128> {
   dates.iter().map(|d| d.unix_timestamp_nanos()).collect()
 }
@@ -1083,6 +1089,7 @@ fn encode_dates(dates: &[OffsetDateTime]) -> Vec<i128> {
 /// Decodes the cache's `i128` Unix-nanosecond timestamps back to `OffsetDateTime`
 /// (as UTC), returning an [`Error`] rather than panicking if a crafted cache holds
 /// an out-of-range value.
+#[cfg(feature = "io")]
 fn decode_dates(nanos: &[i128]) -> Result<Vec<OffsetDateTime>, Error> {
   nanos
     .iter()
@@ -1093,6 +1100,7 @@ fn decode_dates(nanos: &[i128]) -> Result<Vec<OffsetDateTime>, Error> {
     .collect()
 }
 
+#[cfg(feature = "io")]
 impl From<&PackageIndex> for SerializedPackageIndex {
   fn from(manifest: &PackageIndex) -> Self {
     let interner = &manifest.interner;
@@ -1150,6 +1158,7 @@ impl From<&PackageIndex> for SerializedPackageIndex {
   }
 }
 
+#[cfg(feature = "io")]
 impl TryFrom<SerializedPackageIndex> for PackageIndex {
   type Error = Error;
 
@@ -1638,6 +1647,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn encode_decode_dates_roundtrips_and_rejects_out_of_range() {
     let dates = vec![
       OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(),
@@ -2133,6 +2143,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_package_index_serialization_round_trip() {
     let pkg = create_test_package("TestMod", "TestOwner", "1.0.0");
     let packages = vec![pkg.clone()];
@@ -2166,6 +2177,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_version_name_and_full_name_are_version_level_not_package_level() {
     // Real Thunderstore data: a version's full_name carries the version suffix,
     // distinct from the package's own full_name.
@@ -2248,6 +2260,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_duplicate_string_table_returns_error_not_panic() {
     let pkg = create_test_package("TestMod", "TestOwner", "1.0.0");
     let interned: PackageIndex = vec![pkg].into();
@@ -2271,6 +2284,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_corrupt_cache_index_returns_error_not_panic() {
     let pkg = create_test_package("TestMod", "TestOwner", "1.0.0");
     let interned: PackageIndex = vec![pkg].into();
@@ -2539,6 +2553,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_cache_rejects_unsupported_format_version() {
     let pkg = create_test_package("TestMod", "TestOwner", "1.0.0");
     let interned: PackageIndex = vec![pkg].into();
@@ -2554,6 +2569,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_cache_current_format_version_round_trips() {
     let pkg = create_test_package("TestMod", "TestOwner", "1.0.0");
     let interned: PackageIndex = vec![pkg].into();

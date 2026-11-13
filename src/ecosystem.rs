@@ -21,7 +21,9 @@
 #![deny(missing_docs)]
 
 use crate::error::{Error, Result};
+#[cfg(feature = "io")]
 use crate::retry::{RetryPolicy, retry_http};
+#[cfg(feature = "io")]
 use crate::util::SizeCap;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
@@ -50,6 +52,7 @@ pub const DEFAULT_ECOSYSTEM_URL: &str =
 /// Maximum size of an ecosystem schema fetched over the network. The real schema
 /// is small relative to this generous cap, which bounds the memory a misbehaving or
 /// compromised endpoint can force [`Ecosystem::fetch_latest`] to allocate.
+#[cfg(feature = "io")]
 const MAX_ECOSYSTEM_BYTES: u64 = 64 * 1024 * 1024;
 
 /// A parsed ecosystem schema: the known games plus the mod-loader package registry.
@@ -127,6 +130,7 @@ impl Ecosystem {
   /// trust — see the [`DEFAULT_ECOSYSTEM_URL`] trust note. The response body is
   /// size-bounded (see `MAX_ECOSYSTEM_BYTES`) so a misbehaving endpoint cannot
   /// force unbounded allocation.
+  #[cfg(feature = "io")]
   pub async fn fetch_latest(client: &reqwest::Client, url: &str) -> Result<Self> {
     Self::fetch_latest_bounded(client, url, MAX_ECOSYSTEM_BYTES, &RetryPolicy::default()).await
   }
@@ -134,6 +138,7 @@ impl Ecosystem {
   /// [`fetch_latest`](Self::fetch_latest) with an explicit body-size cap and
   /// retry policy. Transient network failures are retried; a size-cap breach or
   /// a parse failure is terminal.
+  #[cfg(feature = "io")]
   async fn fetch_latest_bounded(
     client: &reqwest::Client,
     url: &str,
@@ -670,6 +675,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_fetch_latest_rejects_declared_oversize_body() {
     let mut server = mockito::Server::new();
     let body = "x".repeat(1000);
@@ -697,6 +703,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_fetch_latest_rejects_streamed_oversize_body() {
     let mut server = mockito::Server::new();
 
@@ -725,6 +732,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_fetch_latest_parses_network_schema() {
     let mut server = mockito::Server::new();
 

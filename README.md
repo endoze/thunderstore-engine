@@ -72,8 +72,37 @@ async fn main() -> thunderstore_engine::Result<()> {
 
 ## Cargo features
 
+### `io` (default)
+
+Everything that touches disk or network: the `client`, the index cache, zip
+extraction, and every profile operation that reads or writes a target. With
+`io` off, the crate builds without an HTTP client, an async runtime, or an
+archive library, and keeps what does no IO:
+
+- the package, version, and ecosystem models, and the dependency resolver;
+- the plan types (`InstallPlan`, `InstallBatch`, `UninstallBatch`,
+  `ToggleBatch`, `LaunchPlan`) and the `mods.yml` and export models;
+- pure planners that take what the `io` functions would read as arguments:
+  `install::plan_install_from` (a package's file list),
+  `install::plan_delisted_from`, `profile::plan_install_batch_from`,
+  `profile::plan_set_enabled_batch_from`,
+  `profile::plan_uninstall_batch_from`, and
+  `profile::launch::launch_plan_from` (a target's `LaunchFacts`).
+
+Each `io` function with a pure counterpart reads its inputs and calls that
+counterpart, so the two decide identically. To depend on the pure part only:
+
+```toml
+thunderstore-engine = { version = "0.3", default-features = false }
+```
+
+Cargo merges features across everything built together, so a crate that must
+not reach the `io` functions is only held to that when it is built on its own.
+
+### TLS backend
+
 The HTTP/TLS backend is selectable so downstream builds can avoid a backend's
-build dependency. Pick exactly one:
+build dependency. Either one turns on `io`. Pick exactly one:
 
 - `rustls-tls` *(default)*: rustls with the `aws-lc-rs` provider (needs a C
   toolchain to build).
@@ -82,6 +111,28 @@ build dependency. Pick exactly one:
   ```toml
   thunderstore-engine = { version = "0.1", default-features = false, features = ["native-tls"] }
   ```
+
+### `test-support`
+
+Off by default. Adds `test_support`, a mock Thunderstore built on `mockito`
+that serves a small package index and real package archives, so a client's
+tests can run the install pipeline with no network access.
+`MockThunderstore::start` (or `start_async` in an async test) starts it, and
+`client_builder` returns a client pointed at it. Turn it on for tests only:
+
+```toml
+[dev-dependencies]
+thunderstore-engine = { version = "0.3", features = ["test-support"] }
+```
+
+`test-support` turns on `io`, so it needs a TLS backend like any `io` build.
+A client on `native-tls` repeats its own features, so the test build doesn't
+also get the default `rustls-tls`:
+
+```toml
+[dev-dependencies]
+thunderstore-engine = { version = "0.3", default-features = false, features = ["native-tls", "test-support"] }
+```
 
 ## Refreshing the bundled ecosystem snapshot
 

@@ -20,6 +20,7 @@ pub enum Error {
   Io(#[from] io::Error),
 
   /// Error from HTTP operations.
+  #[cfg(feature = "io")]
   #[error("HTTP error: {0}")]
   Http(#[from] reqwest::Error),
 
@@ -28,10 +29,12 @@ pub enum Error {
   Json(#[from] serde_json::Error),
 
   /// Error from ZIP operations.
+  #[cfg(feature = "io")]
   #[error("ZIP error: {0}")]
   Zip(#[from] zip::result::ZipError),
 
   /// Error from header parsing.
+  #[cfg(feature = "io")]
   #[error("Header error: {0}")]
   Header(#[from] reqwest::header::ToStrError),
 

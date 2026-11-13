@@ -6,7 +6,9 @@
 
 #![deny(missing_docs)]
 
+#[cfg(feature = "io")]
 use crate::error::{Error, Result};
+#[cfg(feature = "io")]
 use crate::extract::{extract_zip, should_extract};
 use std::path::{Path, PathBuf};
 
@@ -19,6 +21,7 @@ pub fn package_cache_dir(base: &Path, game: &str, full_name: &str, version: &str
 /// Extracts `archive` into the package cache directory if that version is not
 /// already present, and returns the directory. Uses [`should_extract`] so an
 /// unchanged version is not re-extracted.
+#[cfg(feature = "io")]
 pub fn ensure_extracted(
   base: &Path,
   game: &str,
@@ -42,7 +45,7 @@ pub fn ensure_extracted(
   Ok(dir)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "io"))]
 mod tests {
   use super::*;
   use std::io::{Cursor, Write};

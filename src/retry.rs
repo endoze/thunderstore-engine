@@ -10,8 +10,11 @@
 
 #![deny(missing_docs)]
 
+#[cfg(feature = "io")]
 use crate::error::{Error, Result};
+#[cfg(feature = "io")]
 use std::future::Future;
+#[cfg(feature = "io")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -50,6 +53,7 @@ impl RetryPolicy {
   }
 
   /// The backoff delay before the retry following `attempt` (0-based).
+  #[cfg(feature = "io")]
   fn backoff(&self, attempt: u32) -> Duration {
     let factor = 1u32.checked_shl(attempt).unwrap_or(u32::MAX);
     let capped = self.base_delay.saturating_mul(factor).min(self.max_delay);
@@ -65,6 +69,7 @@ impl RetryPolicy {
 
 /// A cheap, dependency-free varying value used only to desynchronize concurrent
 /// retries. Not cryptographic and not for any security purpose.
+#[cfg(feature = "io")]
 fn jitter_source() -> u64 {
   static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -83,6 +88,7 @@ fn jitter_source() -> u64 {
 /// the public `get_manifest`/`download_files` futures — `!Send`. A closure
 /// returning a single concrete future type has no such higher-ranked lifetime, so
 /// the futures stay `Send` and can be driven from a multi-threaded runtime.
+#[cfg(feature = "io")]
 pub(crate) async fn retry_with<T, F>(
   policy: &RetryPolicy,
   is_retryable: impl Fn(&Error) -> bool,
@@ -121,6 +127,7 @@ where
 }
 
 /// [`retry_with`] using [`is_retryable_http`] as the classifier.
+#[cfg(feature = "io")]
 pub(crate) async fn retry_http<T, F>(policy: &RetryPolicy, op: impl FnMut() -> F) -> Result<T>
 where
   F: Future<Output = Result<T>>,
@@ -131,6 +138,7 @@ where
 /// Whether an error is a transient HTTP failure worth retrying: a connection,
 /// timeout, request, or body error, or a `5xx`/`429` status. A `4xx` (other than
 /// `429`) and every non-HTTP error are treated as terminal.
+#[cfg(feature = "io")]
 pub(crate) fn is_retryable_http(err: &Error) -> bool {
   match err {
     Error::Http(e) => {
@@ -144,7 +152,7 @@ pub(crate) fn is_retryable_http(err: &Error) -> bool {
   }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "io"))]
 mod tests {
   use super::*;
   use std::cell::Cell;
