@@ -531,6 +531,24 @@ mod tests {
     assert!(safe_join(base, Some(Path::new("./ok.txt"))).is_some());
   }
 
+  /// A drive or UNC prefix only parses as one on Windows, so that is the only
+  /// host where the guard can be seen to catch it.
+  #[test]
+  #[cfg(windows)]
+  fn safe_join_rejects_drive_and_unc_prefixes() {
+    let base = Path::new(r"C:\dest");
+
+    assert_eq!(
+      safe_join(base, Some(Path::new(r"C:\Windows\evil.dll"))),
+      None
+    );
+    assert_eq!(safe_join(base, Some(Path::new("C:evil.dll"))), None);
+    assert_eq!(
+      safe_join(base, Some(Path::new(r"\\server\share\evil.dll"))),
+      None
+    );
+  }
+
   #[test]
   fn should_reextract_truth_table() {
     // No existing manifest (or an unparseable one) => re-extract.

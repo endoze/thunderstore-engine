@@ -32,7 +32,7 @@
 
 use std::path::Path;
 #[cfg(feature = "io")]
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 
 /// Path prefixes a sandboxed Steam is known to replace with a private mount, used
 /// only when no running Steam client is available to ask directly.
@@ -123,11 +123,14 @@ fn starts_with_components(path: &Path, prefix: &Path) -> bool {
 /// "does a similarly named file exist here". Taking the root as a parameter is also
 /// what makes the resolution testable against an ordinary directory tree.
 ///
-/// `path`'s leading `/` is stripped before joining, since [`Path::join`] with an
-/// absolute path discards the root it is joined onto.
+/// `path`'s root, and on Windows its drive prefix, is dropped before joining,
+/// since [`Path::join`] with an absolute path discards the root it is joined onto.
 #[cfg(feature = "io")]
 fn visible_in(namespace_root: &Path, path: &Path) -> bool {
-  let relative = path.strip_prefix("/").unwrap_or(path);
+  let relative: PathBuf = path
+    .components()
+    .filter(|component| !matches!(component, Component::Prefix(_) | Component::RootDir))
+    .collect();
 
   namespace_root.join(relative).exists()
 }
@@ -370,9 +373,9 @@ mod tests {
     assert!(visible_in(root, Path::new("/home/u/.local/share/vmm")));
   }
 
-  /// The leading `/` has to be stripped: `Path::join` with an absolute path
-  /// discards the root it is joined onto, which would silently check the *host*
-  /// filesystem and call every path reachable.
+  /// The root, and on Windows the drive prefix, has to be dropped: `Path::join`
+  /// with an absolute path discards the root it is joined onto, which would
+  /// silently check the *host* filesystem and call every path reachable.
   #[test]
   fn visible_in_does_not_fall_through_to_the_host_filesystem() {
     let namespace = tempdir().unwrap();
@@ -534,6 +537,31 @@ mod tests {
       steam_exe(),
       PathBuf::from("steam"),
       "off Windows the bare program name is correct and must be preserved"
+    );
+  }
+
+  /// The Windows half of `resolution_is_inert_off_windows`: the registry read
+  /// and the Program Files roots run for real, and whatever the host holds, the
+  /// result is a file that exists or the bare fallback.
+  #[test]
+  #[cfg(windows)]
+  fn resolution_reads_the_host_on_windows() {
+    assert!(
+      !install_roots().is_empty(),
+      "Windows always exports a Program Files root"
+    );
+
+    let recorded = registry_steam_exe();
+    let resolved = steam_exe();
+
+    if let Some(recorded) = recorded.filter(|path| path.is_file()) {
+      assert_eq!(resolved, recorded, "a live registry entry must win");
+    }
+
+    assert!(
+      resolved.is_file() || resolved == Path::new("steam"),
+      "got {}",
+      resolved.display()
     );
   }
 

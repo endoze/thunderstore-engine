@@ -174,6 +174,21 @@ pub enum Error {
     game: String,
   },
 
+  /// A modded launch found no mod loader installed in the target, so its mods
+  /// would not load.
+  #[error("Profile error: no {loader:?} mod loader is installed")]
+  NoModLoader {
+    /// The loader the game's mods need.
+    loader: crate::ecosystem::LoaderKind,
+  },
+
+  /// The game folder a launch needs does not exist.
+  #[error("Profile error: the game folder {} does not exist", .path.display())]
+  MissingGameDir {
+    /// The game folder as given.
+    path: std::path::PathBuf,
+  },
+
   /// One or more files in a batch download failed.
   #[error("{} of {total} downloads failed: {}", .failures.len(), list_failures(.failures))]
   Download {

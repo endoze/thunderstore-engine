@@ -1838,6 +1838,16 @@ mods:
     assert_eq!(import_config_key("a.cfg"), Some(PathBuf::from("a.cfg")));
   }
 
+  /// A drive prefix only parses as one on Windows, so that is the only host
+  /// where the guard can be seen to catch it.
+  #[test]
+  #[cfg(windows)]
+  fn import_config_key_refuses_a_drive_prefix() {
+    assert_eq!(import_config_key(r"C:\Windows\evil.cfg"), None);
+    assert_eq!(import_config_key("C:evil.cfg"), None);
+    assert_eq!(import_config_key(r"\\server\share\evil.cfg"), None);
+  }
+
   #[test]
   fn read_export_accepts_r2z_and_bare_r2x() {
     let dir = tempfile::tempdir().unwrap();

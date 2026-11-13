@@ -86,15 +86,16 @@ archive library, and keeps what does no IO:
   `GameDef::community`), read from each game's package index location;
 - the `Error` type, which is `Clone` so a client can keep one in its state;
 - the plan types (`InstallPlan`, `InstallBatch`, `UninstallBatch`,
-  `ToggleBatch`, `LaunchPlan`) and the `mods.yml` and export models;
+  `ToggleBatch`, `LaunchPlan`, `LaunchNotice`) and the `mods.yml` and export
+  models;
 - profile name validation, `profile::layout::validate_name`, which refuses
   names Windows cannot hold on every OS and gives the reason as a `BadName`;
 - pure planners that take what the `io` functions would read as arguments:
   `install::plan_install_from` (a package's file list),
   `install::plan_delisted_from`, `profile::plan_install_batch_from`,
   `profile::plan_set_enabled_batch_from`,
-  `profile::plan_uninstall_batch_from`, and
-  `profile::launch::launch_plan_from` (a target's `LaunchFacts`);
+  `profile::plan_uninstall_batch_from`, `profile::launch::launch_plan_from`,
+  and `profile::launch::prepare_plan_from` (a target's `LaunchFacts`);
 - queries over installed packages: `query::dependants` (every installed
   package that requires a given one, directly or transitively) and
   `query::outdated` (installed packages the index has a newer version of),

@@ -19,6 +19,12 @@ use crate::ecosystem::{Ecosystem, GameProfile, InstanceType, LoaderKind};
 use crate::error::{Error, Result};
 use std::path::{Path, PathBuf};
 
+mod prepare;
+
+pub use prepare::{LaunchNotice, prepare_plan_from};
+#[cfg(feature = "io")]
+pub use prepare::{PreparedLaunch, prepare_launch};
+
 /// The operating system the game will run on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -330,6 +336,12 @@ pub struct LaunchFacts {
   /// (`MelonLoader/Managed`) or 0.6 (`MelonLoader/Il2CppAssemblies`) layout. When
   /// neither does, MelonLoader is asked to regenerate its assembly cache.
   pub melonloader_assemblies: bool,
+  /// The loader kinds whose files from [`LOADER_FILES`] are in the target.
+  /// BepInEx and BepisLoader are found through [`Self::preloader`] instead.
+  pub loaders: Vec<LoaderKind>,
+  /// The package names recorded in the target's `mods.yml`, which name the
+  /// loader pack the engine or r2modman installed.
+  pub recorded: Vec<String>,
 }
 
 impl Default for LaunchFacts {
@@ -340,9 +352,41 @@ impl Default for LaunchFacts {
       has_corlibs: false,
       loader_scripts: Vec::new(),
       melonloader_assemblies: false,
+      loaders: Vec::new(),
+      recorded: Vec::new(),
     }
   }
 }
+
+/// MelonLoader's own assembly in the 0.5 layout and the 0.6 and 0.7 runtimes.
+const MELONLOADER_FILES: [&str; 4] = [
+  "MelonLoader/MelonLoader.dll",
+  "MelonLoader/net35/MelonLoader.dll",
+  "MelonLoader/net472/MelonLoader.dll",
+  "MelonLoader/net6/MelonLoader.dll",
+];
+
+/// Files that show a loader is installed in a target, any one of them enough.
+///
+/// Each path is where r2modman's installer for that loader puts a file from
+/// the loader's Thunderstore pack. Lovely, GodotMl, and ReturnOfModding have no
+/// entry because their paths are unverified, so they are found only through
+/// the loader pack recorded in `mods.yml` ([`LaunchFacts::recorded`]).
+pub const LOADER_FILES: [(LoaderKind, &[&str]); 7] = [
+  (LoaderKind::Umm, &["UMM/Core/UnityModManager.dll"]),
+  (LoaderKind::MelonLoader, &MELONLOADER_FILES),
+  (LoaderKind::RecursiveMelonLoader, &MELONLOADER_FILES),
+  (
+    LoaderKind::GdWeave,
+    &["GDWeave/core/GDWeave.dll", "winmm.dll"],
+  ),
+  (
+    LoaderKind::Northstar,
+    &["R2Northstar/Northstar.dll", "NorthstarLauncher.exe"],
+  ),
+  (LoaderKind::Rivet, &["Rivet/Loader.dll"]),
+  (LoaderKind::Shimloader, &["dwmapi.dll", "ue4ss.dll"]),
+];
 
 #[cfg(feature = "io")]
 impl LaunchFacts {
@@ -360,6 +404,14 @@ impl LaunchFacts {
       || target_dir
         .join("MelonLoader/Il2CppAssemblies/Assembly-CSharp.dll")
         .is_file();
+    let loaders = LOADER_FILES
+      .iter()
+      .filter(|(_, files)| files.iter().any(|file| target_dir.join(file).is_file()))
+      .map(|(loader, _)| *loader)
+      .collect();
+    let recorded = crate::profile::modlist::read(target_dir)
+      .map(|mods| mods.into_iter().map(|entry| entry.name).collect())
+      .unwrap_or_default();
 
     Self {
       doorstop_version: doorstop_version(target_dir),
@@ -367,6 +419,8 @@ impl LaunchFacts {
       has_corlibs: has_corlibs(target_dir),
       loader_scripts,
       melonloader_assemblies,
+      loaders,
+      recorded,
     }
   }
 }
@@ -1370,6 +1424,29 @@ pub fn stage_for_launch_in(
   game_dir: &Path,
   ctx: &LaunchContext,
 ) -> Result<Vec<PathBuf>> {
+  let staged = stage_files_in(target_dir, eco, game, game_dir, ctx)?;
+  let mut written = staged.created;
+
+  written.extend(staged.replaced);
+  written.sort();
+
+  Ok(written)
+}
+
+/// [`stage_for_launch_in`], keeping files it created apart from files it
+/// overwrote.
+///
+/// Files are staged in name order. When one fails, the files this call created
+/// are removed before the error is returned, so a failed staging leaves no
+/// new file behind; a file it had already overwritten keeps the new copy.
+#[cfg(feature = "io")]
+pub(crate) fn stage_files_in(
+  target_dir: &Path,
+  eco: &Ecosystem,
+  game: &str,
+  game_dir: &Path,
+  ctx: &LaunchContext,
+) -> Result<StagedFiles> {
   if ctx.os == HostOs::MacOs {
     return Err(Error::Profile(MACOS_UNSUPPORTED.to_string()));
   }
@@ -1377,10 +1454,10 @@ pub fn stage_for_launch_in(
   let profile = eco.require_profile(game)?;
 
   if script_injection_applies(profile, ctx) {
-    return Ok(Vec::new());
+    return Ok(StagedFiles::default());
   }
 
-  let mut written = Vec::new();
+  let mut copies = Vec::new();
 
   for entry in std::fs::read_dir(target_dir)
     .map_err(|e| Error::Profile(format!("reading {}: {}", target_dir.display(), e)))?
@@ -1408,16 +1485,32 @@ pub fn stage_for_launch_in(
       None => continue,
     };
 
-    let staged = stage_one_file(&entry.path(), &dest)?;
+    copies.push((entry.path(), dest));
+  }
 
-    if staged {
-      written.push(dest);
+  copies.sort();
+
+  let mut staged = StagedFiles::default();
+
+  for (source, dest) in copies {
+    match stage_one_file(&source, &dest) {
+      Ok(StagedFile::InPlace) => {}
+      Ok(StagedFile::Created) => staged.created.push(dest),
+      Ok(StagedFile::Replaced) => staged.replaced.push(dest),
+      Err(error) => {
+        for created in &staged.created {
+          let _ = std::fs::remove_file(created);
+        }
+
+        return Err(error);
+      }
     }
   }
 
-  written.sort();
+  staged.created.sort();
+  staged.replaced.sort();
 
-  Ok(written)
+  Ok(staged)
 }
 
 /// Stages an r2modman-layout profile's loader files into `game_dir`.
@@ -1443,23 +1536,24 @@ pub fn stage_for_launch(
 /// Copies one staged file, creating parent directories and refusing to write
 /// through a pre-existing symlink at the destination.
 ///
-/// Returns whether a copy actually happened: `false` means `source` and `dest`
-/// were already [`same_file`], so nothing was written. [`stage_for_launch_in`]
-/// uses that to decide whether `dest` belongs in its returned `Vec<PathBuf>` —
-/// see that function's doc comment for why an already-in-place file must not be
-/// reported as written.
+/// Returns what happened to `dest`: [`StagedFile::InPlace`] means `source` and
+/// `dest` were already [`same_file`], so nothing was written.
+/// [`stage_for_launch_in`] uses that to decide whether `dest` belongs in its
+/// returned `Vec<PathBuf>`; see that function's doc comment for why an
+/// already-in-place file must not be reported as written.
 ///
 /// The symlink refusal is checked first and unconditionally, before the
 /// same-file check: a destination symlink that happens to point at `source`
 /// must still be refused rather than treated as "already in place", so a
 /// pre-planted link can never be silently followed.
 #[cfg(feature = "io")]
-fn stage_one_file(source: &Path, dest: &Path) -> Result<bool> {
-  let dest_is_symlink = std::fs::symlink_metadata(dest)
-    .map(|metadata| metadata.file_type().is_symlink())
-    .unwrap_or(false);
+fn stage_one_file(source: &Path, dest: &Path) -> Result<StagedFile> {
+  let existing = std::fs::symlink_metadata(dest).ok();
 
-  if dest_is_symlink {
+  if existing
+    .as_ref()
+    .is_some_and(|metadata| metadata.file_type().is_symlink())
+  {
     return Err(Error::Profile(format!(
       "refusing to stage through a symlink at {}",
       dest.display()
@@ -1467,7 +1561,7 @@ fn stage_one_file(source: &Path, dest: &Path) -> Result<bool> {
   }
 
   if crate::util::same_file(source, dest) {
-    return Ok(false);
+    return Ok(StagedFile::InPlace);
   }
 
   if let Some(parent) = dest.parent() {
@@ -1478,7 +1572,32 @@ fn stage_one_file(source: &Path, dest: &Path) -> Result<bool> {
   std::fs::copy(source, dest)
     .map_err(|e| Error::Profile(format!("staging {}: {}", dest.display(), e)))?;
 
-  Ok(true)
+  match existing {
+    Some(_) => Ok(StagedFile::Replaced),
+    None => Ok(StagedFile::Created),
+  }
+}
+
+/// What staging did to one destination.
+#[cfg(feature = "io")]
+enum StagedFile {
+  /// The destination is the source itself, so nothing was written.
+  InPlace,
+  /// The destination did not exist and now holds a copy.
+  Created,
+  /// The destination already held a file, now overwritten with a copy.
+  Replaced,
+}
+
+/// The game-folder files one staging wrote, split by whether they existed
+/// before it.
+#[cfg(feature = "io")]
+#[derive(Debug, Default)]
+pub(crate) struct StagedFiles {
+  /// Files this staging created.
+  pub(crate) created: Vec<PathBuf>,
+  /// Files that were already there and were overwritten.
+  pub(crate) replaced: Vec<PathBuf>,
 }
 
 /// The string a user pastes into Steam's launch options for a Linux native launch.
@@ -1610,6 +1729,28 @@ impl LaunchPlan {
 #[cfg(all(test, feature = "io"))]
 mod tests {
   use super::*;
+
+  /// Asserts `options` is `script` quoted, then `%command%`. On Unix that is
+  /// `script` exactly; on Windows it holds no `\` and names the same file.
+  pub(super) fn assert_options_name_script(options: &str, script: &Path) {
+    let quoted = options
+      .strip_suffix(" %command%")
+      .and_then(|rest| rest.strip_prefix('"'))
+      .and_then(|rest| rest.strip_suffix('"'))
+      .unwrap_or_else(|| panic!("not a quoted path then %command%: {options}"));
+
+    #[cfg(unix)]
+    assert_eq!(quoted, script.to_str().unwrap());
+
+    #[cfg(not(unix))]
+    {
+      assert!(!quoted.contains('\\'), "{quoted}");
+      assert_eq!(
+        std::fs::canonicalize(quoted).unwrap(),
+        std::fs::canonicalize(script).unwrap()
+      );
+    }
+  }
 
   #[test]
   fn doorstop_version_reads_major_and_defaults_to_three() {
@@ -2266,6 +2407,20 @@ mod tests {
     assert!(ensure_loader_scripts_executable(root).unwrap().is_empty());
   }
 
+  /// Off Unix there is no execute bit, so a loader script is left alone and no
+  /// change is reported for a launch to surface.
+  #[test]
+  #[cfg(not(unix))]
+  fn ensure_loader_scripts_executable_changes_nothing_off_unix() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    std::fs::write(root.join("start_game_bepinex.sh"), b"#!/bin/sh\n").unwrap();
+    std::fs::write(root.join("run_bepinex.sh"), b"#!/bin/sh\n").unwrap();
+
+    assert!(ensure_loader_scripts_executable(root).unwrap().is_empty());
+  }
+
   /// Read access is mirrored rather than forced to `0o755`, so a target whose
   /// scripts are deliberately owner-only does not become world-readable just to
   /// be launchable.
@@ -2614,6 +2769,12 @@ mod tests {
     assert_eq!(
       steam_launch_options(Path::new("/data/My Games/wrapper.sh")),
       r#""/data/My Games/wrapper.sh" %command%"#
+    );
+
+    // A Windows path is written with `/` separators.
+    assert_eq!(
+      steam_launch_options(Path::new(r"C:\Users\me\launch_wrapper.sh")),
+      r#""C:/Users/me/launch_wrapper.sh" %command%"#
     );
   }
 
@@ -3223,7 +3384,7 @@ mod tests {
 
     let options = steam_launch_options(&script_path);
 
-    assert!(options.contains(&script_path.display().to_string()));
+    assert_options_name_script(&options, &script_path);
     assert!(!options.contains("WINEDLLOVERRIDES"));
     assert!(
       std::fs::read_to_string(&script_path)
@@ -3867,5 +4028,42 @@ mod planning_tests {
       LaunchFacts::read(&root.join("missing")),
       LaunchFacts::default()
     );
+  }
+
+  #[test]
+  #[cfg(feature = "io")]
+  fn launch_facts_read_the_loader_files_and_recorded_packages() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let version: crate::models::Version = serde_json::from_str(
+      r#"{"name":"GDWeave","full_name":"NotNet-GDWeave","description":"d","icon":"i",
+      "version_number":"2.0.0","dependencies":[],"download_url":"u","downloads":1,
+      "date_created":"2024-01-01T12:00:00Z","website_url":"w","is_active":true,
+      "uuid4":"u","file_size":1}"#,
+    )
+    .unwrap();
+
+    std::fs::create_dir_all(root.join("GDWeave/core")).unwrap();
+    std::fs::write(root.join("GDWeave/core/GDWeave.dll"), b"").unwrap();
+    std::fs::create_dir_all(root.join("R2Northstar")).unwrap();
+    std::fs::write(root.join("R2Northstar/Northstar.dll"), b"").unwrap();
+    crate::profile::modlist::write(
+      root,
+      &[crate::profile::mod_entry_from_version(
+        "NotNet-GDWeave",
+        "NotNet",
+        &version,
+        1,
+      )],
+    )
+    .unwrap();
+
+    let facts = LaunchFacts::read(root);
+
+    assert_eq!(
+      facts.loaders,
+      vec![LoaderKind::GdWeave, LoaderKind::Northstar]
+    );
+    assert_eq!(facts.recorded, vec!["NotNet-GDWeave".to_string()]);
   }
 }
