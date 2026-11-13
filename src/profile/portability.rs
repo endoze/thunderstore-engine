@@ -732,11 +732,10 @@ pub async fn import_r2z_in(
   // Importing again once the cause is fixed skips the mods already installed
   // and completes it. A missing exported version is never fixed by a retry
   // alone, so the message does not promise one will.
-  if let Some((name, error)) = outcome.failed.into_iter().next() {
-    return Err(Error::Profile(format!(
-      "importing {name}: {error}; the import is unfinished (its config files were \
-       not restored)"
-    )));
+  if !outcome.failed.is_empty() {
+    return Err(Error::ImportUnfinished {
+      failures: outcome.failed,
+    });
   }
 
   // Configs are extracted after every install, so an exported per-mod config
@@ -1102,10 +1101,7 @@ pub async fn adopt_names_in(
     });
   }
 
-  let game_profile = eco
-    .game(game)
-    .and_then(|g| g.profile())
-    .ok_or_else(|| Error::Profile(format!("no ecosystem profile for game {game:?}")))?;
+  let game_profile = eco.require_profile(game)?;
   let keep: std::collections::BTreeSet<String> =
     recorded.iter().map(|entry| entry.name.clone()).collect();
   let swept = crate::install::remove_delisted(game_profile, target_dir, &keep)?;

@@ -290,7 +290,7 @@ pub fn clear_selection(base: &Path, game: &str) -> Result<()> {
 /// appears, rather than printing a generic fallback for a case nobody worded.
 /// [`Error`] being `#[non_exhaustive]` does not weaken that: the wildcard arm a
 /// client needs there is for other kinds of failure, not for other refusals.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BadProfile {
   /// The name is not a safe single path component, so it could escape the
   /// profiles directory. See [`validate_name`].

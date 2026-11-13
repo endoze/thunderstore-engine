@@ -265,9 +265,9 @@ impl ThunderstoreClient {
   ///
   /// # Errors
   ///
-  /// Returns a single [`Error::Download`] carrying how many of how many files
-  /// failed plus the first failure's message. **This is all-or-nothing only in
-  /// its reporting, not its effects**: files that succeeded are still on disk, so
+  /// Returns a single [`Error::Download`] naming each file that failed, with
+  /// its reason, and how many files were attempted. **This is all-or-nothing
+  /// only in its reporting, not its effects**: files that succeeded are still on disk, so
   /// a caller that retries should expect those to be skipped as already present.
   /// The underlying per-file causes are [`Error::Http`],
   /// [`Error::SizeLimitExceeded`] (archive over
@@ -1084,33 +1084,26 @@ fn check_complete(content_length: Option<u64>, written: u64) -> Result<()> {
 }
 
 /// Collapses the per-file download results into a single outcome: `Ok(())` if
-/// every file succeeded, otherwise an [`Error::Download`] reporting how many of
-/// `total` failed and the first failure's message. Pure over the result vector.
-fn aggregate_download_results(results: Vec<Result<()>>, total: usize) -> Result<()> {
-  let mut failures = 0;
-  let mut first_error: Option<String> = None;
+/// every file succeeded, otherwise an [`Error::Download`] naming each file that
+/// failed and why. Pure over the result vector.
+fn aggregate_download_results(results: Vec<(String, Result<()>)>) -> Result<()> {
+  let total = results.len();
+  let mut failures: Vec<(String, Error)> = results
+    .into_iter()
+    .filter_map(|(name, result)| result.err().map(|err| (name, err)))
+    .collect();
 
-  for result in results {
-    if let Err(err) = result {
-      failures += 1;
-
-      tracing::error!("Download error: {:?}", err);
-
-      if first_error.is_none() {
-        first_error = Some(err.to_string());
-      }
-    }
+  if failures.is_empty() {
+    return Ok(());
   }
 
-  if failures > 0 {
-    return Err(Error::Download {
-      failed: failures,
-      total,
-      first: first_error.unwrap_or_default(),
-    });
+  for (name, err) in &failures {
+    tracing::error!("Download error for {name}: {err:?}");
   }
 
-  Ok(())
+  failures.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+  Err(Error::Download { total, failures })
 }
 
 /// Downloads multiple files concurrently with progress indicators.
@@ -1131,17 +1124,16 @@ async fn download_files(
 
   tracing::debug!("Processing {} mods", urls.len());
 
-  let total = urls.len();
   let concurrency = concurrency.max(1);
 
-  let results: Vec<Result<()>> =
+  let results: Vec<(String, Result<()>)> =
     futures::stream::iter(urls.into_iter().map(|(archive_filename, url)| {
       let client = http.clone();
       let cache_dir = cache_dir.to_path_buf();
       let progress = progress.clone();
 
       async move {
-        download_file(
+        let result = download_file(
           &client,
           &url,
           &archive_filename,
@@ -1150,14 +1142,16 @@ async fn download_files(
           &retry,
           progress.as_ref(),
         )
-        .await
+        .await;
+
+        (archive_filename, result)
       }
     }))
     .buffer_unordered(concurrency)
     .collect()
     .await;
 
-  aggregate_download_results(results, total)
+  aggregate_download_results(results)
 }
 
 /// Validates a download filename, rejecting absolute paths and any path
@@ -1431,32 +1425,47 @@ mod tests {
 
   #[test]
   fn aggregate_download_results_all_ok_is_ok() {
-    assert!(aggregate_download_results(vec![Ok(()), Ok(())], 2).is_ok());
-    assert!(aggregate_download_results(vec![], 0).is_ok());
+    let ok = vec![
+      ("A-1.0.0.zip".to_string(), Ok(())),
+      ("B-1.0.0.zip".to_string(), Ok(())),
+    ];
+
+    assert!(aggregate_download_results(ok).is_ok());
+    assert!(aggregate_download_results(vec![]).is_ok());
   }
 
   #[test]
-  fn aggregate_download_results_reports_count_and_first_error() {
+  fn aggregate_download_results_names_every_failed_file() {
     let results = vec![
-      Ok(()),
-      Err(Error::UnsafeName("bad".to_string())),
-      Err(Error::IncompleteDownload {
-        expected: 5,
-        actual: 2,
-      }),
+      (
+        "C-1.0.0.zip".to_string(),
+        Err(Error::IncompleteDownload {
+          expected: 5,
+          actual: 2,
+        }),
+      ),
+      ("A-1.0.0.zip".to_string(), Ok(())),
+      (
+        "B-1.0.0.zip".to_string(),
+        Err(Error::UnsafeName("bad".to_string())),
+      ),
     ];
 
-    let err = aggregate_download_results(results, 3).unwrap_err();
+    let err = aggregate_download_results(results).unwrap_err();
+
+    assert_eq!(
+      err.to_string(),
+      "2 of 3 downloads failed: B-1.0.0.zip: unsafe name: bad; \
+       C-1.0.0.zip: incomplete download: expected 5 bytes, received 2"
+    );
 
     match err {
-      Error::Download {
-        failed,
-        total,
-        first,
-      } => {
-        assert_eq!(failed, 2);
+      Error::Download { total, failures } => {
+        let failed: Vec<&str> = failures.iter().map(|(name, _)| name.as_str()).collect();
+
         assert_eq!(total, 3);
-        assert!(first.contains("unsafe name"), "first was: {first}");
+        assert_eq!(failed, ["B-1.0.0.zip", "C-1.0.0.zip"]);
+        assert!(matches!(failures[0].1, Error::UnsafeName(_)));
       }
       other => panic!("unexpected error: {other}"),
     }

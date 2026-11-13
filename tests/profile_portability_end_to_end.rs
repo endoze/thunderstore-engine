@@ -4,6 +4,7 @@ use std::io::{Cursor, Write};
 
 use mockito::Server;
 use tempfile::tempdir;
+use thunderstore_engine::Error;
 use thunderstore_engine::client::ThunderstoreClient;
 use thunderstore_engine::ecosystem::Ecosystem;
 use thunderstore_engine::profile;
@@ -179,6 +180,84 @@ fn a_failed_import_tells_the_user_it_is_unfinished() {
 
   assert!(error.contains("Author-CoolMod"), "{error}");
   assert!(error.contains("the import is unfinished"), "{error}");
+}
+
+/// A client showing why an import stopped needs every mod that failed, not
+/// only the first.
+#[test]
+fn a_failed_import_names_every_mod_that_failed() {
+  let mut server = Server::new();
+
+  let _idx = server
+    .mock("GET", "/pkg/")
+    .with_status(200)
+    .with_header("Content-Type", "application/json")
+    .with_header("Last-Modified", "Wed, 21 Feb 2024 15:30:45 GMT")
+    .with_body(index_json(&server.url()))
+    .create();
+
+  let cache = tempdir().unwrap();
+  let base = tempdir().unwrap();
+
+  let client = ThunderstoreClient::builder()
+    .package_index_url(format!("{}/pkg/", server.url()))
+    .base_url(server.url())
+    .cache_dir(cache.path())
+    .build()
+    .unwrap();
+
+  let rt = Runtime::new().unwrap();
+  let eco = Ecosystem::bundled();
+  let index = rt.block_on(client.get_manifest()).unwrap();
+  let version = index
+    .get_package_by_full_name("Author-CoolMod")
+    .unwrap()
+    .latest_version()
+    .unwrap()
+    .clone();
+  let entries = [
+    profile::mod_entry_from_version("Author-CoolMod", "Author", &version, 1),
+    profile::mod_entry_from_version("Other-Mod", "Other", &version, 1),
+  ];
+  let export = profile::portability::export_format_from_mods("Gone", &entries);
+  let yaml = profile::portability::export_r2x_to_string(&export).unwrap();
+
+  // An index without either exported mod makes both installs fail.
+  let empty = thunderstore_engine::models::PackageIndex::from(Vec::new());
+  let error = rt
+    .block_on(profile::portability::import_r2z_in(
+      &base.path().join("target"),
+      base.path(),
+      &eco,
+      &empty,
+      &client,
+      "valheim",
+      yaml.as_bytes(),
+      2,
+    ))
+    .unwrap_err();
+
+  let Error::ImportUnfinished { failures } = &error else {
+    panic!("unexpected error: {error}");
+  };
+  let failed: Vec<&str> = failures.iter().map(|(name, _)| name.as_str()).collect();
+
+  assert_eq!(failed, ["Author-CoolMod-1.0.0", "Other-Mod-1.0.0"]);
+  assert!(
+    failures
+      .iter()
+      .all(|(_, reason)| matches!(reason, Error::UnresolvedDependency { .. })),
+    "{error}"
+  );
+
+  let message = error.to_string();
+
+  assert!(
+    message.contains("importing Author-CoolMod-1.0.0: "),
+    "{message}"
+  );
+  assert!(message.contains("importing Other-Mod-1.0.0: "), "{message}");
+  assert!(message.ends_with("the import is unfinished (its config files were not restored)"));
 }
 
 /// `import_in` has to route one source string to the same place a caller

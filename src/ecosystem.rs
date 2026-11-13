@@ -179,6 +179,35 @@ impl Ecosystem {
     self.games.get(slug)
   }
 
+  /// Returns the primary profile for a game (see [`GameDef::profile`]), the
+  /// lookup every install, uninstall, and launch operation starts from.
+  ///
+  /// # Errors
+  ///
+  /// [`Error::UnknownGame`] if no game has the slug `game`, and
+  /// [`Error::NoGameProfile`] if the game is known but has no profile.
+  ///
+  /// # Examples
+  ///
+  /// ```
+  /// use thunderstore_engine::Error;
+  /// use thunderstore_engine::ecosystem::Ecosystem;
+  ///
+  /// let eco = Ecosystem::bundled();
+  ///
+  /// assert!(eco.require_profile("valheim").is_ok());
+  /// assert!(matches!(eco.require_profile("not-a-game"), Err(Error::UnknownGame { .. })));
+  /// ```
+  pub fn require_profile(&self, game: &str) -> Result<&GameProfile> {
+    let def = self.game(game).ok_or_else(|| Error::UnknownGame {
+      game: game.to_string(),
+    })?;
+
+    def.profile().ok_or_else(|| Error::NoGameProfile {
+      game: game.to_string(),
+    })
+  }
+
   /// Iterates over all known games.
   pub fn games(&self) -> impl Iterator<Item = &GameDef> {
     self.games.values()
@@ -618,6 +647,27 @@ mod tests {
     let profile = eco.game("x").unwrap().profile().unwrap();
 
     assert_eq!(profile.package_loader, LoaderKind::Other);
+  }
+
+  #[test]
+  fn require_profile_tells_an_unknown_game_from_one_without_a_profile() {
+    let json = r#"{
+      "games": {
+        "bare": { "label": "bare", "r2modman": [] },
+        "x": { "label": "x", "r2modman": [ { "packageLoader": "bepinex", "installRules": [] } ] }
+      }
+    }"#;
+    let eco = Ecosystem::from_json(json).unwrap();
+
+    assert!(eco.require_profile("x").is_ok());
+    assert!(matches!(
+      eco.require_profile("ghost"),
+      Err(Error::UnknownGame { game }) if game == "ghost"
+    ));
+    assert!(matches!(
+      eco.require_profile("bare"),
+      Err(Error::NoGameProfile { game }) if game == "bare"
+    ));
   }
 
   #[test]

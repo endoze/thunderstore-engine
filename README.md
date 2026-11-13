@@ -79,7 +79,9 @@ extraction, and every profile operation that reads or writes a target. With
 `io` off, the crate builds without an HTTP client, an async runtime, or an
 archive library, and keeps what does no IO:
 
-- the package, version, and ecosystem models, and the dependency resolver;
+- the package, version, and ecosystem models (including
+  `Ecosystem::require_profile`), and the dependency resolver;
+- the `Error` type, which is `Clone` so a client can keep one in its state;
 - the plan types (`InstallPlan`, `InstallBatch`, `UninstallBatch`,
   `ToggleBatch`, `LaunchPlan`) and the `mods.yml` and export models;
 - pure planners that take what the `io` functions would read as arguments:

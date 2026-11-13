@@ -307,10 +307,7 @@ pub fn install_extracted_in(
   archive: Option<&Path>,
   installed_at_time: u64,
 ) -> Result<()> {
-  let game_profile = eco
-    .game(game)
-    .and_then(|g| g.profile())
-    .ok_or_else(|| Error::Profile(format!("no ecosystem profile for game {game:?}")))?;
+  let game_profile = eco.require_profile(game)?;
 
   let plan = plan_install(eco, game_profile, full_name, extracted_dir, archive)?;
 
@@ -562,10 +559,7 @@ pub fn uninstall_mod_in(
   game: &str,
   full_name: &str,
 ) -> Result<()> {
-  let game_profile = eco
-    .game(game)
-    .and_then(|g| g.profile())
-    .ok_or_else(|| Error::Profile(format!("no ecosystem profile for game {game:?}")))?;
+  let game_profile = eco.require_profile(game)?;
 
   // Before any mutation. `remove_state_payload` below reaches an unreadable
   // record on its own, but only after `remove_delisted` has already deleted this
@@ -617,17 +611,16 @@ pub fn set_enabled_in(
   full_name: &str,
   enabled: bool,
 ) -> Result<()> {
-  let game_profile = eco
-    .game(game)
-    .and_then(|g| g.profile())
-    .ok_or_else(|| Error::Profile(format!("no ecosystem profile for game {game:?}")))?;
+  let game_profile = eco.require_profile(game)?;
 
   let mut mods = modlist::read(target_dir)?;
 
   let entry = mods
     .iter_mut()
     .find(|m| m.name == full_name)
-    .ok_or_else(|| Error::Profile(format!("{full_name} is not installed")))?;
+    .ok_or_else(|| Error::NotInstalled {
+      package: full_name.to_string(),
+    })?;
 
   if eco.modloader_package(full_name).is_some() {
     return Ok(());
@@ -750,16 +743,17 @@ async fn install_one(
     && unresolved == full_name
     && let Some((name, version)) = crate::util::split_version(full_name)
   {
-    return Err(Error::Profile(format!(
-      "cannot install {full_name}: {name} has no version {version}"
-    )));
+    return Err(Error::MissingVersion {
+      package: name.to_string(),
+      version: version.to_string(),
+    });
   }
 
   if !resolution.unresolved.is_empty() {
-    return Err(Error::Profile(format!(
-      "cannot install {full_name}: could not resolve {}",
-      resolution.unresolved.join(", ")
-    )));
+    return Err(Error::UnresolvedDependency {
+      package: full_name.to_string(),
+      unresolved: resolution.unresolved,
+    });
   }
 
   let recorded = modlist::read(target_dir)?;
@@ -974,13 +968,14 @@ pub async fn install_batch(
 /// - [`Error::Http`] or
 ///   [`Error::Download`] if fetching the package or a
 ///   dependency fails.
-/// - [`Error::Install`] if the ecosystem has no install
-///   rules for `game`, or a package's files cannot be routed.
+/// - [`Error::UnknownGame`] or [`Error::NoGameProfile`] if `eco` has no
+///   profile for `game`.
+/// - [`Error::UnresolvedDependency`] if the package or a dependency is absent
+///   from `index`, and [`Error::MissingVersion`] if `full_name` names a version
+///   the index does not have. Nothing is installed in either case.
+/// - [`Error::Install`] if a package's files cannot be routed.
 /// - [`Error::Io`] if `target_dir` or `cache_base` cannot be
 ///   written.
-///
-/// A package that is absent from `index` is skipped rather than reported here;
-/// see [`crate::models::DependencyGraph::resolve_report`] to detect that.
 ///
 /// # Examples
 ///
@@ -1166,10 +1161,7 @@ pub fn plan_uninstall_batch(
   game: &str,
   names: Option<&[String]>,
 ) -> Result<UninstallBatch> {
-  let game_profile = eco
-    .game(game)
-    .and_then(|g| g.profile())
-    .ok_or_else(|| Error::Profile(format!("no ecosystem profile for game {game:?}")))?;
+  let game_profile = eco.require_profile(game)?;
 
   let recorded = modlist::read(target_dir)?;
 
@@ -1202,8 +1194,9 @@ pub fn plan_uninstall_batch(
 ///
 /// # Errors
 ///
-/// [`Error::Profile`] if `game` has no ecosystem profile, if a name in `names`
-/// is not recorded, or if a subject cannot be removed exactly.
+/// [`Error::UnknownGame`] or [`Error::NoGameProfile`] if `eco` has no profile
+/// for `game`, [`Error::NotInstalled`] if a name in `names` is not recorded,
+/// and [`Error::Profile`] if a subject cannot be removed exactly.
 pub fn plan_uninstall_batch_from(
   target_dir: &Path,
   eco: &Ecosystem,
@@ -1213,16 +1206,15 @@ pub fn plan_uninstall_batch_from(
   mut record_state: impl FnMut(&str) -> RecordState,
   untracked: Vec<PathBuf>,
 ) -> Result<UninstallBatch> {
-  eco
-    .game(game)
-    .and_then(|g| g.profile())
-    .ok_or_else(|| Error::Profile(format!("no ecosystem profile for game {game:?}")))?;
+  eco.require_profile(game)?;
 
   let subjects: Vec<String> = match names {
     Some(names) => {
       for name in names {
         if modlist::find(recorded, name).is_none() {
-          return Err(Error::Profile(format!("{name} is not installed")));
+          return Err(Error::NotInstalled {
+            package: name.clone(),
+          });
         }
       }
 
@@ -1335,7 +1327,7 @@ pub fn plan_set_enabled_batch(
 ///
 /// # Errors
 ///
-/// [`Error::Profile`] if a name in `names` is not recorded.
+/// [`Error::NotInstalled`] if a name in `names` is not recorded.
 pub fn plan_set_enabled_batch_from(
   recorded: &[ProfileMod],
   eco: &Ecosystem,
@@ -1345,7 +1337,9 @@ pub fn plan_set_enabled_batch_from(
   if let Some(names) = names {
     for name in names {
       if modlist::find(recorded, name).is_none() {
-        return Err(Error::Profile(format!("{name} is not installed")));
+        return Err(Error::NotInstalled {
+          package: name.clone(),
+        });
       }
     }
   }
@@ -1779,9 +1773,20 @@ mod tests {
       1,
     ));
 
-    let err = result.unwrap_err().to_string();
+    let err = result.unwrap_err();
 
-    assert!(err.contains("Missing-Dep"), "unexpected error: {err}");
+    assert!(
+      matches!(
+        &err,
+        Error::UnresolvedDependency { package, unresolved }
+          if package == "Author-Mod" && unresolved == &["Missing-Dep".to_string()]
+      ),
+      "unexpected error: {err}"
+    );
+    assert_eq!(
+      err.to_string(),
+      "Profile error: cannot install Author-Mod: could not resolve Missing-Dep"
+    );
   }
 
   #[test]
@@ -3232,12 +3237,17 @@ mod tests {
       assert_eq!(outcome.failed.len(), 1);
       assert_eq!(outcome.failed[0].0, "Author-Mod-9.9.9");
       assert!(
-        outcome.failed[0]
-          .1
-          .to_string()
-          .contains("Author-Mod has no version 9.9.9"),
+        matches!(
+          &outcome.failed[0].1,
+          Error::MissingVersion { package, version }
+            if package == "Author-Mod" && version == "9.9.9"
+        ),
         "{}",
         outcome.failed[0].1
+      );
+      assert_eq!(
+        outcome.failed[0].1.to_string(),
+        "Profile error: cannot install Author-Mod-9.9.9: Author-Mod has no version 9.9.9"
       );
       assert!(
         modlist::read(repo.target.path())
@@ -3343,7 +3353,13 @@ mod planning_tests {
 
     let result = plan_set_enabled_batch_from(&record, &eco, Some(&names(&["Owner-Missing"])), true);
 
-    assert!(matches!(result, Err(Error::Profile(message)) if message.contains("Owner-Missing")));
+    let error = result.unwrap_err();
+
+    assert!(matches!(&error, Error::NotInstalled { package } if package == "Owner-Missing"));
+    assert_eq!(
+      error.to_string(),
+      "Profile error: Owner-Missing is not installed"
+    );
   }
 
   #[test]
@@ -3446,10 +3462,8 @@ mod planning_tests {
     );
 
     assert!(
-      matches!(unrecorded, Err(Error::Profile(message)) if message.contains("not installed"))
+      matches!(unrecorded, Err(Error::NotInstalled { package }) if package == "Owner-Missing")
     );
-    assert!(
-      matches!(unknown_game, Err(Error::Profile(message)) if message.contains("no ecosystem profile"))
-    );
+    assert!(matches!(unknown_game, Err(Error::UnknownGame { game }) if game == "no-such-game"));
   }
 }

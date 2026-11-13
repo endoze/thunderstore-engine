@@ -78,7 +78,7 @@ impl SizeCap {
 /// or directory") into one that names what failed and where.
 #[cfg(feature = "io")]
 pub(crate) fn io_context(context: impl std::fmt::Display, err: std::io::Error) -> Error {
-  Error::Io(std::io::Error::new(err.kind(), format!("{context}: {err}")))
+  Error::from(std::io::Error::new(err.kind(), format!("{context}: {err}")))
 }
 
 /// The `Owner-Name` prefix (the first two hyphen-separated segments) of a

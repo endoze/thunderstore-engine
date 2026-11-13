@@ -853,8 +853,9 @@ fn is_script_injected(
 ///
 /// # Errors
 ///
-/// - [`Error::Profile`] if `ctx.os` is
-///   [`HostOs::MacOs`], if `game` is unknown to `eco`, or if a
+/// - [`Error::UnknownGame`] or [`Error::NoGameProfile`] if `eco` has no
+///   profile for `game`.
+/// - [`Error::Profile`] if `ctx.os` is [`HostOs::MacOs`], or if a
 ///   [`LaunchMode::Modded`] plan needs a loader script that `target_dir` does
 ///   not contain.
 ///
@@ -943,10 +944,7 @@ pub fn launch_plan_from(
     return Err(Error::Profile(MACOS_UNSUPPORTED.to_string()));
   }
 
-  let profile = eco
-    .game(game)
-    .and_then(|g| g.profile())
-    .ok_or_else(|| Error::Profile(format!("no ecosystem profile for game {game:?}")))?;
+  let profile = eco.require_profile(game)?;
 
   // Computed before the argv so the loader-script decision is available for
   // `loader_args_from` to fold into its Doorstop flag spellings (see
@@ -1376,10 +1374,7 @@ pub fn stage_for_launch_in(
     return Err(Error::Profile(MACOS_UNSUPPORTED.to_string()));
   }
 
-  let profile = eco
-    .game(game)
-    .and_then(|g| g.profile())
-    .ok_or_else(|| Error::Profile(format!("no ecosystem profile for game {game:?}")))?;
+  let profile = eco.require_profile(game)?;
 
   if script_injection_applies(profile, ctx) {
     return Ok(Vec::new());
@@ -2158,7 +2153,7 @@ mod tests {
 
     let err = launch_plan_in(dir.path(), &eco, "not-a-game", &ctx(LaunchMode::Modded)).unwrap_err();
 
-    assert!(err.to_string().contains("no ecosystem profile"));
+    assert!(matches!(err, Error::UnknownGame { game } if game == "not-a-game"));
   }
 
   #[test]
