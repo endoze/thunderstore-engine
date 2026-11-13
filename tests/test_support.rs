@@ -1,6 +1,9 @@
 //! The published mock Thunderstore, used the way a client crate would use it.
 
 use tempfile::tempdir;
+use thunderstore_engine::Error;
+use thunderstore_engine::RetryPolicy;
+use thunderstore_engine::client::ThunderstoreClient;
 use thunderstore_engine::extract::extract_zip;
 use thunderstore_engine::models::DependencyGraph;
 use thunderstore_engine::test_support::MockThunderstore;
@@ -67,4 +70,54 @@ async fn the_mock_starts_inside_an_async_test() {
   let index = client.get_manifest().await.unwrap();
 
   assert_eq!(index.len(), 5);
+}
+
+#[tokio::test]
+async fn a_client_gets_a_version_readme_from_the_mock() {
+  let mock = MockThunderstore::start_async().await;
+  let cache = tempdir().unwrap();
+  let client = mock
+    .client_builder()
+    .cache_dir(cache.path())
+    .build()
+    .unwrap();
+
+  let readme = client.get_readme("Owner", "ModD", "2.0.0").await.unwrap();
+
+  assert_eq!(readme.as_deref(), Some("# ModD 2.0.0\n\nA mod."));
+}
+
+#[tokio::test]
+async fn a_package_without_a_readme_is_none_not_an_error() {
+  let mock = MockThunderstore::start_async().await;
+  let cache = tempdir().unwrap();
+  let client = mock
+    .client_builder()
+    .cache_dir(cache.path())
+    .build()
+    .unwrap();
+
+  let readme = client.get_readme("Owner", "ModB", "1.0.0").await.unwrap();
+
+  assert_eq!(readme, None);
+}
+
+#[tokio::test]
+async fn a_readme_request_that_cannot_reach_the_host_is_an_http_error() {
+  let cache = tempdir().unwrap();
+  // Nothing listens on loopback port 1, so the connection is refused.
+  let client = ThunderstoreClient::builder()
+    .base_url("http://127.0.0.1:1")
+    .community("valheim")
+    .cache_dir(cache.path())
+    .retry(RetryPolicy::none())
+    .build()
+    .unwrap();
+
+  let result = client.get_readme("Owner", "ModA", "1.0.0").await;
+
+  assert!(
+    matches!(&result, Err(Error::Http(error)) if error.is_connect()),
+    "{result:?}"
+  );
 }

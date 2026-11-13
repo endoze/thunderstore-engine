@@ -14,6 +14,9 @@
 //! Each mod archive ships a DLL named after its package (`ModA.dll`), so a test
 //! can tell whose files landed where.
 //!
+//! Every version has a [`readme`] except `Owner-ModB`, which answers `404` like
+//! a package Thunderstore has no readme for.
+//!
 //! ```no_run
 //! use thunderstore_engine::test_support::MockThunderstore;
 //!
@@ -93,6 +96,30 @@ impl MockThunderstore {
         .create();
     }
 
+    for (owner, name, version) in [
+      ("Owner", "ModA", "1.0.0"),
+      ("Owner", "ModC", "1.0.0"),
+      ("Owner", "ModD", "1.0.0"),
+      ("Owner", "ModD", "2.0.0"),
+      ("denikson", "BepInExPack_Valheim", "5.4.2200"),
+    ] {
+      let body = serde_json::json!({ "markdown": readme(name, version) });
+
+      server
+        .mock("GET", readme_path(owner, name, version).as_str())
+        .with_status(200)
+        .with_header("Content-Type", "application/json")
+        .with_body(body.to_string())
+        .create();
+    }
+
+    server
+      .mock("GET", readme_path("Owner", "ModB", "1.0.0").as_str())
+      .with_status(404)
+      .with_header("Content-Type", "application/json")
+      .with_body(r#"{"detail":"Not found."}"#)
+      .create();
+
     Self { server }
   }
 
@@ -119,6 +146,17 @@ impl MockThunderstore {
       .base_url(self.url())
       .package_index_url(self.package_index_url())
   }
+}
+
+/// The readme markdown the mock serves for `name` at `version`, such as
+/// `"# ModA 1.0.0\n\nA mod."`.
+pub fn readme(name: &str, version: &str) -> String {
+  format!("# {name} {version}\n\nA mod.")
+}
+
+/// Path a version's readme is served from, as Thunderstore lays it out.
+pub fn readme_path(owner: &str, name: &str, version: &str) -> String {
+  format!("/api/experimental/package/{owner}/{name}/{version}/readme/")
 }
 
 /// A mod archive with a manifest at `version` and one DLL, `plugins/ModA.dll`,

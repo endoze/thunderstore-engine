@@ -267,6 +267,13 @@ impl GameDef {
       .find(|p| p.instance_type == InstanceType::Game)
       .or_else(|| self.profiles.first())
   }
+
+  /// The Thunderstore community of the primary [`profile`](Self::profile).
+  ///
+  /// See [`GameProfile::community`].
+  pub fn community(&self) -> Option<&str> {
+    self.profile()?.community()
+  }
 }
 
 /// A per-manager profile for a game: its loader, install rules, and metadata.
@@ -328,6 +335,37 @@ impl GameProfile {
       .iter()
       .find(|d| d.platform == "steam")
       .and_then(|d| d.identifier.parse().ok())
+  }
+
+  /// The Thunderstore community slug this profile's packages come from, read
+  /// from the `/c/<community>/` segment of [`package_index`](Self::package_index).
+  ///
+  /// The slug can differ from the profile's own identifiers: the Outward
+  /// Definitive profile (`OutwardDe`) and the Valheim dedicated server
+  /// (`ValheimServer`) both use their game's community. Returns `None` when the
+  /// profile has no package index or its path is not `/c/<slug>/...`.
+  ///
+  /// # Examples
+  ///
+  /// ```
+  /// use thunderstore_engine::ecosystem::Ecosystem;
+  ///
+  /// let eco = Ecosystem::bundled();
+  /// let valheim = eco.game("valheim").unwrap().profile().unwrap();
+  ///
+  /// assert_eq!(valheim.community(), Some("valheim"));
+  /// ```
+  pub fn community(&self) -> Option<&str> {
+    let url = self.package_index.as_deref()?;
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let (_, path) = after_scheme.split_once('/')?;
+    let (community, _) = path.strip_prefix("c/")?.split_once('/')?;
+    let is_slug = !community.is_empty()
+      && community
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+
+    is_slug.then_some(community)
   }
 }
 
@@ -600,6 +638,58 @@ mod tests {
       .expect("config rule");
 
     assert!(!config.tracking_method.is_namespaced());
+  }
+
+  #[test]
+  fn community_comes_from_the_profile_package_index() {
+    let eco = Ecosystem::bundled();
+    let outward = eco.game("outward").expect("outward present");
+    let definitive = outward
+      .profiles
+      .iter()
+      .find(|p| p.settings_identifier.as_deref() == Some("OutwardDe"))
+      .expect("Outward Definitive profile");
+
+    assert_eq!(definitive.community(), Some("outward"));
+    assert_eq!(outward.community(), Some("outward"));
+
+    let server = eco
+      .game("valheim")
+      .expect("valheim present")
+      .profiles
+      .iter()
+      .find(|p| p.instance_type == InstanceType::Server)
+      .expect("valheim server profile");
+
+    assert_eq!(server.settings_identifier.as_deref(), Some("ValheimServer"));
+    assert_eq!(server.community(), Some("valheim"));
+  }
+
+  #[test]
+  fn community_is_none_without_a_usable_package_index() {
+    let community_of = |index: Option<&str>| {
+      let json = serde_json::json!({
+        "games": { "g": { "r2modman": [{ "packageIndex": index }] } }
+      });
+      let eco = Ecosystem::from_json(&json.to_string()).unwrap();
+
+      eco.game("g").unwrap().community().map(str::to_string)
+    };
+
+    assert_eq!(
+      community_of(Some("https://example.com/c/my-game/api/v1/package/")),
+      Some("my-game".to_string())
+    );
+    assert_eq!(community_of(None), None);
+    assert_eq!(
+      community_of(Some("https://thunderstore.io/api/v1/package/")),
+      None
+    );
+    assert_eq!(
+      community_of(Some("https://thunderstore.io/c/../api/v1/package/")),
+      None
+    );
+    assert_eq!(community_of(Some("https://thunderstore.io/c/")), None);
   }
 
   #[test]

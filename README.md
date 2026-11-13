@@ -81,6 +81,8 @@ archive library, and keeps what does no IO:
 
 - the package, version, and ecosystem models (including
   `Ecosystem::require_profile`), and the dependency resolver;
+- the game to community mapping (`GameProfile::community`,
+  `GameDef::community`), read from each game's package index location;
 - the `Error` type, which is `Clone` so a client can keep one in its state;
 - the plan types (`InstallPlan`, `InstallBatch`, `UninstallBatch`,
   `ToggleBatch`, `LaunchPlan`) and the `mods.yml` and export models;
@@ -117,8 +119,8 @@ build dependency. Either one turns on `io`. Pick exactly one:
 ### `test-support`
 
 Off by default. Adds `test_support`, a mock Thunderstore built on `mockito`
-that serves a small package index and real package archives, so a client's
-tests can run the install pipeline with no network access.
+that serves a small package index, real package archives, and their readmes,
+so a client's tests can run the install pipeline with no network access.
 `MockThunderstore::start` (or `start_async` in an async test) starts it, and
 `client_builder` returns a client pointed at it. Turn it on for tests only:
 

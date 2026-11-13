@@ -97,6 +97,27 @@ const PROFILE_API_PATH: &str = "api/experimental/legacyprofile";
 /// misbehaving or hostile host well above that.
 const MAX_PROFILE_CODE_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Thunderstore's per-package endpoints, under which a version's readme is
+/// `<owner>/<name>/<version>/readme/`.
+const PACKAGE_API_PATH: &str = "api/experimental/package";
+
+/// Ceiling on a readme response body read into memory, far above any real
+/// readme, to bound a misbehaving or hostile host.
+const MAX_README_BYTES: u64 = 16 * 1024 * 1024;
+
+/// What [`ThunderstoreClient::refresh_if_stale`] found.
+#[derive(Debug, Clone)]
+#[expect(
+  clippy::large_enum_variant,
+  reason = "returned once per refresh and matched at once, like Result<PackageIndex>"
+)]
+pub enum Refreshed {
+  /// The cached index is as new as the server's, so nothing was downloaded.
+  Unchanged,
+  /// The index was downloaded and cached.
+  Updated(PackageIndex),
+}
+
 /// An async client for a single Thunderstore community.
 ///
 /// Build one with [`ThunderstoreClient::builder`].
@@ -234,6 +255,74 @@ impl ThunderstoreClient {
     .await
   }
 
+  /// Reads the package index from the on-disk cache without any network
+  /// request, however old the cache is.
+  ///
+  /// Returns `Ok(None)` when nothing has been cached for this client's index
+  /// yet, so a caller can show the cached list at once and refresh later.
+  ///
+  /// # Errors
+  ///
+  /// A cache that exists but cannot be used is an error rather than `None`:
+  ///
+  /// - [`Error::Cache`] or [`Error::UnsupportedCacheVersion`] if the cache is
+  ///   corrupt or from an incompatible version of this crate.
+  /// - [`Error::SizeLimitExceeded`] if it exceeds
+  ///   [`manifest_max_decompressed_bytes`](ThunderstoreClientBuilder::manifest_max_decompressed_bytes).
+  /// - [`Error::Io`] if it cannot be read.
+  pub async fn cached_index(&self) -> Result<Option<PackageIndex>> {
+    let path = api_manifest_path(&self.index_cache_dir());
+    let limit = self.max_manifest_decompressed_bytes;
+
+    // Opened once with no existence check first, so a cache removed at any
+    // point before the read is `None`, never an error.
+    let decoded = tokio::task::spawn_blocking(move || decode_cached_manifest(&path, limit))
+      .await
+      .map_err(|e| Error::Cache(format!("cache decode task panicked: {}", e)))?;
+
+    match decoded {
+      Ok(index) => Ok(Some(index)),
+      Err(Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+      Err(err) => Err(err),
+    }
+  }
+
+  /// Downloads the package index only when the server has a newer one than
+  /// the cache, for a caller that already shows [`cached_index`](Self::cached_index).
+  ///
+  /// Sends a `HEAD` and compares its `Last-Modified` with the cached marker.
+  /// A current cache answers [`Refreshed::Unchanged`] without reading the
+  /// cached index. A stale cache, or no cache, is replaced by a download and
+  /// returned as [`Refreshed::Updated`]. A corrupt cache with a current marker
+  /// still answers `Unchanged`, so a caller whose `cached_index` failed should
+  /// call [`refresh_index`](Self::refresh_index) instead.
+  ///
+  /// # Errors
+  ///
+  /// Unlike [`get_manifest`](Self::get_manifest), a failed freshness check is
+  /// an error and never falls back to the cache, so the caller can tell the
+  /// user the list may be out of date:
+  ///
+  /// - [`Error::Http`] if the `HEAD` or the download fails or returns a
+  ///   non-success status.
+  /// - [`Error::MissingHeader`] or [`Error::InvalidHeader`] if the server's
+  ///   `Last-Modified` is absent or unparseable.
+  /// - Otherwise the same as [`refresh_index`](Self::refresh_index).
+  pub async fn refresh_if_stale(&self) -> Result<Refreshed> {
+    let index_dir = self.index_cache_dir();
+
+    if api_manifest_file_exists(&index_dir) {
+      let local = local_last_modified(&index_dir).await?;
+      let network = network_last_modified(&self.http, &self.package_index_url).await?;
+
+      if is_fresh(network, local) {
+        return Ok(Refreshed::Unchanged);
+      }
+    }
+
+    self.refresh_index().await.map(Refreshed::Updated)
+  }
+
   /// Forces a network refresh of the package index, bypassing the cache.
   ///
   /// # Errors
@@ -353,6 +442,48 @@ impl ThunderstoreClient {
 
     Ok(body)
   }
+
+  /// Fetches the readme markdown for one version of a package, such as
+  /// `("denikson", "BepInExPack_Valheim", "5.4.2202")`.
+  ///
+  /// Returns `Ok(None)` when Thunderstore has no readme for that version,
+  /// including when it does not know the package or version. Transient
+  /// failures are retried per the client's [`RetryPolicy`].
+  ///
+  /// # Errors
+  ///
+  /// - [`Error::Config`] if `owner`, `name`, or `version` is empty, `.` or
+  ///   `..`, or contains anything outside ASCII alphanumerics, `-`, `_`, and
+  ///   `.`. This is checked before any request.
+  /// - [`Error::Http`] if the request fails or the server returns an error
+  ///   status other than `404`, after the retry policy is exhausted.
+  /// - [`Error::SizeLimitExceeded`] if the response body is implausibly large.
+  /// - [`Error::Json`] if the response is not the expected
+  ///   `{ "markdown": ... }` shape.
+  pub async fn get_readme(&self, owner: &str, name: &str, version: &str) -> Result<Option<String>> {
+    for segment in [owner, name, version] {
+      validate_package_segment(segment)?;
+    }
+
+    let url = format!(
+      "{}/{}/{owner}/{name}/{version}/readme/",
+      self.base_url, PACKAGE_API_PATH
+    );
+
+    retry_http(&self.retry, || async {
+      let response = self.http.get(&url).send().await?;
+
+      if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+      }
+
+      let body = read_capped_body(response.error_for_status()?, Some(MAX_README_BYTES)).await?;
+      let parsed: ReadmeResponse = serde_json::from_slice(&body)?;
+
+      Ok(Some(parsed.markdown))
+    })
+    .await
+  }
 }
 
 /// Builder for [`ThunderstoreClient`].
@@ -368,6 +499,7 @@ pub struct ThunderstoreClientBuilder {
   max_manifest_bytes: Option<u64>,
   max_manifest_decompressed_bytes: Option<u64>,
   retry: RetryPolicy,
+  user_agent: Option<String>,
 }
 
 impl Default for ThunderstoreClientBuilder {
@@ -386,6 +518,7 @@ impl Default for ThunderstoreClientBuilder {
       // that passes the download cap is always readable back from cache.
       max_manifest_decompressed_bytes: None,
       retry: RetryPolicy::default(),
+      user_agent: None,
     }
   }
 }
@@ -514,6 +647,18 @@ impl ThunderstoreClientBuilder {
     self
   }
 
+  /// Sets the `User-Agent` header sent on every request this client makes.
+  ///
+  /// When unset, no `User-Agent` header is sent.
+  ///
+  /// [`build`](Self::build) fails with [`Error::Http`] if the value is not a
+  /// valid header value, for example one containing a newline.
+  pub fn user_agent(mut self, user_agent: impl Into<String>) -> Self {
+    self.user_agent = Some(user_agent.into());
+
+    self
+  }
+
   /// Builds the [`ThunderstoreClient`].
   ///
   /// # Errors
@@ -551,11 +696,16 @@ impl ThunderstoreClientBuilder {
     // Redirects are followed but bounded (reqwest's default limit) and never for
     // non-HTTP schemes; download URLs come from the fetched index, so this is a
     // deliberate, documented policy.
-    let http = Client::builder()
+    let mut http = Client::builder()
       .connect_timeout(self.download_timeout)
       .read_timeout(self.download_timeout)
-      .redirect(reqwest::redirect::Policy::limited(10))
-      .build()?;
+      .redirect(reqwest::redirect::Policy::limited(10));
+
+    if let Some(user_agent) = self.user_agent {
+      http = http.user_agent(user_agent);
+    }
+
+    let http = http.build()?;
     let progress = self.progress.unwrap_or_else(|| Arc::new(NoopProgress));
 
     Ok(ThunderstoreClient {
@@ -638,6 +788,29 @@ fn validate_profile_code(code: &str) -> Result<()> {
   if !is_valid {
     return Err(Error::Config(format!(
       "invalid profile code {code:?}: expected only ASCII letters, digits, '-', and '_'"
+    )));
+  }
+
+  Ok(())
+}
+
+/// The `GET …/package/<owner>/<name>/<version>/readme/` response body.
+#[derive(serde::Deserialize)]
+struct ReadmeResponse {
+  markdown: String,
+}
+
+/// Validates an owner, package name, or version before it is interpolated into
+/// a URL path, so it cannot inject extra path segments or a query.
+fn validate_package_segment(segment: &str) -> Result<()> {
+  let is_valid = !matches!(segment, "" | "." | "..")
+    && segment
+      .chars()
+      .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+
+  if !is_valid {
+    return Err(Error::Config(format!(
+      "invalid package segment {segment:?}: expected only ASCII letters, digits, '-', '_', and '.'"
     )));
   }
 
@@ -1840,6 +2013,77 @@ mod tests {
   }
 
   #[test]
+  fn cached_index_reports_no_cache_without_a_request() {
+    let mut server = Server::new();
+    let temp_dir = tempdir().unwrap();
+    let head = server.mock("HEAD", "/pkg/").expect(0).create();
+    let get = server.mock("GET", "/pkg/").expect(0).create();
+
+    let client = ThunderstoreClient::builder()
+      .package_index_url(format!("{}/pkg/", server.url()))
+      .cache_dir(temp_dir.path())
+      .build()
+      .unwrap();
+
+    let rt = Runtime::new().unwrap();
+    let cached = rt.block_on(client.cached_index()).unwrap();
+
+    assert!(cached.is_none());
+
+    head.assert();
+    get.assert();
+  }
+
+  #[test]
+  fn cached_index_loads_a_stale_cache_without_a_request() {
+    let mut server = Server::new();
+    let temp_dir = tempdir().unwrap();
+    let head = server.mock("HEAD", "/pkg/").expect(0).create();
+    let get = server.mock("GET", "/pkg/").expect(0).create();
+
+    let client = ThunderstoreClient::builder()
+      .package_index_url(format!("{}/pkg/", server.url()))
+      .cache_dir(temp_dir.path())
+      .build()
+      .unwrap();
+
+    seed_index_cache(&client.index_cache_dir(), "Thu, 01 Jan 1970 00:00:00 GMT");
+
+    let rt = Runtime::new().unwrap();
+    let index = rt
+      .block_on(client.cached_index())
+      .unwrap()
+      .expect("seeded cache is read");
+
+    assert_eq!(
+      index.resolve_full_name_at(0),
+      Some("CachedOwner-CachedMod".to_string())
+    );
+
+    head.assert();
+    get.assert();
+  }
+
+  #[test]
+  fn cached_index_reports_a_corrupt_cache_as_an_error() {
+    let temp_dir = tempdir().unwrap();
+
+    let client = ThunderstoreClient::builder()
+      .package_index_url("http://127.0.0.1:9/pkg/")
+      .cache_dir(temp_dir.path())
+      .build()
+      .unwrap();
+    let index_dir = client.index_cache_dir();
+
+    std::fs::create_dir_all(&index_dir).unwrap();
+    std::fs::write(api_manifest_path(&index_dir), b"not zstd").unwrap();
+
+    let rt = Runtime::new().unwrap();
+
+    assert!(rt.block_on(client.cached_index()).is_err());
+  }
+
+  #[test]
   fn test_get_manifest_falls_back_to_cache_when_head_fails() {
     let mut server = Server::new();
     let temp_dir = tempdir().unwrap();
@@ -1874,6 +2118,148 @@ mod tests {
     );
 
     mock.assert();
+  }
+
+  /// A client for `server`'s `/pkg/` index, caching under `cache_dir`.
+  fn pkg_client(server: &Server, cache_dir: &Path) -> ThunderstoreClient {
+    ThunderstoreClient::builder()
+      .package_index_url(format!("{}/pkg/", server.url()))
+      .cache_dir(cache_dir)
+      .build()
+      .unwrap()
+  }
+
+  #[test]
+  fn refresh_if_stale_reports_a_fresh_cache_unchanged_without_downloading() {
+    let mut server = Server::new();
+    let temp_dir = tempdir().unwrap();
+    let head = server
+      .mock("HEAD", "/pkg/")
+      .with_status(200)
+      .with_header("Last-Modified", "Wed, 21 Feb 2024 15:30:45 GMT")
+      .create();
+    let get = server.mock("GET", "/pkg/").expect(0).create();
+    let client = pkg_client(&server, temp_dir.path());
+    let index_dir = client.index_cache_dir();
+
+    seed_index_cache(&index_dir, "Wed, 21 Feb 2024 15:30:45 GMT");
+    // Unchanged must come from the marker alone, so a cache that would not
+    // decode still answers Unchanged.
+    std::fs::write(api_manifest_path(&index_dir), b"not zstd").unwrap();
+
+    let rt = Runtime::new().unwrap();
+    let refreshed = rt.block_on(client.refresh_if_stale()).unwrap();
+
+    assert!(matches!(refreshed, Refreshed::Unchanged));
+
+    head.assert();
+    get.assert();
+  }
+
+  #[test]
+  fn refresh_if_stale_downloads_and_caches_a_stale_index() {
+    let mut server = Server::new();
+    let temp_dir = tempdir().unwrap();
+    let head = server
+      .mock("HEAD", "/pkg/")
+      .with_status(200)
+      .with_header("Last-Modified", "Wed, 28 Feb 2024 15:30:45 GMT")
+      .create();
+    let get = server
+      .mock("GET", "/pkg/")
+      .with_status(200)
+      .with_header("Content-Type", "application/json")
+      .with_header("Last-Modified", "Wed, 28 Feb 2024 15:30:45 GMT")
+      .with_body(sample_manifest_json())
+      .create();
+    let client = pkg_client(&server, temp_dir.path());
+
+    seed_index_cache(&client.index_cache_dir(), "Wed, 21 Feb 2024 15:30:45 GMT");
+
+    let rt = Runtime::new().unwrap();
+    let refreshed = rt.block_on(client.refresh_if_stale()).unwrap();
+
+    let Refreshed::Updated(index) = refreshed else {
+      panic!("a stale cache is replaced");
+    };
+
+    assert_eq!(
+      index.resolve_full_name_at(0),
+      Some("Owner-ModA".to_string())
+    );
+
+    let cached = rt.block_on(client.cached_index()).unwrap().unwrap();
+
+    assert_eq!(
+      cached.resolve_full_name_at(0),
+      Some("Owner-ModA".to_string())
+    );
+
+    head.assert();
+    get.assert();
+  }
+
+  #[test]
+  fn refresh_if_stale_downloads_when_nothing_is_cached() {
+    let mut server = Server::new();
+    let temp_dir = tempdir().unwrap();
+    let head = server.mock("HEAD", "/pkg/").expect(0).create();
+    let get = server
+      .mock("GET", "/pkg/")
+      .with_status(200)
+      .with_header("Content-Type", "application/json")
+      .with_header("Last-Modified", "Wed, 21 Feb 2024 15:30:45 GMT")
+      .with_body(sample_manifest_json())
+      .create();
+    let client = pkg_client(&server, temp_dir.path());
+
+    let rt = Runtime::new().unwrap();
+    let refreshed = rt.block_on(client.refresh_if_stale()).unwrap();
+
+    assert!(matches!(refreshed, Refreshed::Updated(ref index) if index.len() == 1));
+    assert!(rt.block_on(client.cached_index()).unwrap().is_some());
+
+    head.assert();
+    get.assert();
+  }
+
+  #[test]
+  fn refresh_if_stale_reports_a_failed_freshness_check() {
+    let mut server = Server::new();
+    let temp_dir = tempdir().unwrap();
+    let head = server.mock("HEAD", "/pkg/").with_status(500).create();
+    let get = server.mock("GET", "/pkg/").expect(0).create();
+    let client = pkg_client(&server, temp_dir.path());
+
+    seed_index_cache(&client.index_cache_dir(), "Wed, 21 Feb 2024 15:30:45 GMT");
+
+    let rt = Runtime::new().unwrap();
+    let result = rt.block_on(client.refresh_if_stale());
+
+    assert!(matches!(result, Err(Error::Http(_))), "got {result:?}");
+
+    head.assert();
+    get.assert();
+  }
+
+  #[test]
+  fn refresh_if_stale_reports_a_failed_download() {
+    let mut server = Server::new();
+    let temp_dir = tempdir().unwrap();
+    let get = server.mock("GET", "/pkg/").with_status(503).create();
+    let client = ThunderstoreClient::builder()
+      .package_index_url(format!("{}/pkg/", server.url()))
+      .cache_dir(temp_dir.path())
+      .retry(RetryPolicy::none())
+      .build()
+      .unwrap();
+
+    let rt = Runtime::new().unwrap();
+    let result = rt.block_on(client.refresh_if_stale());
+
+    assert!(result.is_err());
+
+    get.assert();
   }
 
   #[test]
@@ -2961,6 +3347,122 @@ mod tests {
   }
 
   #[test]
+  fn user_agent_is_sent_on_every_request() {
+    let mut server = Server::new();
+    let agent = "my-manager/1.2 (+https://example.com)";
+    let index_path = "/c/valheim/api/v1/package/";
+    let archive = b"zip bytes";
+
+    let index_get = server
+      .mock("GET", index_path)
+      .match_header("user-agent", agent)
+      .with_status(200)
+      .with_header("Last-Modified", "Wed, 21 Feb 2024 15:30:45 GMT")
+      .with_body(sample_manifest_json())
+      .create();
+    let index_head = server
+      .mock("HEAD", index_path)
+      .match_header("user-agent", agent)
+      .with_status(200)
+      .with_header("Last-Modified", "Wed, 21 Feb 2024 15:30:45 GMT")
+      .create();
+    let download = server
+      .mock("GET", "/mod.zip")
+      .match_header("user-agent", agent)
+      .with_status(200)
+      .with_header("Content-Length", &archive.len().to_string())
+      .with_body(archive)
+      .create();
+    let create_code = server
+      .mock("POST", "/api/experimental/legacyprofile/create/")
+      .match_header("user-agent", agent)
+      .with_status(200)
+      .with_body(r#"{"key":"abc-123"}"#)
+      .create();
+    let fetch_code = server
+      .mock("GET", "/api/experimental/legacyprofile/get/abc-123/")
+      .match_header("user-agent", agent)
+      .with_status(200)
+      .with_body("#r2modman\nQUJD")
+      .create();
+    let readme = server
+      .mock("GET", "/api/experimental/package/Owner/ModA/1.0.0/readme/")
+      .match_header("user-agent", agent)
+      .with_status(200)
+      .with_body(r##"{"markdown":"# ModA"}"##)
+      .create();
+
+    let cache = tempdir().unwrap();
+    let client = ThunderstoreClient::builder()
+      .base_url(server.url())
+      .community("valheim")
+      .cache_dir(cache.path())
+      .user_agent(agent)
+      .retry(RetryPolicy::none())
+      .build()
+      .unwrap();
+    let urls = HashMap::from([("mod.zip".to_string(), format!("{}/mod.zip", server.url()))]);
+
+    let rt = Runtime::new().unwrap();
+
+    rt.block_on(async {
+      client.refresh_index().await.unwrap();
+      client.get_manifest().await.unwrap();
+      client.download_files(urls).await.unwrap();
+      client.create_profile_code(b"payload").await.unwrap();
+      client.fetch_profile_code("abc-123").await.unwrap();
+      client.get_readme("Owner", "ModA", "1.0.0").await.unwrap();
+    });
+
+    index_get.assert();
+    index_head.assert();
+    download.assert();
+    create_code.assert();
+    fetch_code.assert();
+    readme.assert();
+  }
+
+  #[test]
+  fn user_agent_is_not_sent_unless_set() {
+    let mut server = Server::new();
+
+    let mock = server
+      .mock("GET", "/api/experimental/legacyprofile/get/abc-123/")
+      .match_header("user-agent", mockito::Matcher::Missing)
+      .with_status(200)
+      .with_body("#r2modman\nQUJD")
+      .create();
+
+    let cache = tempdir().unwrap();
+    let client = ThunderstoreClient::builder()
+      .base_url(server.url())
+      .community("valheim")
+      .cache_dir(cache.path())
+      .retry(RetryPolicy::none())
+      .build()
+      .unwrap();
+
+    let rt = Runtime::new().unwrap();
+
+    rt.block_on(client.fetch_profile_code("abc-123")).unwrap();
+
+    mock.assert();
+  }
+
+  #[test]
+  fn user_agent_that_is_not_a_header_value_fails_build() {
+    let cache = tempdir().unwrap();
+
+    let result = ThunderstoreClient::builder()
+      .community("valheim")
+      .cache_dir(cache.path())
+      .user_agent("bad\nagent")
+      .build();
+
+    assert!(result.is_err());
+  }
+
+  #[test]
   fn fetch_profile_code_rejects_unsafe_code() {
     let cache = tempdir().unwrap();
     let client = ThunderstoreClient::builder()
@@ -2976,5 +3478,62 @@ mod tests {
       rt.block_on(client.fetch_profile_code("../../evil")),
       Err(Error::Config(_))
     ));
+  }
+
+  #[test]
+  fn get_readme_retries_a_server_error_then_reports_it() {
+    let mut server = Server::new();
+
+    let mock = server
+      .mock("GET", "/api/experimental/package/Owner/ModA/1.0.0/readme/")
+      .with_status(503)
+      .expect(2)
+      .create();
+
+    let cache = tempdir().unwrap();
+    let client = ThunderstoreClient::builder()
+      .base_url(server.url())
+      .community("valheim")
+      .cache_dir(cache.path())
+      .retry(RetryPolicy {
+        max_retries: 1,
+        base_delay: Duration::ZERO,
+        max_delay: Duration::ZERO,
+      })
+      .build()
+      .unwrap();
+
+    let rt = Runtime::new().unwrap();
+    let result = rt.block_on(client.get_readme("Owner", "ModA", "1.0.0"));
+
+    assert!(matches!(result, Err(Error::Http(_))), "{result:?}");
+    mock.assert();
+  }
+
+  #[test]
+  fn get_readme_rejects_segments_that_would_change_the_path() {
+    let cache = tempdir().unwrap();
+    let client = ThunderstoreClient::builder()
+      .community("valheim")
+      .cache_dir(cache.path())
+      .build()
+      .unwrap();
+
+    let rt = Runtime::new().unwrap();
+
+    for (owner, name, version) in [
+      ("..", "ModA", "1.0.0"),
+      ("Owner", "Mod/A", "1.0.0"),
+      ("Owner", "ModA", "1.0.0?x=1"),
+      ("Owner", "", "1.0.0"),
+    ] {
+      assert!(
+        matches!(
+          rt.block_on(client.get_readme(owner, name, version)),
+          Err(Error::Config(_))
+        ),
+        "{owner}/{name}/{version}"
+      );
+    }
   }
 }
