@@ -280,6 +280,18 @@ pub fn extract_zip_with_limits(
   dest_dir: &Path,
   limits: &ExtractLimits,
 ) -> Result<()> {
+  extract_zip_reporting(zip_path, dest_dir, limits, &mut |_, _| {})
+}
+
+/// [`extract_zip_with_limits`], calling `on_progress(done, total)` in archive
+/// entries before each entry and once more after the last.
+#[cfg(feature = "io")]
+pub(crate) fn extract_zip_reporting(
+  zip_path: &Path,
+  dest_dir: &Path,
+  limits: &ExtractLimits,
+  on_progress: &mut dyn FnMut(u64, u64),
+) -> Result<()> {
   let file = fs::File::open(zip_path)?;
   let mut archive = zip::ZipArchive::new(file)?;
 
@@ -295,8 +307,11 @@ pub fn extract_zip_with_limits(
 
   let mut total_written: u64 = 0;
   let mut buffer = vec![0u8; EXTRACT_CHUNK_SIZE];
+  let entries = archive.len() as u64;
 
   for i in 0..archive.len() {
+    on_progress(i as u64, entries);
+
     let mut file_in_archive = archive.by_index(i)?;
     let enclosed = file_in_archive.enclosed_name();
     let outpath = match safe_join(dest_dir, enclosed.as_deref()) {
@@ -373,6 +388,8 @@ pub fn extract_zip_with_limits(
       }
     }
   }
+
+  on_progress(entries, entries);
 
   Ok(())
 }

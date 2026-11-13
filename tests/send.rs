@@ -19,3 +19,26 @@ fn public_async_futures_are_send() {
   assert_send(&client.refresh_index());
   assert_send(&client.download_files(HashMap::new()));
 }
+
+/// Never called: building the future is enough for the compiler to check it.
+#[allow(dead_code)]
+fn install_batch_with_is_send(
+  client: &ThunderstoreClient,
+  index: &thunderstore_engine::models::PackageIndex,
+  eco: &thunderstore_engine::ecosystem::Ecosystem,
+) {
+  let batch = thunderstore_engine::profile::InstallBatch::default();
+  let operation = thunderstore_engine::progress::Operation::default();
+
+  assert_send(&thunderstore_engine::profile::install_batch_with(
+    std::path::Path::new("target"),
+    std::path::Path::new("cache"),
+    eco,
+    index,
+    client,
+    "valheim",
+    &batch,
+    0,
+    &operation,
+  ));
+}

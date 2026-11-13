@@ -94,6 +94,10 @@ name = "profile_end_to_end"
 required-features = ["test-support"]
 
 [[test]]
+name = "operation_progress"
+required-features = ["test-support"]
+
+[[test]]
 name = "profile_launch_end_to_end"
 required-features = ["io"]
 

@@ -67,18 +67,22 @@ use crate::error::{Error, Result};
 use crate::extract::parse_package_filename;
 #[cfg(feature = "io")]
 use crate::install::{
-  apply_install, clear_state_files, plan_install, remove_delisted, remove_mod_folders,
-  remove_state_file, remove_state_payload, state_tracker_from_plan, write_state_file,
+  apply_install_reporting, clear_state_files, plan_install, remove_mod_folders, remove_state_file,
+  remove_state_payload, state_tracker_from_plan, write_state_file,
 };
 use crate::models::Version;
 #[cfg(feature = "io")]
 use crate::models::{DependencyGraph, PackageIndex};
+#[cfg(feature = "io")]
+use crate::progress::{Operation, Stage, StageProgress};
 use modlist::{ProfileMod, SemVer};
 #[cfg(feature = "io")]
 use std::collections::BTreeSet;
 #[cfg(feature = "io")]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "io")]
+use std::sync::Arc;
 
 /// Builds a [`ProfileMod`] from a Thunderstore [`Version`], applying the same
 /// defaults r2modman uses for a Thunderstore install (`fromThunderstoreCombo`):
@@ -132,7 +136,7 @@ pub fn mod_entry_from_version(
 /// A batch does not stop at the first failure: an operation that already mutated
 /// earlier items has to report which ones, so `failed` carries the reason per
 /// item rather than collapsing to a single error.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct BatchOutcome {
   /// Identifiers the operation completed.
@@ -154,12 +158,33 @@ pub struct BatchOutcome {
   pub unchanged: Vec<String>,
   /// Identifiers that failed, each with the reason.
   pub failed: Vec<(String, Error)>,
+  /// Untracked folders an uninstall left in place because the caller did not
+  /// call [`UninstallBatch::confirm_untracked`]. Only [`uninstall_batch`]
+  /// fills this.
+  pub kept_untracked: Vec<PathBuf>,
+  /// What was left undone because the caller cancelled.
+  ///
+  /// [`install_batch_with`] lists each `desired` identifier not started, as
+  /// given, and each `Owner-Name` of a started identifier's dependency closure
+  /// left uninstalled. [`uninstall_batch_with`] and [`set_enabled_batch_with`]
+  /// list each identifier not started, and an uninstall also lists each
+  /// confirmed untracked folder it did not remove, by path.
+  pub cancelled: Vec<String>,
+  /// Recorded mods that were disabled before an install and are enabled after
+  /// it, sorted. Only [`install_batch`] fills this, and leaves it empty when
+  /// `mods.yml` cannot be read before or after the installs.
+  pub re_enabled: Vec<String>,
+  /// Mods an install reinstalled and then restored to disabled, from
+  /// [`InstallBatch::protect_disabled`], sorted. Only [`install_batch`] fills
+  /// this, and leaves it empty when `mods.yml` cannot be read after the
+  /// installs.
+  pub kept_disabled: Vec<String>,
 }
 
 impl BatchOutcome {
-  /// Whether every item succeeded.
+  /// Whether every item succeeded: nothing failed and nothing was cancelled.
   pub fn is_ok(&self) -> bool {
-    self.failed.is_empty()
+    self.failed.is_empty() && self.cancelled.is_empty()
   }
 }
 
@@ -307,6 +332,35 @@ pub fn install_extracted_in(
   archive: Option<&Path>,
   installed_at_time: u64,
 ) -> Result<()> {
+  install_extracted_reporting(
+    target_dir,
+    eco,
+    game,
+    full_name,
+    owner,
+    version,
+    extracted_dir,
+    archive,
+    installed_at_time,
+    &mut |_, _| {},
+  )
+}
+
+/// [`install_extracted_in`], passing `on_progress` to the file copy.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "io")]
+fn install_extracted_reporting(
+  target_dir: &Path,
+  eco: &Ecosystem,
+  game: &str,
+  full_name: &str,
+  owner: &str,
+  version: &Version,
+  extracted_dir: &Path,
+  archive: Option<&Path>,
+  installed_at_time: u64,
+  on_progress: &mut dyn FnMut(u64, u64),
+) -> Result<()> {
   let game_profile = eco.require_profile(game)?;
 
   let plan = plan_install(eco, game_profile, full_name, extracted_dir, archive)?;
@@ -318,7 +372,7 @@ pub fn install_extracted_in(
   // `ensure_removable` refuses for a loader with no record.
   clear_state_files(target_dir, full_name)?;
   remove_mod_folders(game_profile, target_dir, full_name)?;
-  apply_install(&plan, target_dir)?;
+  apply_install_reporting(&plan, target_dir, on_progress)?;
 
   match state_tracker_from_plan(&plan, full_name) {
     Some(tracker) => write_state_file(target_dir, &tracker)?,
@@ -435,8 +489,8 @@ impl From<NotRemovable> for Error {
 /// installed and there is no way to know which files the loader placed;
 /// uninstalling anyway would drop the `mods.yml` entry and leave every one of
 /// its files orphaned. An ordinary mod, by contrast, has no record by design
-/// under install rules with no `state` route, and `remove_delisted` reconciles
-/// its folders by presence instead.
+/// under install rules with no `state` route, and its folders are removed
+/// by presence instead.
 ///
 /// An *unreadable* record is always a problem, loader or not: the file exists,
 /// so something tracked files, and guessing which is how an uninstall orphans or
@@ -534,22 +588,24 @@ pub fn check_removable_from(
   })
 }
 
-/// Uninstalls a mod from `target_dir`: removes its `mods.yml` entry,
-/// reconciles the on-disk namespaced folders against the remaining set (so only
-/// this mod's folders are removed), and removes its `State`-tracked payload
-/// files along with its `_state` file.
+/// Uninstalls a mod from `target_dir`: removes its `mods.yml` entry, its
+/// `<Owner-Name>/` folder under each namespaced route, and its `State`-tracked
+/// payload files along with its `_state` file. Folders the record does not
+/// name are left alone; [`uninstall_batch`] removes those only when asked.
+/// A name `mods.yml` does not record exactly is [`Error::NotInstalled`], before
+/// anything is touched.
 ///
 /// [`ensure_removable`] gates the whole thing before anything is touched, so a
 /// mod whose files cannot be removed exactly is refused rather than half
 /// removed. See its doc for which records qualify.
 ///
-/// Both removal paths are needed: `remove_delisted` reconciles the per-mod
-/// `<Owner-Name>/` folders under namespaced routes, while `State`-tracked files
-/// sit directly under a shared route (e.g. `BepInEx/core/`) and are only
-/// recoverable from the `_state` record. This function does not special-case
-/// the mod loader beyond the refusal above: naming it as `full_name` removes
-/// it through these same two paths like any other mod, which is how callers
-/// such as `vmm uninstall --all` uninstall it. Only shared config
+/// Both removal paths are needed: the per-mod folders sit under namespaced
+/// routes, while `State`-tracked files sit directly under a shared route (e.g.
+/// `BepInEx/core/`) and are only recoverable from the `_state` record. This
+/// function does not special-case the mod loader beyond the refusal above:
+/// naming it as `full_name` removes it through these same two paths like any
+/// other mod, which is how callers such as `vmm uninstall --all` uninstall it.
+/// Only shared config
 /// (`none`-tracked) is unconditionally left untouched, since nothing this
 /// function does ever names it for removal.
 #[cfg(feature = "io")]
@@ -562,18 +618,23 @@ pub fn uninstall_mod_in(
   let game_profile = eco.require_profile(game)?;
 
   // Before any mutation. `remove_state_payload` below reaches an unreadable
-  // record on its own, but only after `remove_delisted` has already deleted this
-  // mod's folders and before `mods.yml` is rewritten, so the entry would be left
-  // naming files that are gone. Refusing here is what keeps both sides intact.
+  // record on its own, but only after `remove_mod_folders` has already deleted
+  // this mod's folders and before `mods.yml` is rewritten, so the entry would be
+  // left naming files that are gone. Refusing here is what keeps both sides
+  // intact.
   ensure_removable(target_dir, eco, full_name)?;
 
   let mut mods = modlist::read(target_dir)?;
 
+  if modlist::find(&mods, full_name).is_none() {
+    return Err(Error::NotInstalled {
+      package: full_name.to_string(),
+    });
+  }
+
   mods.retain(|m| m.name != full_name);
 
-  let keep: BTreeSet<String> = mods.iter().map(|m| m.name.clone()).collect();
-
-  remove_delisted(game_profile, target_dir, &keep)?;
+  remove_mod_folders(game_profile, target_dir, full_name)?;
   remove_state_payload(target_dir, full_name)?;
 
   modlist::write(target_dir, &mods)
@@ -724,7 +785,7 @@ pub fn disable_mod(
 async fn install_one(
   target_dir: &Path,
   cache_base: &Path,
-  eco: &Ecosystem,
+  eco: &Arc<Ecosystem>,
   index: &PackageIndex,
   client: &ThunderstoreClient,
   game: &str,
@@ -732,7 +793,8 @@ async fn install_one(
   pins: &[String],
   force: bool,
   installed_at_time: u64,
-) -> Result<(Vec<String>, Vec<String>)> {
+  operation: &Operation,
+) -> Result<ClosureOutcome> {
   let resolution = DependencyGraph::new(vec![full_name.to_string()])
     .pins(pins.iter().cloned())
     .resolve_report(index);
@@ -790,18 +852,13 @@ async fn install_one(
     }
   }
 
-  client.download_files(urls.clone()).await?;
+  client.download_files_for(urls.clone(), operation).await?;
 
-  let mut installed = Vec::new();
+  let mut jobs = Vec::with_capacity(urls.len());
 
   for filename in urls.keys() {
     let (pkg_full_name, version_str) = parse_package_filename(filename)
       .ok_or_else(|| Error::Profile(format!("unparseable package filename {filename:?}")))?;
-
-    let archive = downloads.join(filename);
-
-    let extracted =
-      cache::ensure_extracted(cache_base, game, &pkg_full_name, &version_str, &archive)?;
 
     let package = index
       .get_package_by_full_name(&pkg_full_name)
@@ -813,27 +870,185 @@ async fn install_one(
       .iter()
       .find(|v| v.version_number.as_deref() == Some(version_str.as_str()))
       .or_else(|| package.latest_version())
-      .ok_or_else(|| Error::Profile(format!("{pkg_full_name} has no usable version")))?;
+      .ok_or_else(|| Error::Profile(format!("{pkg_full_name} has no usable version")))?
+      .clone();
 
-    install_extracted_in(
-      target_dir,
-      eco,
-      game,
-      &pkg_full_name,
-      &owner,
+    jobs.push(PackageJob {
+      target_dir: target_dir.to_path_buf(),
+      cache_base: cache_base.to_path_buf(),
+      eco: eco.clone(),
+      game: game.to_string(),
+      full_name: pkg_full_name,
+      owner,
       version,
-      &extracted,
-      Some(&archive),
+      version_str,
+      archive: downloads.join(filename),
       installed_at_time,
-    )?;
-
-    installed.push(pkg_full_name);
+      operation: operation.clone(),
+    });
   }
 
-  installed.sort();
-  unchanged.sort();
+  let mut closure = ClosureOutcome {
+    unchanged,
+    ..ClosureOutcome::default()
+  };
 
-  Ok((installed, unchanged))
+  for job in dependencies_first(jobs) {
+    let pkg_full_name = job.full_name.clone();
+
+    if operation.is_cancelled() {
+      closure.cancelled.push(pkg_full_name);
+
+      continue;
+    }
+
+    tokio::task::spawn_blocking(move || job.run())
+      .await
+      .map_err(|e| Error::Install(format!("install task for {pkg_full_name} failed: {e}")))??;
+
+    closure.installed.push(pkg_full_name);
+  }
+
+  closure.installed.sort();
+  closure.unchanged.sort();
+  closure.cancelled.sort();
+
+  Ok(closure)
+}
+
+/// What [`install_one`] did with each package of one dependency closure, each
+/// list sorted.
+#[cfg(feature = "io")]
+#[derive(Debug, Default)]
+struct ClosureOutcome {
+  installed: Vec<String>,
+  unchanged: Vec<String>,
+  cancelled: Vec<String>,
+}
+
+/// `jobs` reordered so each package comes after every package in `jobs` it
+/// depends on, which keeps a cancel between packages from leaving an
+/// installed mod without its dependencies. Ties go by name, and a dependency
+/// cycle is broken at the first package reached.
+#[cfg(feature = "io")]
+fn dependencies_first(mut jobs: Vec<PackageJob>) -> Vec<PackageJob> {
+  jobs.sort_by(|a, b| a.full_name.cmp(&b.full_name));
+
+  let position: HashMap<&str, usize> = jobs
+    .iter()
+    .enumerate()
+    .map(|(at, job)| (job.full_name.as_str(), at))
+    .collect();
+  let requires: Vec<Vec<usize>> = jobs
+    .iter()
+    .map(|job| {
+      job
+        .version
+        .dependencies
+        .iter()
+        .filter_map(|dependency| {
+          position
+            .get(crate::util::full_name_prefix(dependency))
+            .copied()
+        })
+        .collect()
+    })
+    .collect();
+  let mut visited = vec![false; jobs.len()];
+  let mut order = Vec::with_capacity(jobs.len());
+
+  for at in 0..jobs.len() {
+    visit_dependencies_first(at, &requires, &mut visited, &mut order);
+  }
+
+  let mut slots: Vec<Option<PackageJob>> = jobs.into_iter().map(Some).collect();
+
+  order
+    .into_iter()
+    .filter_map(|at| slots[at].take())
+    .collect()
+}
+
+/// Pushes `at` onto `order` after everything it `requires`, depth first.
+#[cfg(feature = "io")]
+fn visit_dependencies_first(
+  at: usize,
+  requires: &[Vec<usize>],
+  visited: &mut [bool],
+  order: &mut Vec<usize>,
+) {
+  if visited[at] {
+    return;
+  }
+
+  visited[at] = true;
+
+  for &dependency in &requires[at] {
+    visit_dependencies_first(dependency, requires, visited, order);
+  }
+
+  order.push(at);
+}
+
+/// The blocking half of installing one downloaded package: extract it into the
+/// package cache, then install it into the target. Owns its inputs so it can
+/// run on the blocking pool.
+#[cfg(feature = "io")]
+struct PackageJob {
+  target_dir: PathBuf,
+  cache_base: PathBuf,
+  eco: Arc<Ecosystem>,
+  game: String,
+  full_name: String,
+  owner: String,
+  version: Version,
+  version_str: String,
+  archive: PathBuf,
+  installed_at_time: u64,
+  operation: Operation,
+}
+
+#[cfg(feature = "io")]
+impl PackageJob {
+  fn run(self) -> Result<()> {
+    let mut extracting = None;
+
+    let extracted = cache::ensure_extracted_reporting(
+      &self.cache_base,
+      &self.game,
+      &self.full_name,
+      &self.version_str,
+      &self.archive,
+      &mut |done, total| self.advance(&mut extracting, Stage::Extracting, done, total),
+    )?;
+
+    drop(extracting);
+
+    let mut installing = None;
+
+    install_extracted_reporting(
+      &self.target_dir,
+      &self.eco,
+      &self.game,
+      &self.full_name,
+      &self.owner,
+      &self.version,
+      &extracted,
+      Some(&self.archive),
+      self.installed_at_time,
+      &mut |done, total| self.advance(&mut installing, Stage::Installing, done, total),
+    )
+  }
+
+  /// Starts `stage` in `slot` on the first call, then reports `done`.
+  fn advance(&self, slot: &mut Option<StageProgress>, stage: Stage, done: u64, total: u64) {
+    let progress =
+      slot.get_or_insert_with(|| self.operation.stage(&self.full_name, stage, Some(total)));
+
+    if done > 0 {
+      progress.advance(done);
+    }
+  }
 }
 
 /// Whether the files `entry` installed at `version` are still in place, judged
@@ -873,11 +1088,15 @@ fn recorded_files_present(
 /// Failures do not abort the batch: each item is attempted and its reason
 /// recorded, because an operation that already installed earlier items has to
 /// say which ones. The disabled-state restore runs regardless, since items
-/// installed before a failure are already enabled. A requested enable that
-/// fails is recorded the same way.
+/// installed before a failure are already enabled. A requested enable or a
+/// disabled-state restore that fails is recorded the same way, as is every one
+/// of them when `mods.yml` cannot be read, so the outcome is kept rather than
+/// replaced by an error.
 ///
 /// A `desired` entry of `Owner-Name-Version` installs exactly that version, and
 /// the pin holds for the rest of the batch.
+///
+/// Reports nothing and cannot be cancelled; see [`install_batch_with`].
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "io")]
 pub async fn install_batch(
@@ -890,13 +1109,100 @@ pub async fn install_batch(
   batch: &InstallBatch,
   installed_at_time: u64,
 ) -> Result<BatchOutcome> {
+  install_batch_with(
+    target_dir,
+    cache_base,
+    eco,
+    index,
+    client,
+    game,
+    batch,
+    installed_at_time,
+    &Operation::default(),
+  )
+  .await
+}
+
+/// [`install_batch`], reporting each package's download, extraction, and
+/// install to `operation`, and stopping once `operation` is cancelled.
+/// Extraction and file copying run on Tokio's blocking pool.
+///
+/// A cancel takes effect before the next package, dependencies included: the
+/// package being installed finishes, and the rest are left alone. Each
+/// identifier's dependencies install before it, so no installed mod is left
+/// without them. The packages and `desired` identifiers not started land in
+/// [`BatchOutcome::cancelled`], and the disabled-state restore still runs.
+/// Downloads for an identifier's closure run together and are not
+/// interrupted. Dropping the future instead skips the restore, and the package
+/// on the blocking pool keeps installing, writing `mods.yml` and its `_state`
+/// file, after the future is gone, so a profile operation started right after
+/// can race it. Cancel through the token and await the future instead.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::path::Path;
+/// use thunderstore_engine::client::ThunderstoreClient;
+/// use thunderstore_engine::ecosystem::Ecosystem;
+/// use thunderstore_engine::profile::{self, modlist};
+/// use thunderstore_engine::progress::{Operation, OperationId};
+///
+/// # async fn run(client: &ThunderstoreClient, target: &Path) -> thunderstore_engine::Result<()> {
+/// let index = client.get_manifest().await?;
+/// let desired = ["Owner-ModA".to_string()];
+/// let batch = profile::plan_install_batch(target, &desired, &desired)?;
+/// let (tx, rx) = std::sync::mpsc::channel();
+/// let operation = Operation::new(OperationId(1)).with_progress(move |event| {
+///   let _ = tx.send(event);
+/// });
+/// let cancel = operation.cancel_token();
+///
+/// let outcome = profile::install_batch_with(
+///   target,
+///   Path::new("/var/cache/my-mod-manager"),
+///   &Ecosystem::bundled(),
+///   &index,
+///   client,
+///   "valheim",
+///   &batch,
+///   modlist::now_millis(),
+///   &operation,
+/// )
+/// .await?;
+///
+/// println!("cancelled: {:?}", outcome.cancelled);
+/// # let _ = (rx, cancel);
+/// # Ok(())
+/// # }
+/// ```
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "io")]
+pub async fn install_batch_with(
+  target_dir: &Path,
+  cache_base: &Path,
+  eco: &Ecosystem,
+  index: &PackageIndex,
+  client: &ThunderstoreClient,
+  game: &str,
+  batch: &InstallBatch,
+  installed_at_time: u64,
+  operation: &Operation,
+) -> Result<BatchOutcome> {
+  let before = modlist::read(target_dir).ok();
+  let shared_eco = Arc::new(eco.clone());
   let mut outcome = BatchOutcome::default();
 
   for full_name in &batch.desired {
+    if operation.is_cancelled() {
+      outcome.cancelled.push(full_name.clone());
+
+      continue;
+    }
+
     match install_one(
       target_dir,
       cache_base,
-      eco,
+      &shared_eco,
       index,
       client,
       game,
@@ -904,21 +1210,25 @@ pub async fn install_batch(
       &batch.desired,
       batch.force,
       installed_at_time,
+      operation,
     )
     .await
     {
-      Ok((installed, unchanged)) => {
-        outcome.succeeded.extend(installed);
-        outcome.unchanged.extend(unchanged);
+      Ok(closure) => {
+        outcome.succeeded.extend(closure.installed);
+        outcome.unchanged.extend(closure.unchanged);
+        outcome.cancelled.extend(closure.cancelled);
       }
       Err(error) => outcome.failed.push((full_name.clone(), error)),
     }
   }
 
-  reapply_batch_disabled(target_dir, eco, game, batch)?;
-
   outcome.succeeded.sort();
   outcome.succeeded.dedup();
+
+  let restore_failures = reapply_each_disabled(target_dir, eco, game, batch, &outcome.succeeded);
+
+  outcome.failed.extend(restore_failures);
   outcome.unchanged.sort();
   outcome.unchanged.dedup();
   outcome
@@ -927,19 +1237,27 @@ pub async fn install_batch(
 
   // A reinstalled mod is already enabled; only one skipped as current can still
   // carry the disabled state the caller asked to clear.
-  let recorded = modlist::read(target_dir)?;
-  let disabled: BTreeSet<&str> = recorded
+  let to_enable = batch
+    .enable_requested
     .iter()
-    .filter(|entry| !entry.enabled)
-    .map(|entry| entry.name.as_str())
-    .collect();
+    .filter(|full_name| outcome.unchanged.binary_search(full_name).is_ok());
 
-  for full_name in &batch.enable_requested {
-    if disabled.contains(full_name.as_str())
-      && outcome.unchanged.binary_search(full_name).is_ok()
-      && let Err(error) = set_enabled_in(target_dir, eco, game, full_name, true)
-    {
-      outcome.failed.push((full_name.clone(), error));
+  match modlist::read(target_dir) {
+    Ok(recorded) => {
+      for full_name in to_enable {
+        if modlist::find(&recorded, full_name).is_some_and(|entry| !entry.enabled)
+          && let Err(error) = set_enabled_in(target_dir, eco, game, full_name, true)
+        {
+          outcome.failed.push((full_name.clone(), error));
+        }
+      }
+    }
+    Err(error) => {
+      let unconfirmed: Vec<_> = to_enable
+        .map(|full_name| (full_name.clone(), error.clone()))
+        .collect();
+
+      outcome.failed.extend(unconfirmed);
     }
   }
 
@@ -948,7 +1266,88 @@ pub async fn install_batch(
 
   outcome.unchanged.retain(|name| !failed.contains(name));
 
+  if let Ok(after) = modlist::read(target_dir) {
+    (outcome.re_enabled, outcome.kept_disabled) = enabled_state_changes(
+      before.as_deref(),
+      &after,
+      &batch.protect_disabled,
+      &outcome.succeeded,
+    );
+  }
+
   Ok(outcome)
+}
+
+/// [`reapply_batch_disabled`] for a batch outcome: every protected mod is
+/// attempted, and each one left enabled comes back with the reason. When
+/// `mods.yml` cannot be read, that is every protected mod in `reinstalled`,
+/// since its install enabled it.
+#[cfg(feature = "io")]
+fn reapply_each_disabled(
+  target_dir: &Path,
+  eco: &Ecosystem,
+  game: &str,
+  batch: &InstallBatch,
+  reinstalled: &[String],
+) -> Vec<(String, Error)> {
+  let recorded = match modlist::read(target_dir) {
+    Ok(recorded) => recorded,
+    Err(error) => {
+      return batch
+        .protect_disabled
+        .iter()
+        .filter(|full_name| reinstalled.contains(full_name))
+        .map(|full_name| (full_name.clone(), error.clone()))
+        .collect();
+    }
+  };
+
+  batch
+    .protect_disabled
+    .iter()
+    .filter(|full_name| modlist::find(&recorded, full_name).is_some())
+    .filter_map(|full_name| {
+      set_enabled_in(target_dir, eco, game, full_name, false)
+        .err()
+        .map(|error| (full_name.clone(), error))
+    })
+    .collect()
+}
+
+/// The recorded mods disabled in `before` and enabled in `after`, and the
+/// `protect_disabled` mods in `reinstalled` that are disabled in `after`, each
+/// sorted. With no `before`, nothing counts as re-enabled.
+#[cfg(feature = "io")]
+fn enabled_state_changes(
+  before: Option<&[ProfileMod]>,
+  after: &[ProfileMod],
+  protect_disabled: &[String],
+  reinstalled: &[String],
+) -> (Vec<String>, Vec<String>) {
+  let disabled_before: BTreeSet<&str> = before
+    .unwrap_or_default()
+    .iter()
+    .filter(|entry| !entry.enabled)
+    .map(|entry| entry.name.as_str())
+    .collect();
+
+  let mut re_enabled: Vec<String> = after
+    .iter()
+    .filter(|entry| entry.enabled && disabled_before.contains(entry.name.as_str()))
+    .map(|entry| entry.name.clone())
+    .collect();
+
+  let mut kept_disabled: Vec<String> = after
+    .iter()
+    .filter(|entry| !entry.enabled)
+    .filter(|entry| protect_disabled.contains(&entry.name) && reinstalled.contains(&entry.name))
+    .map(|entry| entry.name.clone())
+    .collect();
+
+  re_enabled.sort();
+  kept_disabled.sort();
+
+  (re_enabled, kept_disabled)
 }
 
 /// Installs one mod and its dependency closure, protecting the disabled state of
@@ -1119,9 +1518,27 @@ pub struct UninstallBatch {
   pub mods: Vec<String>,
   /// Every recognised mod loader to remove, sorted, removed after `mods`.
   pub loaders: Vec<String>,
-  /// Root-relative mod folders the record does not account for, which the
-  /// reconcile sweep removes along with the named mods.
+  /// Root-relative mod folders the record does not account for.
+  ///
+  /// [`uninstall_batch`] keeps all of them unless the caller calls
+  /// [`UninstallBatch::confirm_untracked`]. With that consent it removes the
+  /// ones still listed here, so a caller shows this list and trims it to the
+  /// folders the user agreed to delete.
   pub untracked: Vec<PathBuf>,
+  untracked_confirmed: bool,
+}
+
+impl UninstallBatch {
+  /// Records that the user agreed to delete the folders in
+  /// [`UninstallBatch::untracked`]. Without this, [`uninstall_batch`] keeps them.
+  pub fn confirm_untracked(&mut self) {
+    self.untracked_confirmed = true;
+  }
+
+  /// Whether [`UninstallBatch::confirm_untracked`] was called.
+  pub fn untracked_confirmed(&self) -> bool {
+    self.untracked_confirmed
+  }
 }
 
 /// Every one of `names` that cannot be removed exactly, with the reason.
@@ -1249,14 +1666,22 @@ pub fn plan_uninstall_batch_from(
     mods,
     loaders,
     untracked,
+    untracked_confirmed: false,
   })
 }
 
 /// Removes everything `batch` names, loaders last, reporting per-item outcomes.
 ///
-/// Each removal re-derives its keep-set from the remaining record, so ordering is
-/// not required for correctness; loaders go last so every intermediate state is
-/// coherent.
+/// Loaders go last so every intermediate state is coherent. Each folder in
+/// [`UninstallBatch::untracked`] is then kept and reported in
+/// [`BatchOutcome::kept_untracked`], unless the caller called
+/// [`UninstallBatch::confirm_untracked`]. With that consent, each listed
+/// folder that is still an untracked mod folder is removed; an untracked
+/// folder the batch does not list is kept, including one that appeared after
+/// planning. A folder that fails to go is reported in [`BatchOutcome::failed`]
+/// under its path.
+///
+/// Reports nothing and cannot be cancelled; see [`uninstall_batch_with`].
 #[cfg(feature = "io")]
 pub fn uninstall_batch(
   target_dir: &Path,
@@ -1264,16 +1689,105 @@ pub fn uninstall_batch(
   game: &str,
   batch: &UninstallBatch,
 ) -> Result<BatchOutcome> {
+  uninstall_batch_with(target_dir, eco, game, batch, &Operation::default())
+}
+
+/// [`uninstall_batch`], reporting each package's [`Stage::Uninstalling`] to
+/// `operation` and stopping once `operation` is cancelled.
+///
+/// A cancel takes effect before the next package: the one being removed
+/// finishes. The packages not started land in [`BatchOutcome::cancelled`], and
+/// so does each confirmed untracked folder, since removing them is the last
+/// step.
+#[cfg(feature = "io")]
+pub fn uninstall_batch_with(
+  target_dir: &Path,
+  eco: &Ecosystem,
+  game: &str,
+  batch: &UninstallBatch,
+  operation: &Operation,
+) -> Result<BatchOutcome> {
   let mut outcome = BatchOutcome::default();
 
   for full_name in batch.mods.iter().chain(batch.loaders.iter()) {
+    if operation.is_cancelled() {
+      outcome.cancelled.push(full_name.clone());
+
+      continue;
+    }
+
+    let _uninstalling = operation.stage(full_name, Stage::Uninstalling, None);
+
     match uninstall_mod_in(target_dir, eco, game, full_name) {
       Ok(()) => outcome.succeeded.push(full_name.clone()),
       Err(error) => outcome.failed.push((full_name.clone(), error)),
     }
   }
 
+  if !batch.untracked_confirmed {
+    outcome.kept_untracked = batch.untracked.clone();
+
+    return Ok(outcome);
+  }
+
+  if batch.untracked.is_empty() {
+    return Ok(outcome);
+  }
+
+  if operation.is_cancelled() {
+    let unswept = batch
+      .untracked
+      .iter()
+      .map(|relative| relative.display().to_string());
+
+    outcome.cancelled.extend(unswept);
+
+    return Ok(outcome);
+  }
+
+  let still_untracked = match still_untracked(target_dir, eco, game) {
+    Ok(still_untracked) => still_untracked,
+    Err(error) => {
+      let unswept = batch
+        .untracked
+        .iter()
+        .map(|relative| (relative.display().to_string(), error.clone()));
+
+      outcome.failed.extend(unswept);
+
+      return Ok(outcome);
+    }
+  };
+
+  for relative in still_untracked {
+    if !batch.untracked.contains(&relative) {
+      continue;
+    }
+
+    let path = target_dir.join(&relative);
+
+    if let Err(error) = std::fs::remove_dir_all(&path) {
+      outcome.failed.push((
+        relative.display().to_string(),
+        crate::util::io_context(format!("removing {}", path.display()), error),
+      ));
+    }
+  }
+
   Ok(outcome)
+}
+
+/// The untracked folders an uninstall sweep may remove now. Re-listed rather
+/// than trusted: [`UninstallBatch::untracked`] is caller-editable, so only a
+/// path the sweep itself would pick can be removed through it.
+#[cfg(feature = "io")]
+fn still_untracked(target_dir: &Path, eco: &Ecosystem, game: &str) -> Result<Vec<PathBuf>> {
+  let keep: BTreeSet<String> = modlist::read(target_dir)?
+    .into_iter()
+    .map(|entry| entry.name)
+    .collect();
+
+  crate::install::plan_delisted(eco.require_profile(game)?, target_dir, &keep)
 }
 
 /// What a bulk enable or disable will do.
@@ -1378,6 +1892,8 @@ pub fn plan_set_enabled_batch_from(
 /// half-applied toggle with nothing reported. Applies `batch.enabled`, the
 /// sense it was planned for, rather than taking its own `enabled` argument, so
 /// the executor cannot disagree with the plan it is executing.
+///
+/// Reports nothing and cannot be cancelled; see [`set_enabled_batch_with`].
 #[cfg(feature = "io")]
 pub fn set_enabled_batch(
   target_dir: &Path,
@@ -1385,9 +1901,39 @@ pub fn set_enabled_batch(
   game: &str,
   batch: &ToggleBatch,
 ) -> Result<BatchOutcome> {
+  set_enabled_batch_with(target_dir, eco, game, batch, &Operation::default())
+}
+
+/// [`set_enabled_batch`], reporting each package's [`Stage::Enabling`] or
+/// [`Stage::Disabling`] to `operation` and stopping once `operation` is
+/// cancelled.
+///
+/// A cancel takes effect before the next package: the one being toggled
+/// finishes. The packages not started land in [`BatchOutcome::cancelled`].
+#[cfg(feature = "io")]
+pub fn set_enabled_batch_with(
+  target_dir: &Path,
+  eco: &Ecosystem,
+  game: &str,
+  batch: &ToggleBatch,
+  operation: &Operation,
+) -> Result<BatchOutcome> {
+  let stage = if batch.enabled {
+    Stage::Enabling
+  } else {
+    Stage::Disabling
+  };
   let mut outcome = BatchOutcome::default();
 
   for full_name in &batch.changing {
+    if operation.is_cancelled() {
+      outcome.cancelled.push(full_name.clone());
+
+      continue;
+    }
+
+    let _toggling = operation.stage(full_name, stage, None);
+
     match set_enabled_in(target_dir, eco, game, full_name, batch.enabled) {
       Ok(()) => outcome.succeeded.push(full_name.clone()),
       Err(error) => outcome.failed.push((full_name.clone(), error)),
@@ -1578,7 +2124,7 @@ mod tests {
     let error = uninstall_mod(base, &eco, "valheim", "Main", "Author-Mod").unwrap_err();
 
     // `remove_state_payload` reaches the same unparseable record on its own, but
-    // only after `remove_delisted` has deleted the folder and before `mods.yml`
+    // only after `remove_mod_folders` has deleted the folder and before `mods.yml`
     // is rewritten, which leaves the entry naming files that are already gone.
     // Refusing up front is what keeps both sides intact.
     assert!(
@@ -1831,7 +2377,9 @@ mod tests {
     // involved: the source is a real file so enable's restore-from-cache
     // copy succeeds, and the dest starts out present so disable's removal is
     // a real effect, not a no-op.
-    let state_source = extracted.path().join("state-source.txt");
+    let state_source = extracted
+      .path()
+      .join("cache/Author-Mod/1.0.0/state-dest.txt");
 
     write_file(&state_source, b"state-data");
     write_file(&target_dir.join("state-dest.txt"), b"state-data");
@@ -1871,9 +2419,10 @@ mod tests {
     uninstall_mod_in(target_dir, &eco, "valheim", "Author-Mod").unwrap();
 
     assert!(!target_dir.join("BepInEx/plugins/Author-Mod").exists());
-    // The `State`-tracked payload lives under a shared route, so `remove_delisted`
-    // never reconciles it — uninstall must remove it from the `_state` record
-    // before discarding that record, or the file would be orphaned untracked.
+    // The `State`-tracked payload lives under a shared route, so
+    // `remove_mod_folders` never removes it. Uninstall must remove it from the
+    // `_state` record before discarding that record, or the file would be
+    // orphaned untracked.
     assert!(!target_dir.join("state-dest.txt").exists());
     assert!(!state_file_path(target_dir, "Author-Mod").exists());
     assert_eq!(modlist::read(target_dir).unwrap().len(), 0);
@@ -2245,6 +2794,189 @@ mod tests {
     assert_eq!(outcome.succeeded, vec!["Author-Mod".to_string()]);
     assert!(modlist::read(&profile_dir).unwrap().is_empty());
     assert!(profile_dir.join("BepInEx/plugins/MMHOOK/h.dll").exists());
+  }
+
+  #[test]
+  fn an_uninstall_batch_keeps_untracked_folders_unless_confirmed() {
+    let eco = Ecosystem::bundled();
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+
+    crate::profile::layout::create(base, "valheim", "Main").unwrap();
+
+    let profile_dir = crate::profile::layout::profile_dir(base, "valheim", "Main");
+    let plugins = profile_dir.join("BepInEx/plugins");
+
+    install_plugin(base, &eco, "Author-Gone");
+    write_file(&plugins.join("Other-ByHand/x.dll"), b"dll");
+
+    let batch = plan_uninstall_batch(&profile_dir, &eco, "valheim", None).unwrap();
+
+    assert_eq!(
+      batch.untracked,
+      vec![PathBuf::from("BepInEx/plugins/Other-ByHand")]
+    );
+
+    let outcome = uninstall_batch(&profile_dir, &eco, "valheim", &batch).unwrap();
+
+    assert!(outcome.is_ok(), "failed: {:?}", outcome.failed);
+    assert_eq!(outcome.succeeded, vec!["Author-Gone".to_string()]);
+    assert!(!plugins.join("Author-Gone").exists());
+    assert!(plugins.join("Other-ByHand/x.dll").exists());
+    assert_eq!(
+      outcome.kept_untracked,
+      vec![PathBuf::from("BepInEx/plugins/Other-ByHand")]
+    );
+  }
+
+  /// Installs a regular mod called `name` with one plugin into `Main`.
+  fn install_plugin(base: &Path, eco: &Ecosystem, name: &str) {
+    let extracted = tempdir().unwrap();
+
+    write_file(&extracted.path().join("plugins/Mod.dll"), b"dll");
+    install_extracted(
+      base,
+      eco,
+      "valheim",
+      "Main",
+      name,
+      "Author",
+      &version(name),
+      extracted.path(),
+      None,
+      1,
+    )
+    .unwrap();
+  }
+
+  #[test]
+  fn an_uninstall_batch_removes_only_the_untracked_folders_it_names() {
+    let eco = Ecosystem::bundled();
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+
+    crate::profile::layout::create(base, "valheim", "Main").unwrap();
+
+    let profile_dir = crate::profile::layout::profile_dir(base, "valheim", "Main");
+    let plugins = profile_dir.join("BepInEx/plugins");
+
+    install_plugin(base, &eco, "Author-Gone");
+    install_plugin(base, &eco, "Author-Kept");
+    write_file(&plugins.join("Other-Confirmed/x.dll"), b"dll");
+    write_file(&plugins.join("Other-Declined/x.dll"), b"dll");
+
+    let mut batch = plan_uninstall_batch(
+      &profile_dir,
+      &eco,
+      "valheim",
+      Some(&["Author-Gone".to_string()]),
+    )
+    .unwrap();
+
+    assert_eq!(
+      batch.untracked,
+      vec![
+        PathBuf::from("BepInEx/plugins/Other-Confirmed"),
+        PathBuf::from("BepInEx/plugins/Other-Declined"),
+      ]
+    );
+
+    batch
+      .untracked
+      .retain(|path| path.ends_with("Other-Confirmed"));
+
+    batch.confirm_untracked();
+
+    // Appeared after planning, so the caller never saw it.
+    write_file(&plugins.join("Other-Late/x.dll"), b"dll");
+
+    let outcome = uninstall_batch(&profile_dir, &eco, "valheim", &batch).unwrap();
+
+    assert!(outcome.is_ok(), "failed: {:?}", outcome.failed);
+    assert!(outcome.kept_untracked.is_empty());
+    assert!(!plugins.join("Author-Gone").exists());
+    assert!(!plugins.join("Other-Confirmed").exists());
+    assert!(plugins.join("Author-Kept/Mod.dll").exists());
+    assert!(plugins.join("Other-Declined/x.dll").exists());
+    assert!(plugins.join("Other-Late/x.dll").exists());
+  }
+
+  #[test]
+  fn a_sweep_that_cannot_reread_the_record_keeps_the_outcome_and_the_folders() {
+    let eco = Ecosystem::bundled();
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+
+    crate::profile::layout::create(base, "valheim", "Main").unwrap();
+
+    let profile_dir = crate::profile::layout::profile_dir(base, "valheim", "Main");
+    let untracked = profile_dir.join("BepInEx/plugins/Other-Confirmed");
+
+    write_file(&untracked.join("x.dll"), b"dll");
+
+    let mut batch = plan_uninstall_batch(&profile_dir, &eco, "valheim", None).unwrap();
+
+    batch.confirm_untracked();
+    write_file(&profile_dir.join("mods.yml"), b"- [unclosed");
+
+    let outcome = uninstall_batch(&profile_dir, &eco, "valheim", &batch).unwrap();
+    let failed: Vec<PathBuf> = outcome
+      .failed
+      .iter()
+      .map(|(name, _)| PathBuf::from(name))
+      .collect();
+
+    assert_eq!(failed, [PathBuf::from("BepInEx/plugins/Other-Confirmed")]);
+    assert!(untracked.join("x.dll").exists());
+  }
+
+  #[test]
+  fn uninstalling_one_mod_leaves_folders_the_record_does_not_name() {
+    let eco = Ecosystem::bundled();
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+
+    crate::profile::layout::create(base, "valheim", "Main").unwrap();
+
+    let profile_dir = crate::profile::layout::profile_dir(base, "valheim", "Main");
+    let plugins = profile_dir.join("BepInEx/plugins");
+
+    install_plugin(base, &eco, "Author-Gone");
+    write_file(&plugins.join("Other-ByHand/x.dll"), b"dll");
+
+    uninstall_mod(base, &eco, "valheim", "Main", "Author-Gone").unwrap();
+
+    assert!(!plugins.join("Author-Gone").exists());
+    assert!(plugins.join("Other-ByHand/x.dll").exists());
+    assert!(modlist::read(&profile_dir).unwrap().is_empty());
+  }
+
+  #[test]
+  fn uninstalling_a_name_the_record_lacks_is_refused_before_anything_is_removed() {
+    let eco = Ecosystem::bundled();
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+
+    crate::profile::layout::create(base, "valheim", "Main").unwrap();
+
+    let profile_dir = crate::profile::layout::profile_dir(base, "valheim", "Main");
+    let plugins = profile_dir.join("BepInEx/plugins");
+
+    install_plugin(base, &eco, "Author-Kept");
+    write_file(&plugins.join("Other-ByHand/x.dll"), b"dll");
+
+    for name in ["Other-ByHand", "author-kept"] {
+      let refused = uninstall_mod(base, &eco, "valheim", "Main", name).unwrap_err();
+
+      assert!(
+        matches!(&refused, Error::NotInstalled { package } if package == name),
+        "got: {refused:?}"
+      );
+    }
+
+    assert!(plugins.join("Other-ByHand/x.dll").exists());
+    assert!(plugins.join("Author-Kept").exists());
+    assert_eq!(modlist::read(&profile_dir).unwrap().len(), 1);
   }
 
   #[test]

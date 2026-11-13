@@ -175,6 +175,9 @@ pub fn read(profile_dir: &Path) -> Result<Vec<ProfileMod>> {
 }
 
 /// Writes `mods` to `<profile_dir>/mods.yml`, creating the directory if needed.
+///
+/// The file is replaced atomically, so a crash mid-write leaves the previous
+/// record whole rather than a truncated one.
 #[cfg(feature = "io")]
 pub fn write(profile_dir: &Path, mods: &[ProfileMod]) -> Result<()> {
   fs::create_dir_all(profile_dir)
@@ -185,7 +188,8 @@ pub fn write(profile_dir: &Path, mods: &[ProfileMod]) -> Result<()> {
 
   let path = profile_dir.join(MODS_YML);
 
-  fs::write(&path, text).map_err(|e| Error::Profile(format!("writing {}: {}", path.display(), e)))
+  crate::util::write_atomic(&path, text.as_bytes())
+    .map_err(|e| Error::Profile(format!("writing {}: {}", path.display(), e)))
 }
 
 /// Finds an installed mod by its `Owner-Name` identifier.
@@ -326,6 +330,59 @@ mod tests {
       }
     );
     assert!(back[0].enabled);
+  }
+
+  /// A write that truncated `mods.yml` in place would show through a handle
+  /// opened before it; a replacing rename leaves that handle on the old file.
+  #[test]
+  #[cfg(all(feature = "io", unix))]
+  fn a_write_replaces_mods_yml_instead_of_truncating_it() {
+    use std::io::Read;
+
+    let dir = tempdir().unwrap();
+
+    write(dir.path(), &[sample()]).unwrap();
+
+    let before = std::fs::read_to_string(dir.path().join(MODS_YML)).unwrap();
+    let mut held = std::fs::File::open(dir.path().join(MODS_YML)).unwrap();
+
+    write(dir.path(), &[]).unwrap();
+
+    let mut seen = String::new();
+
+    held.read_to_string(&mut seen).unwrap();
+
+    assert_eq!(seen, before);
+    assert_eq!(read(dir.path()).unwrap().len(), 0);
+
+    let names: Vec<String> = std::fs::read_dir(dir.path())
+      .unwrap()
+      .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+      .collect();
+
+    assert_eq!(
+      names,
+      vec![MODS_YML.to_string()],
+      "no temp file is left behind"
+    );
+  }
+
+  #[test]
+  #[cfg(feature = "io")]
+  fn a_failed_write_leaves_no_temp_file_behind() {
+    let dir = tempdir().unwrap();
+
+    std::fs::create_dir(dir.path().join(MODS_YML)).unwrap();
+    std::fs::write(dir.path().join(MODS_YML).join("keep"), "").unwrap();
+
+    assert!(write(dir.path(), &[sample()]).is_err());
+
+    let names: Vec<String> = std::fs::read_dir(dir.path())
+      .unwrap()
+      .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+      .collect();
+
+    assert_eq!(names, vec![MODS_YML.to_string()]);
   }
 
   #[test]

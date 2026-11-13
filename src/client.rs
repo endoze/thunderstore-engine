@@ -376,6 +376,28 @@ impl ThunderstoreClient {
     .await
   }
 
+  /// [`download_files`](Self::download_files), also reporting each archive to
+  /// `operation`.
+  pub(crate) async fn download_files_for(
+    &self,
+    urls: HashMap<String, String>,
+    operation: &crate::progress::Operation,
+  ) -> Result<()> {
+    let reporter =
+      crate::progress::OperationDownloads::new(operation.clone(), self.progress.clone());
+
+    download_files(
+      urls,
+      &self.cache_dir,
+      &self.http,
+      self.download_concurrency,
+      self.max_download_bytes,
+      self.retry,
+      Arc::new(reporter),
+    )
+    .await
+  }
+
   /// Uploads a profile-code payload and returns the server-issued key.
   ///
   /// `payload` is sent verbatim as `application/octet-stream`; composing it (the

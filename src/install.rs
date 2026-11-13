@@ -926,11 +926,25 @@ fn collect_routes<F: Fn(&InstallRule) -> bool>(
 /// `root` mid-install.
 #[cfg(feature = "io")]
 pub fn apply_install(plan: &InstallPlan, root: &Path) -> Result<FileManifest> {
+  apply_install_reporting(plan, root, &mut |_, _| {})
+}
+
+/// [`apply_install`], calling `on_progress(done, total)` in plan entries before
+/// each entry and once more after the last.
+#[cfg(feature = "io")]
+pub(crate) fn apply_install_reporting(
+  plan: &InstallPlan,
+  root: &Path,
+  on_progress: &mut dyn FnMut(u64, u64),
+) -> Result<FileManifest> {
   let mut written = Vec::with_capacity(plan.entries.len());
   let mut created: Vec<PathBuf> = Vec::new();
   let mut created_dirs: Vec<PathBuf> = Vec::new();
+  let total = plan.entries.len() as u64;
 
-  for entry in &plan.entries {
+  for (done, entry) in plan.entries.iter().enumerate() {
+    on_progress(done as u64, total);
+
     if let Err(err) = ensure_safe_relative(&entry.dest_relative) {
       rollback_partial_install(&created, &created_dirs);
 
@@ -972,6 +986,8 @@ pub fn apply_install(plan: &InstallPlan, root: &Path) -> Result<FileManifest> {
       }
     }
   }
+
+  on_progress(total, total);
 
   Ok(FileManifest { written })
 }
@@ -1414,7 +1430,7 @@ pub fn plan_suffix_renames(files: &[PathBuf], disable: bool) -> Vec<(PathBuf, Pa
 /// enable). Leaves shared/`none` config and the loader untouched.
 #[cfg(feature = "io")]
 pub fn disable_mod(profile: &GameProfile, profile_dir: &Path, mod_name: &str) -> Result<()> {
-  let tracker = read_state_file(profile_dir, mod_name)?;
+  let tracker = read_safe_state_file(profile_dir, mod_name)?;
 
   toggle_subdir_files(profile, profile_dir, mod_name, true)?;
 
@@ -1424,13 +1440,60 @@ pub fn disable_mod(profile: &GameProfile, profile_dir: &Path, mod_name: &str) ->
 /// Enables an installed mod: strips `.old` from its `Subdir`-tracked files and
 /// restores its `State`-tracked files by copying them back from the cache
 /// sources recorded in the `_state` file.
+///
+/// # Errors
+///
+/// [`Error::Install`] before anything is touched if the `_state` file names a
+/// destination outside `profile_dir`, or a source that is not a file of the
+/// same name in this mod's own package cache (`.../cache/<mod_name>/...`), so a
+/// tampered or imported record cannot copy any other file into the profile.
 #[cfg(feature = "io")]
 pub fn enable_mod(profile: &GameProfile, profile_dir: &Path, mod_name: &str) -> Result<()> {
-  let tracker = read_state_file(profile_dir, mod_name)?;
+  let tracker = read_safe_state_file(profile_dir, mod_name)?;
+
+  for (source, install_rel) in tracker.iter().flat_map(|tracker| &tracker.files) {
+    ensure_cached_source(mod_name, source, install_rel)?;
+  }
 
   toggle_subdir_files(profile, profile_dir, mod_name, false)?;
 
   toggle_state_files(profile_dir, tracker, false)
+}
+
+/// [`read_state_file`], refusing a tracker with any destination outside the
+/// profile so a toggle fails before it moves anything.
+#[cfg(feature = "io")]
+fn read_safe_state_file(profile_dir: &Path, mod_name: &str) -> Result<Option<ModFileTracker>> {
+  let tracker = read_state_file(profile_dir, mod_name)?;
+
+  for (_, install_rel) in tracker.iter().flat_map(|tracker| &tracker.files) {
+    ensure_safe_relative(Path::new(install_rel))?;
+  }
+
+  Ok(tracker)
+}
+
+/// Refuses a `_state` source that installing `mod_name` could not have
+/// recorded: anything but an absolute path, with no `..`, inside
+/// `cache/<mod_name>/`, naming a file called what `install_rel` is called.
+#[cfg(feature = "io")]
+fn ensure_cached_source(mod_name: &str, source: &str, install_rel: &str) -> Result<()> {
+  let path = Path::new(source);
+  let components: Vec<Component> = path.components().collect();
+  let in_own_cache = components
+    .windows(2)
+    .any(|pair| pair[0].as_os_str() == "cache" && pair[1].as_os_str() == mod_name);
+  let same_name =
+    path.file_name().is_some() && path.file_name() == Path::new(install_rel).file_name();
+
+  if path.is_absolute() && !components.contains(&Component::ParentDir) && in_own_cache && same_name
+  {
+    return Ok(());
+  }
+
+  Err(Error::Install(format!(
+    "the state record for {mod_name} restores {install_rel} from {source}, which is not in its package cache"
+  )))
 }
 
 /// Applies the `.old` rename policy to every file under each namespaced route's
@@ -1518,9 +1581,14 @@ fn remove_state_files(profile_dir: &Path, tracker: &ModFileTracker) -> Result<()
 
 /// Copies each `State`-tracked file back from its recorded cache source,
 /// creating any missing destination directories.
+///
+/// Each recorded path is re-validated before use, as [`remove_state_files`]
+/// does, so a tampered entry cannot direct a copy outside the profile root.
 #[cfg(feature = "io")]
 fn restore_state_files(profile_dir: &Path, tracker: &ModFileTracker) -> Result<()> {
   for (source, install_rel) in &tracker.files {
+    ensure_safe_relative(Path::new(install_rel))?;
+
     let dest = profile_dir.join(install_rel);
 
     if let Some(parent) = dest.parent() {
@@ -2657,6 +2725,109 @@ mod tests {
 
   #[test]
   #[cfg(feature = "io")]
+  fn enable_refuses_a_tracker_that_points_outside_the_profile() {
+    let eco = eco();
+    let profile = profile(&eco, "valheim");
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("profile");
+    let source = dir.path().join("cache/payload.dll");
+    let outside = dir.path().join("outside.dll");
+    let absolute = dir.path().join("absolute.dll");
+
+    write(&source, b"payload");
+    write(
+      &root.join("BepInEx/plugins/Author-Evil/plugin.dll.old"),
+      b"dll",
+    );
+
+    for escape in [
+      "../outside.dll".to_string(),
+      absolute.to_string_lossy().to_string(),
+    ] {
+      let tracker = ModFileTracker {
+        mod_name: "Author-Evil".to_string(),
+        files: vec![
+          (
+            source.to_string_lossy().to_string(),
+            "BepInEx/core/ok.dll".to_string(),
+          ),
+          (source.to_string_lossy().to_string(), escape.clone()),
+        ],
+      };
+
+      write_state_file(&root, &tracker).unwrap();
+
+      assert!(
+        enable_mod(&profile, &root, "Author-Evil").is_err(),
+        "{escape:?} must be refused"
+      );
+      assert!(!outside.exists() && !absolute.exists(), "for {escape:?}");
+      // Refused before anything moved, so the mod is still wholly disabled.
+      assert!(!root.join("BepInEx/core/ok.dll").exists(), "for {escape:?}");
+      assert!(
+        root
+          .join("BepInEx/plugins/Author-Evil/plugin.dll.old")
+          .exists(),
+        "for {escape:?}"
+      );
+    }
+  }
+
+  #[test]
+  #[cfg(feature = "io")]
+  fn enable_restores_only_files_from_the_mods_own_package_cache() {
+    let eco = eco();
+    let profile = profile(&eco, "valheim");
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("profile");
+    let cached = dir.path().join("cache/Author-Evil/1.0.0");
+    let secret = dir.path().join("home/.ssh/id_rsa");
+
+    write(&cached.join("ok.dll"), b"payload");
+    write(&cached.join("evil.cfg"), b"imported");
+    write(&secret, b"secret");
+
+    for (source, dest) in [
+      (secret.clone(), "BepInEx/config/id_rsa"),
+      (cached.join("evil.cfg"), "BepInEx/core/evil.dll"),
+      (
+        dir.path().join("cache/Other-Mod/1.0.0/ok.dll"),
+        "BepInEx/core/ok.dll",
+      ),
+    ] {
+      let tracker = ModFileTracker {
+        mod_name: "Author-Evil".to_string(),
+        files: vec![(source.to_string_lossy().to_string(), dest.to_string())],
+      };
+
+      write_state_file(&root, &tracker).unwrap();
+
+      assert!(
+        enable_mod(&profile, &root, "Author-Evil").is_err(),
+        "{source:?} must be refused"
+      );
+      assert!(!root.join(dest).exists(), "for {source:?}");
+    }
+
+    let tracker = ModFileTracker {
+      mod_name: "Author-Evil".to_string(),
+      files: vec![(
+        cached.join("ok.dll").to_string_lossy().to_string(),
+        "BepInEx/core/ok.dll".to_string(),
+      )],
+    };
+
+    write_state_file(&root, &tracker).unwrap();
+    enable_mod(&profile, &root, "Author-Evil").unwrap();
+
+    assert_eq!(
+      fs::read(root.join("BepInEx/core/ok.dll")).unwrap(),
+      b"payload"
+    );
+  }
+
+  #[test]
+  #[cfg(feature = "io")]
   fn state_file_round_trips() {
     let dir = tempdir().unwrap();
     let tracker = ModFileTracker {
@@ -2740,7 +2911,7 @@ mod tests {
 
     // A cached source file and its installed copy under a State route.
     let cache = tempdir().unwrap();
-    let src = cache.path().join("loader.dll");
+    let src = cache.path().join("cache/Author-Loader/1.0.0/loader.dll");
     write(&src, b"loader");
     write(&root.join("BepInEx/core/loader.dll"), b"loader");
 

@@ -14,7 +14,8 @@ be shared across projects.
 
 - **`client`**: async Thunderstore API client with a `zstd` + `bincode`
   package-index cache (per community), keyed by a `Last-Modified` freshness
-  check. UI-agnostic progress via the `progress` traits.
+  check. UI-agnostic progress via the `progress` traits, and per-operation
+  progress events and cancellation via `progress::Operation`.
 - **`models`**: the package/version data model (struct-of-arrays + `lasso`
   string interning) and the on-disk cache wire format.
 - **`resolve`**: dependency-graph resolution over the package index.
@@ -86,6 +87,8 @@ archive library, and keeps what does no IO:
 - the `Error` type, which is `Clone` so a client can keep one in its state;
 - the plan types (`InstallPlan`, `InstallBatch`, `UninstallBatch`,
   `ToggleBatch`, `LaunchPlan`) and the `mods.yml` and export models;
+- profile name validation, `profile::layout::validate_name`, which refuses
+  names Windows cannot hold on every OS and gives the reason as a `BadName`;
 - pure planners that take what the `io` functions would read as arguments:
   `install::plan_install_from` (a package's file list),
   `install::plan_delisted_from`, `profile::plan_install_batch_from`,
@@ -101,7 +104,11 @@ archive library, and keeps what does no IO:
   NSFW and deprecated hidden, community-pinned first, newest update first,
   or `query::SortKey::BestMatch` to rank the closest match to the search
   first), and `query::PackageRow` reads one package's list fields without building
-  its versions.
+  its versions;
+- the per-operation progress and cancel types in `progress` (`Operation`,
+  `OperationId`, `ProgressEvent`, `Stage`, `StageUpdate`, `CancelToken`) and
+  `profile::BatchOutcome`, so a client can store an operation's events and
+  result.
 
 Each `io` function with a pure counterpart reads its inputs and calls that
 counterpart, so the two decide identically. To depend on the pure part only:

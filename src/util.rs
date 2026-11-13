@@ -81,6 +81,48 @@ pub(crate) fn io_context(context: impl std::fmt::Display, err: std::io::Error) -
   Error::from(std::io::Error::new(err.kind(), format!("{context}: {err}")))
 }
 
+/// Replaces `path` with `contents` so a crash leaves either the old file or the
+/// new one, never a truncated one.
+///
+/// Writes a temp file in the same directory, flushes it to disk, then renames
+/// it over `path`. The temp file is removed if any step fails.
+#[cfg(feature = "io")]
+pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+  use std::io::Write;
+  use std::sync::atomic::{AtomicU64, Ordering};
+
+  static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+  let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+  let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+  let tmp = path.with_file_name(format!(".{name}.{}.{seq}.tmp", std::process::id()));
+
+  let written = (|| {
+    let mut file = fs::File::create(&tmp)?;
+
+    file.write_all(contents)?;
+    file.sync_all()?;
+
+    fs::rename(&tmp, path)
+  })();
+
+  if written.is_err() {
+    let _ = fs::remove_file(&tmp);
+
+    return written;
+  }
+
+  // Best effort: makes the rename itself durable on Unix; Windows cannot open
+  // a directory this way.
+  if let Some(parent) = path.parent()
+    && let Ok(dir) = fs::File::open(parent)
+  {
+    let _ = dir.sync_all();
+  }
+
+  Ok(())
+}
+
 /// The `Owner-Name` prefix (the first two hyphen-separated segments) of a
 /// Thunderstore dependency string or package filename.
 ///

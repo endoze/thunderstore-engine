@@ -310,9 +310,12 @@ fn add_zip_file(
 
 /// Writes `target_dir`'s export to `<out_dir>/<profile_name>_<timestamp_millis>.r2z`
 /// and returns the path. `timestamp_millis` is supplied by the caller so the
-/// filename is deterministic and testable. `profile_name` is validated (see
-/// [`crate::profile::layout::validate_name`]) because it becomes part of the
-/// output filename; an unchecked name could otherwise write outside `out_dir`.
+/// filename is deterministic and testable. `profile_name` is refused as
+/// [`BadProfile::InvalidName`](crate::profile::layout::BadProfile::InvalidName)
+/// if it could escape `out_dir`, since it becomes part of the output filename.
+/// It is not held to the stricter
+/// [`crate::profile::layout::validate_name`] rules, so a profile named under
+/// older rules can still be exported.
 #[cfg(feature = "io")]
 pub fn export_to_file_in(
   target_dir: &Path,
@@ -320,7 +323,7 @@ pub fn export_to_file_in(
   out_dir: &Path,
   timestamp_millis: u64,
 ) -> Result<PathBuf> {
-  crate::profile::layout::validate_name(profile_name)?;
+  crate::profile::layout::validate_existing_name(profile_name)?;
 
   let bytes = build_r2z_in(target_dir, profile_name)?;
 
@@ -497,8 +500,9 @@ pub fn read_export(bytes: &[u8]) -> Result<ExportFormat> {
 /// Maps an archive entry name to its target-relative destination, or `None` when
 /// the entry must not be written.
 ///
-/// The manifest and `mods.yml` are skipped (the mod list is applied by installing,
-/// not by copying), a `config/…` entry is re-rooted back under `BepInEx/`, and any
+/// The manifest, `mods.yml`, and `_state/` are skipped (the mod list and its
+/// state records come from installing, not copying; an export never holds
+/// them), a `config/…` entry is re-rooted back under `BepInEx/`, and any
 /// executable extension or unsafe path is refused. Pure — no filesystem access.
 ///
 /// The blocklist check is matched against the name with trailing dots and
@@ -539,6 +543,15 @@ fn import_config_key(name: &str) -> Option<PathBuf> {
       Component::Normal(_) | Component::CurDir => {}
       Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
     }
+  }
+
+  let first = path.components().find_map(|component| match component {
+    Component::Normal(name) => Some(name.to_string_lossy().to_ascii_lowercase()),
+    _ => None,
+  });
+
+  if first.is_some_and(|first| first.trim_end_matches(['.', ' ']) == "_state") {
+    return None;
   }
 
   Some(path)
@@ -740,7 +753,12 @@ pub async fn import_r2z_in(
 
   // Configs are extracted after every install, so an exported per-mod config
   // wins over the package default the install just wrote.
-  extract_configs_in(target_dir, zip_bytes)?;
+  let config_dir = target_dir.to_path_buf();
+  let config_zip = zip_bytes.to_vec();
+
+  tokio::task::spawn_blocking(move || extract_configs_in(&config_dir, &config_zip))
+    .await
+    .map_err(|e| Error::Install(format!("config extraction task failed: {e}")))??;
 
   // `install_batch` already sorts, dedups, and keeps the two lists disjoint.
   Ok(ImportedMods {
@@ -1734,6 +1752,20 @@ mods:
   }
 
   #[test]
+  #[cfg(unix)]
+  fn export_to_file_accepts_a_profile_named_under_the_old_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("profile");
+    let out = dir.path().join("exports");
+
+    crate::profile::modlist::write(&root, &[profile_mod("Author-A", true)]).unwrap();
+
+    let path = export_to_file_in(&root, "v2: test", &out, 1).unwrap();
+
+    assert_eq!(path, out.join("v2: test_1.r2z"));
+  }
+
+  #[test]
   fn encode_profile_payload_prefixes_and_base64s() {
     let payload = encode_profile_payload(b"ABC").unwrap();
 
@@ -1773,6 +1805,8 @@ mods:
     // Manifest and manager state are skipped.
     assert_eq!(import_config_key("export.r2x"), None);
     assert_eq!(import_config_key("mods.yml"), None);
+    assert_eq!(import_config_key("_state/Author-Mod-state.yml"), None);
+    assert_eq!(import_config_key("./_STATE /Author-Mod-state.yml"), None);
     // Executables are refused even inside an otherwise valid path.
     assert_eq!(import_config_key("BepInEx/plugins/evil.dll"), None);
     // Traversal is refused.
