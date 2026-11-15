@@ -164,6 +164,24 @@ impl PackageIndex {
     self.search.get_or_init(|| SearchIndex::new(self))
   }
 
+  /// Builds what a [`BestMatch`](crate::query::SortKey::BestMatch) search
+  /// reads, which otherwise happens on the first such search. Call it on a
+  /// background thread after loading so the first keystroke stays fast. Later
+  /// calls return at once.
+  ///
+  /// ```
+  /// use std::sync::Arc;
+  /// use thunderstore_engine::models::PackageIndex;
+  ///
+  /// let index = Arc::new(PackageIndex::from(Vec::new()));
+  /// let preparing = Arc::clone(&index);
+  ///
+  /// std::thread::spawn(move || preparing.prepare_search()).join().unwrap();
+  /// ```
+  pub fn prepare_search(&self) {
+    self.search_index();
+  }
+
   /// Returns true if the index contains no packages.
   #[allow(dead_code)]
   pub fn is_empty(&self) -> bool {

@@ -239,12 +239,7 @@ pub fn browse(index: &PackageIndex, query: &BrowseQuery) -> Vec<usize> {
   if query.sort == SortKey::BestMatch
     && let Some(needle) = search::Needle::new(query.search)
   {
-    return search::rank(
-      index,
-      &needle,
-      query.direction,
-      (0..index.len()).filter(shown),
-    );
+    return search::rank(index, &needle, query.direction, |idx| shown(&idx));
   }
 
   let search = match query.sort {

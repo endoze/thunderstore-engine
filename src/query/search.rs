@@ -2,6 +2,8 @@
 
 use super::{PackageRow, SortDirection};
 use crate::models::PackageIndex;
+use memchr::memmem::Finder;
+use std::fmt;
 
 /// How well a package matches a search, best first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -27,6 +29,10 @@ enum Tier {
   Typo,
 }
 
+impl Tier {
+  const COUNT: usize = Tier::Typo as usize + 1;
+}
+
 /// Words shorter than this never match by typo: one edit to a short word
 /// reaches too many unrelated names.
 const MIN_TYPO_LEN: usize = 5;
@@ -36,85 +42,457 @@ const MIN_TYPO_LEN: usize = 5;
 /// passes one with a few more downloads but not one with many times more.
 const RATING_WEIGHT: f64 = 0.25;
 
+/// Ends every field in a [`SearchIndex`] buffer. Search words hold only
+/// letters and digits, so a word found in a buffer never runs across two
+/// fields.
+const FIELD_END: char = '\n';
+
 /// A search split into the forms packages are compared in.
 #[derive(Debug)]
 pub(super) struct Needle {
-  words: Vec<String>,
   squashed: String,
+  ends: Vec<u32>,
+  /// A finder for each word, in order.
+  finders: Vec<Finder<'static>>,
+  /// What a name or owner needs to be a typo of this search, when the search
+  /// is long enough to match by typo.
+  typo: Option<TypoAnchors>,
 }
 
 impl Needle {
   /// The needle for `search`, or `None` when it has no letters or digits.
   pub(super) fn new(search: &str) -> Option<Self> {
-    let words = fold_words(search);
-    let squashed = words.concat();
+    let mut squashed = String::new();
+    let mut ends = Vec::new();
 
-    (!words.is_empty()).then_some(Self { words, squashed })
+    fold_into(search, &mut squashed, &mut ends);
+
+    if ends.is_empty() {
+      return None;
+    }
+
+    let words = Words::new(&squashed, &ends);
+    let finders = words
+      .clone()
+      .map(|word| Finder::new(word).into_owned())
+      .collect();
+    let typo = Anchors::new(&squashed).map(|query| {
+      let first = words.clone().next().unwrap_or_default();
+      let first_word = match Anchors::new(first) {
+        Some(anchors) => FirstWord::Anchors(anchors),
+        None => FirstWord::Prefix(first.to_string()),
+      };
+
+      TypoAnchors { query, first_word }
+    });
+
+    Some(Self {
+      squashed,
+      ends,
+      finders,
+      typo,
+    })
+  }
+
+  fn words(&self) -> Words<'_> {
+    Words::new(&self.squashed, &self.ends)
   }
 }
 
-/// Every package's searchable text, folded once per index so a search on each
-/// keystroke only compares.
-#[derive(Debug, Clone)]
+/// What a package's name or owner needs before it is worth checking for a
+/// typo of a search: the search's anchors at the start of the name or owner,
+/// or the first search word's at the start of a name word.
+#[derive(Debug)]
+struct TypoAnchors {
+  query: Anchors,
+  first_word: FirstWord,
+}
+
+/// What a name word needs to match the first search word by typo.
+#[derive(Debug)]
+enum FirstWord {
+  /// The word is long enough for a typo, so the name word needs its anchors.
+  Anchors(Anchors),
+  /// The word is too short for a typo, so the name word has to start with it.
+  Prefix(String),
+}
+
+impl FirstWord {
+  fn fits(&self, text: &str) -> bool {
+    match self {
+      FirstWord::Anchors(anchors) => anchors.fit(text),
+      FirstWord::Prefix(word) => text.starts_with(word.as_str()),
+    }
+  }
+}
+
+/// The two pieces of a typed word that a typo keeps. Cutting the word at
+/// [`anchor_split`], one edit past the cut leaves the `head` before it at the
+/// start, and one edit before the cut leaves the `tail` after it in place,
+/// shifted by at most one, so text holding neither is no typo of the word.
+#[derive(Debug)]
+struct Anchors {
+  head: String,
+  tail: String,
+  /// Where the tail sits in the typed word, less one: the head's length.
+  split: usize,
+}
+
+impl Anchors {
+  /// The anchors of `typed`, or `None` when it is too short to match by typo.
+  fn new(typed: &str) -> Option<Self> {
+    let len = typed.chars().count();
+    let split = anchor_split(len);
+    let at = |nth: usize| {
+      typed
+        .char_indices()
+        .nth(nth)
+        .map_or(typed.len(), |(at, _)| at)
+    };
+
+    (len >= MIN_TYPO_LEN).then(|| Self {
+      head: typed[..at(split)].to_string(),
+      tail: typed[at(split + 1)..].to_string(),
+      split,
+    })
+  }
+
+  /// Whether ASCII `text` keeps either anchor where one edit would leave it.
+  fn fit(&self, text: &str) -> bool {
+    let text = text.as_bytes();
+    let tail = self.tail.as_bytes();
+
+    text.starts_with(self.head.as_bytes())
+      || (self.split..=self.split + 2).any(|at| text.get(at..at + tail.len()) == Some(tail))
+  }
+}
+
+/// Where [`Anchors`] cut a typed word of `len` characters: near the middle,
+/// so both pieces are long enough to rule most text out.
+fn anchor_split(len: usize) -> usize {
+  len.saturating_sub(1) / 2
+}
+
+/// Every package's searchable text, folded once per index into two buffers so
+/// a search on each keystroke scans them instead of visiting each package.
+#[derive(Clone)]
 pub(crate) struct SearchIndex {
-  entries: Vec<Entry>,
+  /// Each package's folded name and folded owner, each followed by
+  /// [`FIELD_END`], one package after another in index order.
+  names: String,
+  /// Each package's lowercased description followed by [`FIELD_END`], one
+  /// package after another in index order.
+  descriptions: String,
+  /// Where each word of a folded name or owner ends, counted from the start of
+  /// that field.
+  word_ends: Vec<u32>,
+  /// Where each package's fields sit in the buffers and `word_ends`.
+  bounds: Vec<Bounds>,
+  /// Package indices from most to least popular, equal ones in index order.
+  most_popular: Vec<u32>,
+  /// Package indices from least to most popular, equal ones in index order.
+  least_popular: Vec<u32>,
+}
+
+/// Where one package's fields start in [`SearchIndex::names`],
+/// [`SearchIndex::descriptions`], and [`SearchIndex::word_ends`]. Each text
+/// field ends just before the [`FIELD_END`] in front of the next start.
+#[derive(Debug, Clone, Copy)]
+struct Bounds {
+  name: u32,
+  owner: u32,
+  names_end: u32,
+  description: u32,
+  description_end: u32,
+  name_words: u32,
+  owner_words: u32,
+  words_end: u32,
+  /// Whether the folded name and owner are ASCII, so a character's position
+  /// in them is its byte position.
+  ascii: bool,
 }
 
 impl SearchIndex {
   pub(crate) fn new(index: &PackageIndex) -> Self {
-    Self {
-      entries: (0..index.len())
-        .map(|idx| Entry::new(PackageRow { index, idx }))
-        .collect(),
+    let mut names = String::new();
+    let mut descriptions = String::new();
+    let mut word_ends = Vec::new();
+    let mut bounds = Vec::with_capacity(index.len());
+    let mut popularity = Vec::with_capacity(index.len());
+
+    for idx in 0..index.len() {
+      let row = PackageRow { index, idx };
+      let name = (offset(names.len()), offset(word_ends.len()));
+
+      fold_into(row.name().unwrap_or_default(), &mut names, &mut word_ends);
+      names.push(FIELD_END);
+
+      let owner = (offset(names.len()), offset(word_ends.len()));
+
+      fold_into(row.owner().unwrap_or_default(), &mut names, &mut word_ends);
+      names.push(FIELD_END);
+
+      let description = offset(descriptions.len());
+
+      push_lowercase(row.description().unwrap_or_default(), &mut descriptions);
+      descriptions.push(FIELD_END);
+      bounds.push(Bounds {
+        name: name.0,
+        owner: owner.0,
+        names_end: offset(names.len()),
+        description,
+        description_end: offset(descriptions.len()),
+        name_words: name.1,
+        owner_words: owner.1,
+        words_end: offset(word_ends.len()),
+        ascii: names[name.0 as usize..].is_ascii(),
+      });
+      popularity.push(
+        (1.0 + row.downloads() as f64).ln() + RATING_WEIGHT * (1.0 + f64::from(row.rating())).ln(),
+      );
     }
+
+    let mut most_popular: Vec<u32> = (0..offset(index.len())).collect();
+
+    most_popular.sort_by(|&a, &b| popularity[b as usize].total_cmp(&popularity[a as usize]));
+
+    let mut least_popular: Vec<u32> = most_popular.iter().rev().copied().collect();
+
+    least_popular
+      .chunk_by_mut(|&a, &b| popularity[a as usize] == popularity[b as usize])
+      .for_each(<[u32]>::reverse);
+    names.shrink_to_fit();
+    descriptions.shrink_to_fit();
+    word_ends.shrink_to_fit();
+
+    Self {
+      names,
+      descriptions,
+      word_ends,
+      bounds,
+      most_popular,
+      least_popular,
+    }
+  }
+
+  /// The package at `idx`, read in place.
+  fn entry(&self, idx: usize) -> EntryRef<'_> {
+    let bounds = self.bounds[idx];
+    let name = |start: u32, next: u32| &self.names[start as usize..next as usize - 1];
+    let ends = |start: u32, next: u32| &self.word_ends[start as usize..next as usize];
+
+    EntryRef {
+      name: FoldedRef {
+        squashed: name(bounds.name, bounds.owner),
+        ends: ends(bounds.name_words, bounds.owner_words),
+      },
+      owner: FoldedRef {
+        squashed: name(bounds.owner, bounds.names_end),
+        ends: ends(bounds.owner_words, bounds.words_end),
+      },
+      description: &self.descriptions
+        [bounds.description as usize..bounds.description_end as usize - 1],
+      ascii: bounds.ascii,
+    }
+  }
+
+  /// Whether each package has every word of `needle` somewhere in its name,
+  /// owner, or description, found by scanning both buffers once per word.
+  fn has_every_word(&self, needle: &Needle) -> Vec<bool> {
+    let mut found = vec![0_usize; self.bounds.len()];
+    let mut words = 0;
+
+    for finder in &needle.finders {
+      let in_names = self.packages_containing(&self.names, |bounds| bounds.names_end, finder);
+      let in_descriptions =
+        self.packages_containing(&self.descriptions, |bounds| bounds.description_end, finder);
+
+      for idx in in_names.chain(in_descriptions) {
+        if found[idx] == words {
+          found[idx] += 1;
+        }
+      }
+
+      words += 1;
+    }
+
+    found.into_iter().map(|count| count == words).collect()
+  }
+
+  /// Whether the package at `idx` has an owner and name as long together as
+  /// `needle`, which a pasted `Owner-Name` needs.
+  fn could_be_full_name(&self, idx: usize, needle: &Needle) -> bool {
+    let bounds = self.bounds[idx];
+
+    (bounds.names_end - bounds.name - 2) as usize == needle.squashed.len()
+  }
+
+  /// Whether each package's name or owner holds one of the [`Anchors`] a typo
+  /// of `needle` keeps, or `None` when the needle is too short to match by
+  /// typo.
+  fn could_be_typo(&self, needle: &Needle) -> Option<Vec<bool>> {
+    let anchors = needle.typo.as_ref()?;
+    let mut patterns = vec![anchors.query.head.as_str(), anchors.query.tail.as_str()];
+    let mut could = vec![false; self.bounds.len()];
+
+    match &anchors.first_word {
+      FirstWord::Anchors(first) => patterns.extend([first.head.as_str(), first.tail.as_str()]),
+      FirstWord::Prefix(word) => patterns.push(word),
+    }
+
+    patterns.sort_unstable();
+    patterns.dedup();
+
+    for pattern in patterns {
+      let finder = Finder::new(pattern);
+
+      for idx in self.packages_containing(&self.names, |bounds| bounds.names_end, &finder) {
+        could[idx] = true;
+      }
+    }
+
+    Some(could)
+  }
+
+  /// The index of each package whose part of `text` contains what `finder`
+  /// looks for. `end` reads where a package's part of `text` ends.
+  fn packages_containing<'s>(
+    &'s self,
+    text: &'s str,
+    end: impl Fn(&Bounds) -> u32 + 's,
+    finder: &'s Finder<'s>,
+  ) -> impl Iterator<Item = usize> + 's {
+    let text = text.as_bytes();
+    let mut idx = 0;
+    let mut from = 0;
+
+    std::iter::from_fn(move || {
+      let at = from + finder.find(&text[from..])?;
+
+      while end(&self.bounds[idx]) as usize <= at {
+        idx += 1;
+      }
+
+      from = end(&self.bounds[idx]) as usize;
+
+      Some(idx)
+    })
   }
 }
 
-/// A package's searchable text, folded once.
-#[derive(Debug, Clone)]
-struct Entry {
-  name: Folded,
-  owner: Folded,
-  description: String,
-  popularity: f64,
+impl fmt::Debug for SearchIndex {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_list()
+      .entries((0..self.bounds.len()).map(|idx| self.entry(idx)))
+      .finish()
+  }
 }
 
-/// Text folded into lowercase words and the same words joined.
-#[derive(Debug, Clone)]
-struct Folded {
-  words: Vec<String>,
-  squashed: String,
+/// A byte position in the search text as stored.
+///
+/// # Panics
+///
+/// When the folded text of an index passes 4 GiB.
+fn offset(at: usize) -> u32 {
+  u32::try_from(at).expect("search text fits in 4 GiB")
 }
 
-impl Folded {
-  fn new(text: &str) -> Self {
-    let words = fold_words(text);
-    let squashed = words.concat();
+/// One package's searchable text, borrowed from a [`SearchIndex`].
+#[derive(Debug, Clone, Copy)]
+struct EntryRef<'a> {
+  name: FoldedRef<'a>,
+  owner: FoldedRef<'a>,
+  description: &'a str,
+  /// Whether the name and owner are ASCII.
+  ascii: bool,
+}
 
-    Self { words, squashed }
+/// Text folded into lowercase words run together, and where each word ends.
+#[derive(Clone, Copy)]
+struct FoldedRef<'a> {
+  squashed: &'a str,
+  ends: &'a [u32],
+}
+
+impl<'a> FoldedRef<'a> {
+  fn words(self) -> Words<'a> {
+    Words::new(self.squashed, self.ends)
+  }
+
+  /// The text from the start of each word to the end.
+  fn word_starts(self) -> impl Iterator<Item = &'a str> {
+    let starts = std::iter::once(0).chain(self.ends.iter().map(|&end| end as usize));
+
+    starts
+      .take(self.ends.len())
+      .map(move |start| &self.squashed[start..])
   }
 
   /// Whether `word` is one of the words, or all of them run together.
-  fn has_word(&self, word: &str) -> bool {
-    self.squashed == word || self.words.iter().any(|own| own == word)
+  fn has_word(self, word: &str) -> bool {
+    self.squashed == word || self.words().any(|own| own == word)
   }
 }
 
-impl Entry {
-  fn new(row: PackageRow) -> Self {
+impl fmt::Debug for FoldedRef<'_> {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_list().entries(self.words()).finish()
+  }
+}
+
+/// The words of folded text, cut at their recorded ends.
+#[derive(Clone)]
+struct Words<'a> {
+  squashed: &'a str,
+  ends: std::slice::Iter<'a, u32>,
+  start: usize,
+}
+
+impl<'a> Words<'a> {
+  fn new(squashed: &'a str, ends: &'a [u32]) -> Self {
     Self {
-      name: Folded::new(row.name().unwrap_or_default()),
-      owner: Folded::new(row.owner().unwrap_or_default()),
-      description: row.description().unwrap_or_default().to_lowercase(),
-      popularity: (1.0 + row.downloads() as f64).ln()
-        + RATING_WEIGHT * (1.0 + f64::from(row.rating())).ln(),
+      squashed,
+      ends: ends.iter(),
+      start: 0,
     }
   }
+}
 
-  fn tier(&self, needle: &Needle) -> Option<Tier> {
+impl<'a> Iterator for Words<'a> {
+  type Item = &'a str;
+
+  fn next(&mut self) -> Option<&'a str> {
+    let end = *self.ends.next()? as usize;
+    let word = &self.squashed[self.start..end];
+
+    self.start = end;
+
+    Some(word)
+  }
+}
+
+impl EntryRef<'_> {
+  /// How well this package matches `needle`, given whether it has every
+  /// needle word somewhere in its text and whether its name or owner passed
+  /// [`SearchIndex::could_be_typo`]. Every tier but
+  /// [`ExactFullName`](Tier::ExactFullName) and [`Typo`](Tier::Typo) needs
+  /// every word, so a package without them skips straight to those two.
+  fn tier(self, needle: &Needle, has_every_word: bool, could_be_typo: bool) -> Option<Tier> {
     let query = needle.squashed.as_str();
-    let name = &self.name;
-    let every_word = |matches: &dyn Fn(&str) -> bool| needle.words.iter().all(|word| matches(word));
+    let name = self.name;
+    let every_word = |matches: &dyn Fn(&str) -> bool| needle.words().all(matches);
+
+    if !has_every_word {
+      let tier = if self.is_full_name(query) {
+        Tier::ExactFullName
+      } else if could_be_typo && self.is_typo(needle) {
+        Tier::Typo
+      } else {
+        return None;
+      };
+
+      return Some(tier);
+    }
 
     let tier = if name.squashed == query {
       Tier::ExactName
@@ -122,34 +500,18 @@ impl Entry {
       Tier::ExactFullName
     } else if name.squashed.starts_with(query) {
       Tier::NamePrefix
-    } else if every_word(&|word| name.words.iter().any(|own| own.starts_with(word))) {
+    } else if every_word(&|word| name.words().any(|own| own.starts_with(word))) {
       Tier::NameWords
     } else if name.squashed.contains(query) {
       Tier::NameSubstring
     } else if self.owner.squashed.starts_with(query) {
       Tier::Owner
-    } else if every_word(&|word| {
-      name.has_word(word) || self.owner.has_word(word) || contains_word(&self.description, word)
+    } else if needle.words().zip(&needle.finders).all(|(word, finder)| {
+      name.has_word(word) || self.owner.has_word(word) || contains_word(self.description, finder)
     }) {
       Tier::WholeWords
-    } else if every_word(&|word| {
-      name.squashed.contains(word)
-        || self.owner.squashed.contains(word)
-        || self.description.contains(word)
-    }) {
-      Tier::Substrings
-    } else if is_typo_of_start(query, &name.squashed)
-      || is_typo_of_start(query, &self.owner.squashed)
-      || every_word(&|word| {
-        name
-          .words
-          .iter()
-          .any(|own| own.starts_with(word) || is_typo_of_start(word, own))
-      })
-    {
-      Tier::Typo
     } else {
-      return None;
+      Tier::Substrings
     };
 
     Some(tier)
@@ -157,42 +519,82 @@ impl Entry {
 
   /// Whether `squashed` is this package's owner and name run together, as a
   /// pasted `Owner-Name` folds to.
-  fn is_full_name(&self, squashed: &str) -> bool {
+  fn is_full_name(self, squashed: &str) -> bool {
     squashed.len() == self.owner.squashed.len() + self.name.squashed.len()
-      && squashed.starts_with(self.owner.squashed.as_str())
-      && squashed.ends_with(self.name.squashed.as_str())
+      && squashed.starts_with(self.owner.squashed)
+      && squashed.ends_with(self.name.squashed)
+  }
+
+  /// Whether `needle` is one typo from the start of the name or owner, or
+  /// each of its words starts a word of the name or is one typo from it.
+  fn is_typo(self, needle: &Needle) -> bool {
+    let Some(anchors) = &needle.typo else {
+      return false;
+    };
+
+    if self.ascii
+      && !anchors.query.fit(self.name.squashed)
+      && !anchors.query.fit(self.owner.squashed)
+      && !self
+        .name
+        .word_starts()
+        .any(|start| anchors.first_word.fits(start))
+    {
+      return false;
+    }
+
+    let query = needle.squashed.as_str();
+
+    is_typo_of_start(query, self.name.squashed)
+      || is_typo_of_start(query, self.owner.squashed)
+      || needle.words().all(|word| {
+        self
+          .name
+          .words()
+          .any(|own| own.starts_with(word) || is_typo_of_start(word, own))
+      })
   }
 }
 
-/// The packages among `candidates` that match `needle`, best match first in
-/// [`Descending`](SortDirection::Descending) order.
+/// The packages that `shown` keeps and that match `needle`, best match first
+/// in [`Descending`](SortDirection::Descending) order. Equal matches go by
+/// popularity, then index order.
 pub(super) fn rank(
   index: &PackageIndex,
   needle: &Needle,
   direction: SortDirection,
-  candidates: impl Iterator<Item = usize>,
+  shown: impl Fn(usize) -> bool,
 ) -> Vec<usize> {
-  let entries = &index.search_index().entries;
-  let mut ranked: Vec<(Tier, f64, usize)> = candidates
-    .filter_map(|idx| {
-      let entry = &entries[idx];
+  let search = index.search_index();
+  let has_every_word = search.has_every_word(needle);
+  let could_be_typo = search.could_be_typo(needle);
+  let order = match direction {
+    SortDirection::Descending => &search.most_popular,
+    SortDirection::Ascending => &search.least_popular,
+  };
+  let mut tiers: [Vec<usize>; Tier::COUNT] = Default::default();
 
-      Some((entry.tier(needle)?, entry.popularity, idx))
-    })
-    .collect();
+  for idx in order.iter().map(|&idx| idx as usize) {
+    let has_every_word = has_every_word[idx];
+    let could_be_typo = could_be_typo.as_ref().is_some_and(|could| could[idx]);
 
-  ranked.sort_by(|(a_tier, a_popularity, _), (b_tier, b_popularity, _)| {
-    let best_first = a_tier
-      .cmp(b_tier)
-      .then_with(|| b_popularity.total_cmp(a_popularity));
-
-    match direction {
-      SortDirection::Descending => best_first,
-      SortDirection::Ascending => best_first.reverse(),
+    if !has_every_word && !could_be_typo && !search.could_be_full_name(idx, needle) {
+      continue;
     }
-  });
 
-  ranked.into_iter().map(|(_, _, idx)| idx).collect()
+    if let Some(tier) = search
+      .entry(idx)
+      .tier(needle, has_every_word, could_be_typo)
+      && shown(idx)
+    {
+      tiers[tier as usize].push(idx);
+    }
+  }
+
+  match direction {
+    SortDirection::Descending => tiers.into_iter().flatten().collect(),
+    SortDirection::Ascending => tiers.into_iter().rev().flatten().collect(),
+  }
 }
 
 /// Whether `typed` is at least [`MIN_TYPO_LEN`] characters and one insertion,
@@ -217,6 +619,15 @@ fn is_typo_of_start(typed: &str, meant: &str) -> bool {
 /// Whether some prefix of `text` is within one edit of `typed`.
 fn starts_within_one_edit<T: PartialEq>(typed: &[T], text: &[T]) -> bool {
   let len = typed.len();
+
+  let split = anchor_split(len);
+
+  if let (Some(head), Some(tail)) = (typed.get(..split), typed.get(split + 1..))
+    && !text.starts_with(head)
+    && !(split..=split + 2).any(|at| text.get(at..at + tail.len()) == Some(tail))
+  {
+    return false;
+  }
 
   (len.saturating_sub(1)..=len + 1)
     .any(|prefix| prefix <= text.len() && within_one_edit(typed, &text[..prefix]))
@@ -250,46 +661,68 @@ fn within_one_edit<T: PartialEq>(a: &[T], b: &[T]) -> bool {
   substituted || swapped
 }
 
-/// Whether `word` occurs in `text` with no letter or digit on either side.
-fn contains_word(text: &str, word: &str) -> bool {
-  text.match_indices(word).any(|(at, _)| {
+/// Whether the word `finder` looks for occurs in `text` with no letter or
+/// digit on either side.
+fn contains_word(text: &str, finder: &Finder) -> bool {
+  let len = finder.needle().len();
+
+  finder.find_iter(text.as_bytes()).any(|at| {
     let before = text[..at].chars().next_back();
-    let after = text[at + word.len()..].chars().next();
+    let after = text[at + len..].chars().next();
 
     !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
   })
 }
 
-/// Splits `text` into lowercase words, breaking at every character that is
-/// not a letter or digit and at camelCase boundaries (`BepInExPack` is `bep`,
-/// `in`, `ex`, `pack`; `UIFixes` is `ui`, `fixes`).
-fn fold_words(text: &str) -> Vec<String> {
-  let chars: Vec<char> = text.chars().collect();
-  let mut words = Vec::new();
-  let mut word = String::new();
+/// Appends `text` to `out` folded into lowercase letters and digits, and the
+/// end of each word, counted from where `out` ended, to `ends`. Words break
+/// at every character that is not a letter or digit and at camelCase
+/// boundaries (`BepInExPack` is `bep`, `in`, `ex`, `pack`; `UIFixes` is `ui`,
+/// `fixes`).
+fn fold_into(text: &str, out: &mut String, ends: &mut Vec<u32>) {
+  let start = out.len();
+  let mut chars = text.chars().peekable();
+  let mut prev = None;
+  let mut in_word = false;
 
-  for (at, &c) in chars.iter().enumerate() {
-    let prev = at.checked_sub(1).map(|prev| chars[prev]);
-    let next = chars.get(at + 1);
+  while let Some(c) = chars.next() {
+    let next = chars.peek().copied();
     let camel_break = c.is_uppercase()
-      && prev.is_some_and(|prev| {
-        prev.is_lowercase() || (prev.is_uppercase() && next.is_some_and(|next| next.is_lowercase()))
+      && prev.is_some_and(|prev: char| {
+        prev.is_lowercase() || (prev.is_uppercase() && next.is_some_and(char::is_lowercase))
       });
 
-    if (!c.is_alphanumeric() || camel_break) && !word.is_empty() {
-      words.push(std::mem::take(&mut word));
+    if (!c.is_alphanumeric() || camel_break) && in_word {
+      ends.push(offset(out.len() - start));
+      in_word = false;
     }
 
     if c.is_alphanumeric() {
-      word.extend(c.to_lowercase());
+      out.extend(c.to_lowercase());
+      in_word = true;
     }
+
+    prev = Some(c);
   }
 
-  if !word.is_empty() {
-    words.push(word);
+  if in_word {
+    ends.push(offset(out.len() - start));
+  }
+}
+
+/// Appends `text` to `out` in lowercase, character by character, as search
+/// words are.
+fn push_lowercase(text: &str, out: &mut String) {
+  if text.is_ascii() {
+    let start = out.len();
+
+    out.push_str(text);
+    out[start..].make_ascii_lowercase();
+
+    return;
   }
 
-  words
+  out.extend(text.chars().flat_map(char::to_lowercase));
 }
 
 #[cfg(test)]
@@ -497,6 +930,66 @@ mod tests {
       best(&index, "jotunn"),
       ["Downloaded-Jotunn", "Rated-Jotunn", "Unrated-Jotunn"]
     );
+  }
+
+  #[test]
+  fn best_match_keeps_index_order_between_equal_matches_in_either_direction() {
+    let index: PackageIndex = vec![
+      listed("First-Jotunn", 0, 10, ""),
+      listed("Second-Jotunn", 0, 10, ""),
+      listed("Popular-Jotunn", 0, 900, ""),
+    ]
+    .into();
+    let ascending = BrowseQuery::new()
+      .search("jotunn")
+      .sort(SortKey::BestMatch, SortDirection::Ascending);
+
+    assert_eq!(
+      best(&index, "jotunn"),
+      ["Popular-Jotunn", "First-Jotunn", "Second-Jotunn"]
+    );
+    assert_eq!(
+      browse_names(&index, &ascending),
+      ["First-Jotunn", "Second-Jotunn", "Popular-Jotunn"]
+    );
+  }
+
+  #[test]
+  fn best_match_finds_a_full_name_pasted_without_its_separator() {
+    let index: PackageIndex = vec![
+      listed("Fan-ValheimModdingJotunnAddon", 0, 900, ""),
+      listed("ValheimModding-Jotunn", 0, 1, ""),
+    ]
+    .into();
+
+    assert_eq!(
+      best(&index, "valheimmoddingjotunn"),
+      ["ValheimModding-Jotunn", "Fan-ValheimModdingJotunnAddon"]
+    );
+  }
+
+  #[test]
+  fn best_match_compares_text_that_grows_when_lowercased() {
+    let index: PackageIndex = vec![
+      listed("Owner1-Helper", 0, 900, "İİ Mod helper for Ünïcode"),
+      listed("Owner2-İstanbulMod", 0, 1, ""),
+    ]
+    .into();
+
+    assert_eq!(best(&index, "mod"), ["Owner2-İstanbulMod", "Owner1-Helper"]);
+    assert_eq!(best(&index, "ünïcode"), ["Owner1-Helper"]);
+    assert_eq!(best(&index, "stanbul"), ["Owner2-İstanbulMod"]);
+  }
+
+  #[test]
+  fn prepare_search_builds_the_search_on_another_thread() {
+    let index: PackageIndex = vec![listed("ValheimModding-Jotunn", 0, 1, "")].into();
+
+    std::thread::scope(|scope| {
+      scope.spawn(|| index.prepare_search());
+    });
+
+    assert_eq!(best(&index, "jotunn"), ["ValheimModding-Jotunn"]);
   }
 
   #[test]

@@ -105,7 +105,8 @@ archive library, and keeps what does no IO:
   NSFW and deprecated hidden, community-pinned first, newest update first,
   or `query::SortKey::BestMatch` to rank the closest match to the search
   first), and `query::PackageRow` reads one package's list fields without building
-  its versions;
+  its versions; `models::PackageIndex::prepare_search` builds what a best-match
+  search reads ahead of the first one, for a background thread after loading;
 - the per-operation progress and cancel types in `progress` (`Operation`,
   `OperationId`, `ProgressEvent`, `Stage`, `StageUpdate`, `CancelToken`) and
   `profile::BatchOutcome`, so a client can store an operation's events and

@@ -41,6 +41,7 @@ zip = { version = "8.6", optional = true }
 bincode = { version = "2.0", features = ["serde"], optional = true }
 zstd = "0.13.3"
 lasso = { version = "0.7", features = ["serialize"] }
+memchr = "2.7"
 serde_yaml_ng = "0.10.0"
 base64 = { version = "0.22", optional = true }
 mockito = { version = "1.7", optional = true }
