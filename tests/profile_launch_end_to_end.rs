@@ -118,8 +118,7 @@ fn linux_native_steam_plan_hands_the_caller_the_wrapper_it_needs() {
   let options = profile::launch::steam_launch_options(&script_path);
   let contents = std::fs::read_to_string(&script_path).unwrap();
 
-  assert!(options.ends_with("%command%"));
-  assert!(options.contains(&script_path.display().to_string()));
+  assert_options_name_script(&options, &script_path);
   assert!(contents.contains("run_bepinex.sh"));
   // The script is profile-agnostic; the profile reaches it through the plan's args.
   assert!(!contents.contains(&profile_dir.display().to_string()));
@@ -259,4 +258,26 @@ fn one_wrapper_written_once_launches_whichever_profile_the_plan_names() {
 
   assert!(!contents.contains(&main.display().to_string()));
   assert!(!contents.contains(&modded.display().to_string()));
+}
+
+/// Asserts `options` is `script` quoted, then `%command%`. On Unix that is
+/// `script` exactly; on Windows it holds no `\` and names the same file.
+fn assert_options_name_script(options: &str, script: &std::path::Path) {
+  let quoted = options
+    .strip_suffix(" %command%")
+    .and_then(|rest| rest.strip_prefix('"'))
+    .and_then(|rest| rest.strip_suffix('"'))
+    .unwrap_or_else(|| panic!("not a quoted path then %command%: {options}"));
+
+  #[cfg(unix)]
+  assert_eq!(quoted, script.to_str().unwrap());
+
+  #[cfg(not(unix))]
+  {
+    assert!(!quoted.contains('\\'), "{quoted}");
+    assert_eq!(
+      std::fs::canonicalize(quoted).unwrap(),
+      std::fs::canonicalize(script).unwrap()
+    );
+  }
 }

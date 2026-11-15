@@ -19,6 +19,12 @@ use crate::ecosystem::{Ecosystem, GameProfile, InstanceType, LoaderKind};
 use crate::error::{Error, Result};
 use std::path::{Path, PathBuf};
 
+mod prepare;
+
+pub use prepare::{LaunchNotice, prepare_plan_from};
+#[cfg(feature = "io")]
+pub use prepare::{PreparedLaunch, prepare_launch};
+
 /// The operating system the game will run on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -291,12 +297,141 @@ const SERVER_SCRIPT: &str = LOADER_SCRIPTS[0];
 const MACOS_UNSUPPORTED: &str =
   "macOS launch is not supported: the injection chain requires r2modman's closed-source proxy";
 
+/// What the launch planner needs to know about a target directory's contents.
+///
+/// [`launch_plan_from`] and [`loader_args_from`] decide from these instead of
+/// reading the target. With the `io` feature, `LaunchFacts::read` gathers them
+/// from disk. A caller that already knows them starts from
+/// [`LaunchFacts::default`], which describes an empty target, and sets the fields
+/// that differ.
+///
+/// # Examples
+///
+/// ```
+/// use thunderstore_engine::profile::launch::{LaunchFacts, LOADER_SCRIPTS};
+///
+/// let mut facts = LaunchFacts::default();
+///
+/// facts.doorstop_version = 4;
+/// facts.loader_scripts = vec![LOADER_SCRIPTS[1].to_string()];
+///
+/// assert_eq!(facts.preloader, None);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct LaunchFacts {
+  /// The Doorstop major version recorded in `.doorstop_version`, or `3` when the
+  /// file is missing, unparseable, or below 3. A major of `4` or higher selects
+  /// the v4 argument spellings.
+  pub doorstop_version: u32,
+  /// The first [`PRELOADER_CANDIDATES`] entry present in `BepInEx/core`, by file
+  /// name.
+  pub preloader: Option<String>,
+  /// Whether an `unstripped_corlib` directory exists, which needs a Doorstop
+  /// search-path override.
+  pub has_corlibs: bool,
+  /// The [`LOADER_SCRIPTS`] present as files in the target root, by name.
+  pub loader_scripts: Vec<String>,
+  /// Whether MelonLoader's `Assembly-CSharp.dll` exists in either its 0.5
+  /// (`MelonLoader/Managed`) or 0.6 (`MelonLoader/Il2CppAssemblies`) layout. When
+  /// neither does, MelonLoader is asked to regenerate its assembly cache.
+  pub melonloader_assemblies: bool,
+  /// The loader kinds whose files from [`LOADER_FILES`] are in the target.
+  /// BepInEx and BepisLoader are found through [`Self::preloader`] instead.
+  pub loaders: Vec<LoaderKind>,
+  /// The package names recorded in the target's `mods.yml`, which name the
+  /// loader pack the engine or r2modman installed.
+  pub recorded: Vec<String>,
+}
+
+impl Default for LaunchFacts {
+  fn default() -> Self {
+    Self {
+      doorstop_version: 3,
+      preloader: None,
+      has_corlibs: false,
+      loader_scripts: Vec::new(),
+      melonloader_assemblies: false,
+      loaders: Vec::new(),
+      recorded: Vec::new(),
+    }
+  }
+}
+
+/// MelonLoader's own assembly in the 0.5 layout and the 0.6 and 0.7 runtimes.
+const MELONLOADER_FILES: [&str; 4] = [
+  "MelonLoader/MelonLoader.dll",
+  "MelonLoader/net35/MelonLoader.dll",
+  "MelonLoader/net472/MelonLoader.dll",
+  "MelonLoader/net6/MelonLoader.dll",
+];
+
+/// Files that show a loader is installed in a target, any one of them enough.
+///
+/// Each path is where r2modman's installer for that loader puts a file from
+/// the loader's Thunderstore pack. Lovely, GodotMl, and ReturnOfModding have no
+/// entry because their paths are unverified, so they are found only through
+/// the loader pack recorded in `mods.yml` ([`LaunchFacts::recorded`]).
+pub const LOADER_FILES: [(LoaderKind, &[&str]); 7] = [
+  (LoaderKind::Umm, &["UMM/Core/UnityModManager.dll"]),
+  (LoaderKind::MelonLoader, &MELONLOADER_FILES),
+  (LoaderKind::RecursiveMelonLoader, &MELONLOADER_FILES),
+  (
+    LoaderKind::GdWeave,
+    &["GDWeave/core/GDWeave.dll", "winmm.dll"],
+  ),
+  (
+    LoaderKind::Northstar,
+    &["R2Northstar/Northstar.dll", "NorthstarLauncher.exe"],
+  ),
+  (LoaderKind::Rivet, &["Rivet/Loader.dll"]),
+  (LoaderKind::Shimloader, &["dwmapi.dll", "ue4ss.dll"]),
+];
+
+#[cfg(feature = "io")]
+impl LaunchFacts {
+  /// Reads every fact from `target_dir`. A missing or unreadable file counts as
+  /// absent, so this never fails.
+  pub fn read(target_dir: &Path) -> Self {
+    let loader_scripts = LOADER_SCRIPTS
+      .iter()
+      .filter(|name| target_dir.join(name).is_file())
+      .map(|name| name.to_string())
+      .collect();
+    let melonloader_assemblies = target_dir
+      .join("MelonLoader/Managed/Assembly-CSharp.dll")
+      .is_file()
+      || target_dir
+        .join("MelonLoader/Il2CppAssemblies/Assembly-CSharp.dll")
+        .is_file();
+    let loaders = LOADER_FILES
+      .iter()
+      .filter(|(_, files)| files.iter().any(|file| target_dir.join(file).is_file()))
+      .map(|(loader, _)| *loader)
+      .collect();
+    let recorded = crate::profile::modlist::read(target_dir)
+      .map(|mods| mods.into_iter().map(|entry| entry.name).collect())
+      .unwrap_or_default();
+
+    Self {
+      doorstop_version: doorstop_version(target_dir),
+      preloader: find_preloader(target_dir),
+      has_corlibs: has_corlibs(target_dir),
+      loader_scripts,
+      melonloader_assemblies,
+      loaders,
+      recorded,
+    }
+  }
+}
+
 /// Reads the Doorstop major version from `<target_dir>/.doorstop_version`,
 /// defaulting to `3` when the file is missing or unparseable.
 ///
 /// A major of `4` or higher selects the v4 argument spellings. r2modman instead
 /// falls back to v3 for anything above 4, which mis-launches a future Doorstop;
 /// we deliberately do not reproduce that.
+#[cfg(feature = "io")]
 pub fn doorstop_version(target_dir: &Path) -> u32 {
   let path = target_dir.join(".doorstop_version");
 
@@ -326,13 +461,33 @@ fn wine_path(path: &Path) -> String {
 ///
 /// Under [`Runtime::Proton`] the path is rendered for the Wine prefix (`Z:` +
 /// forward slashes), which is how the Windows-side Doorstop resolves a Linux path.
+#[cfg(feature = "io")]
 pub fn bepinex_preloader(target_dir: &Path, runtime: Runtime) -> Result<String> {
+  render_preloader(target_dir, find_preloader(target_dir).as_deref(), runtime)
+}
+
+/// The first [`PRELOADER_CANDIDATES`] entry present in `<target_dir>/BepInEx/core`.
+#[cfg(feature = "io")]
+fn find_preloader(target_dir: &Path) -> Option<String> {
   let core = target_dir.join("BepInEx").join("core");
 
-  let found = PRELOADER_CANDIDATES
+  PRELOADER_CANDIDATES
     .iter()
+    .find(|name| core.join(name).is_file())
+    .map(|name| name.to_string())
+}
+
+/// Renders the path of `preloader` inside `<target_dir>/BepInEx/core` as a
+/// Doorstop target, erroring when there is none.
+fn render_preloader(
+  target_dir: &Path,
+  preloader: Option<&str>,
+  runtime: Runtime,
+) -> Result<String> {
+  let core = target_dir.join("BepInEx").join("core");
+
+  let found = preloader
     .map(|name| core.join(name))
-    .find(|candidate| candidate.is_file())
     .ok_or_else(|| Error::Profile(format!("no BepInEx preloader found in {}", core.display())))?;
 
   let rendered = match runtime {
@@ -345,6 +500,7 @@ pub fn bepinex_preloader(target_dir: &Path, runtime: Runtime) -> Result<String> 
 
 /// Whether the target ships unstripped corlibs, which need a Doorstop search-path
 /// override.
+#[cfg(feature = "io")]
 pub fn has_corlibs(target_dir: &Path) -> bool {
   target_dir.join("unstripped_corlib").is_dir()
 }
@@ -362,17 +518,33 @@ fn arg_path(target_dir: &Path, relative: &str) -> String {
 /// extras. An unrecognized loader contributes nothing rather than erroring, so a
 /// newer ecosystem schema degrades to a vanilla launch.
 ///
-/// For [`LoaderKind::BepInEx`] and [`LoaderKind::Umm`], the Doorstop flag
-/// spellings chosen depend on more than `.doorstop_version`: this function also
-/// stats `target_dir` (via `is_script_injected`) to check whether a loader
-/// script is present, because a script-injected launch forces the v4 spellings
-/// regardless of the detected version (see `doorstop_args`'s doc comment).
-/// `launch_plan_in` separately computes the same `ScriptInjection` fact for
-/// `resolve_program`/[`LaunchPlan::steam_wrapper`], so a single call to
-/// [`launch_plan_in`] reads that presence off disk twice — same rule, two
-/// moments, harmless for a synchronous, non-hot-path computation.
+/// Reads the target's [`LaunchFacts`] and computes with [`loader_args_from`].
+#[cfg(feature = "io")]
 pub fn loader_args(
   target_dir: &Path,
+  profile: &GameProfile,
+  ctx: &LaunchContext,
+) -> Result<Vec<String>> {
+  loader_args_from(target_dir, &LaunchFacts::read(target_dir), profile, ctx)
+}
+
+/// The loader's own arguments for the requested mode, computed from `facts`
+/// about `target_dir` without touching disk. An unrecognized loader contributes
+/// nothing rather than erroring, so a newer ecosystem schema degrades to a
+/// vanilla launch.
+///
+/// For [`LoaderKind::BepInEx`] and [`LoaderKind::Umm`], the Doorstop flag
+/// spellings depend on more than [`LaunchFacts::doorstop_version`]: a present
+/// loader script forces the v4 spellings regardless of the detected version
+/// (see `doorstop_args`'s doc comment).
+///
+/// # Errors
+///
+/// [`Error::Profile`] when a modded BepInEx or BepisLoader launch has no
+/// [`LaunchFacts::preloader`].
+pub fn loader_args_from(
+  target_dir: &Path,
+  facts: &LaunchFacts,
   profile: &GameProfile,
   ctx: &LaunchContext,
 ) -> Result<Vec<String>> {
@@ -380,22 +552,24 @@ pub fn loader_args(
 
   let args = match profile.package_loader {
     LoaderKind::BepInEx => {
-      let script_injected = is_script_injected(target_dir, profile, ctx);
+      let script_injected = is_script_injected(target_dir, facts, profile, ctx);
 
       doorstop_args(
         target_dir,
+        facts,
         profile,
         ctx,
         DoorstopTarget::BepInEx,
         script_injected,
       )?
     }
-    LoaderKind::BepisLoader => bepis_args(target_dir, profile, ctx)?,
+    LoaderKind::BepisLoader => bepis_args(target_dir, facts, profile, ctx)?,
     LoaderKind::Umm => {
-      let script_injected = is_script_injected(target_dir, profile, ctx);
+      let script_injected = is_script_injected(target_dir, facts, profile, ctx);
 
       doorstop_args(
         target_dir,
+        facts,
         profile,
         ctx,
         DoorstopTarget::Umm,
@@ -403,7 +577,7 @@ pub fn loader_args(
       )?
     }
     LoaderKind::MelonLoader | LoaderKind::RecursiveMelonLoader => {
-      melonloader_args(target_dir, ctx, &target)
+      melonloader_args(facts, ctx, &target)
     }
     LoaderKind::GdWeave => match ctx.mode {
       LaunchMode::Modded => vec![format!(
@@ -501,13 +675,13 @@ enum DoorstopTarget {
 /// where the version match above is intentional and must be preserved.
 fn doorstop_args(
   target_dir: &Path,
+  facts: &LaunchFacts,
   profile: &GameProfile,
   ctx: &LaunchContext,
   target: DoorstopTarget,
   script_injected: bool,
 ) -> Result<Vec<String>> {
-  let version = doorstop_version(target_dir);
-  let v4 = script_injected || version >= 4;
+  let v4 = script_injected || facts.doorstop_version >= 4;
 
   let (enable_flag, target_flag, search_flag) = if v4 {
     (
@@ -528,7 +702,9 @@ fn doorstop_args(
   }
 
   let assembly = match target {
-    DoorstopTarget::BepInEx => bepinex_preloader(target_dir, ctx.runtime)?,
+    DoorstopTarget::BepInEx => {
+      render_preloader(target_dir, facts.preloader.as_deref(), ctx.runtime)?
+    }
     DoorstopTarget::Umm => arg_path(target_dir, "UMM/Core/UnityModManager.dll"),
   };
 
@@ -543,7 +719,7 @@ fn doorstop_args(
     args.push("--server".to_string());
   }
 
-  if has_corlibs(target_dir) {
+  if facts.has_corlibs {
     args.push(search_flag.to_string());
     args.push(arg_path(target_dir, "unstripped_corlib"));
   }
@@ -554,6 +730,7 @@ fn doorstop_args(
 /// BepisLoader (Resonite): a hookfxr hook plus a hardcoded Doorstop v4 target.
 fn bepis_args(
   target_dir: &Path,
+  facts: &LaunchFacts,
   profile: &GameProfile,
   ctx: &LaunchContext,
 ) -> Result<Vec<String>> {
@@ -572,14 +749,14 @@ fn bepis_args(
     "--doorstop-enabled".to_string(),
     "true".to_string(),
     "--doorstop-target-assembly".to_string(),
-    bepinex_preloader(target_dir, ctx.runtime)?,
+    render_preloader(target_dir, facts.preloader.as_deref(), ctx.runtime)?,
   ];
 
   if profile.instance_type == InstanceType::Server {
     args.push("--server".to_string());
   }
 
-  if has_corlibs(target_dir) {
+  if facts.has_corlibs {
     args.push("--doorstop-mono-dll-search-path-override".to_string());
     args.push(arg_path(target_dir, "unstripped_corlib"));
   }
@@ -589,21 +766,14 @@ fn bepis_args(
 
 /// MelonLoader: point it at the target, and ask it to regenerate its assembly
 /// cache when neither the ML 0.5 nor the ML 0.6 assembly layout is present.
-fn melonloader_args(target_dir: &Path, ctx: &LaunchContext, target: &str) -> Vec<String> {
+fn melonloader_args(facts: &LaunchFacts, ctx: &LaunchContext, target: &str) -> Vec<String> {
   if ctx.mode == LaunchMode::Vanilla {
     return vec!["--no-mods".to_string()];
   }
 
   let mut args = vec!["--melonloader.basedir".to_string(), target.to_string()];
 
-  let ml_five = target_dir
-    .join("MelonLoader/Managed/Assembly-CSharp.dll")
-    .is_file();
-  let ml_six = target_dir
-    .join("MelonLoader/Il2CppAssemblies/Assembly-CSharp.dll")
-    .is_file();
-
-  if !ml_five && !ml_six {
+  if !facts.melonloader_assemblies {
     args.push("--melonloader.agfregenerate".to_string());
   }
 
@@ -665,27 +835,33 @@ fn script_candidates(profile: &GameProfile) -> Vec<&'static str> {
 /// caller (see [`SteamWrapper`]).
 fn script_injection(
   target_dir: &Path,
+  facts: &LaunchFacts,
   profile: &GameProfile,
   ctx: &LaunchContext,
 ) -> ScriptInjection {
-  let script_loader = matches!(
-    profile.package_loader,
-    LoaderKind::BepInEx | LoaderKind::BepisLoader
-  );
-
-  if !script_loader || ctx.os != HostOs::Linux || ctx.runtime != Runtime::Native {
+  if !script_injection_applies(profile, ctx) {
     return ScriptInjection::NotApplicable;
   }
 
   let found = script_candidates(profile)
     .into_iter()
-    .map(|name| target_dir.join(name))
-    .find(|candidate| candidate.is_file());
+    .find(|name| facts.loader_scripts.iter().any(|present| present == name));
 
   match found {
-    Some(path) => ScriptInjection::Found(path),
+    Some(name) => ScriptInjection::Found(target_dir.join(name)),
     None => ScriptInjection::Missing,
   }
+}
+
+/// Whether this loader, host, and runtime inject through a loader script at all,
+/// whichever scripts the target ships.
+fn script_injection_applies(profile: &GameProfile, ctx: &LaunchContext) -> bool {
+  let script_loader = matches!(
+    profile.package_loader,
+    LoaderKind::BepInEx | LoaderKind::BepisLoader
+  );
+
+  script_loader && ctx.os == HostOs::Linux && ctx.runtime == Runtime::Native
 }
 
 /// Whether `doorstop_args` must use the v4 flag spellings unconditionally
@@ -697,9 +873,14 @@ fn script_injection(
 /// when the target ships none of [`LOADER_SCRIPTS`], the argv reaches the game
 /// (or, under Steam, the wrapper's `exec "$@"` fallthrough) directly, so the
 /// version-matched spelling is the correct one there too.
-fn is_script_injected(target_dir: &Path, profile: &GameProfile, ctx: &LaunchContext) -> bool {
+fn is_script_injected(
+  target_dir: &Path,
+  facts: &LaunchFacts,
+  profile: &GameProfile,
+  ctx: &LaunchContext,
+) -> bool {
   matches!(
-    script_injection(target_dir, profile, ctx),
+    script_injection(target_dir, facts, profile, ctx),
     ScriptInjection::Found(_)
   )
 }
@@ -726,8 +907,9 @@ fn is_script_injected(target_dir: &Path, profile: &GameProfile, ctx: &LaunchCont
 ///
 /// # Errors
 ///
-/// - [`Error::Profile`] if `ctx.os` is
-///   [`HostOs::MacOs`], if `game` is unknown to `eco`, or if a
+/// - [`Error::UnknownGame`] or [`Error::NoGameProfile`] if `eco` has no
+///   profile for `game`.
+/// - [`Error::Profile`] if `ctx.os` is [`HostOs::MacOs`], or if a
 ///   [`LaunchMode::Modded`] plan needs a loader script that `target_dir` does
 ///   not contain.
 ///
@@ -759,8 +941,55 @@ fn is_script_injected(target_dir: &Path, profile: &GameProfile, ctx: &LaunchCont
 /// command.spawn()?;
 /// # Ok::<(), thunderstore_engine::Error>(())
 /// ```
+///
+/// Reads the target's [`LaunchFacts`] and computes with [`launch_plan_from`].
+#[cfg(feature = "io")]
 pub fn launch_plan_in(
   target_dir: &Path,
+  eco: &Ecosystem,
+  game: &str,
+  ctx: &LaunchContext,
+) -> Result<LaunchPlan> {
+  launch_plan_from(target_dir, &LaunchFacts::read(target_dir), eco, game, ctx)
+}
+
+/// Computes the launch invocation for `target_dir` from `facts` about its
+/// contents, without touching disk.
+///
+/// The rules and errors are `launch_plan_in`'s; this only takes the target's
+/// contents as [`LaunchFacts`] instead of reading them. `target_dir` is used only
+/// to render paths into the plan.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+/// use thunderstore_engine::ecosystem::Ecosystem;
+/// use thunderstore_engine::profile::launch::{
+///   HostOs, LaunchContext, LaunchFacts, LaunchMode, LaunchProgram, Runtime, StorePlatform,
+///   launch_plan_from,
+/// };
+///
+/// let eco = Ecosystem::bundled();
+/// let ctx = LaunchContext::new(
+///   HostOs::Windows,
+///   StorePlatform::SteamDirect,
+///   Runtime::Native,
+///   LaunchMode::Modded,
+/// );
+/// let mut facts = LaunchFacts::default();
+///
+/// facts.preloader = Some("BepInEx.Preloader.dll".to_string());
+///
+/// let plan = launch_plan_from(Path::new("C:/profiles/main"), &facts, &eco, "valheim", &ctx)?;
+///
+/// assert!(matches!(plan.program, LaunchProgram::GameExe { .. }));
+/// assert!(plan.args.contains(&"C:/profiles/main/BepInEx/core/BepInEx.Preloader.dll".to_string()));
+/// # Ok::<(), thunderstore_engine::Error>(())
+/// ```
+pub fn launch_plan_from(
+  target_dir: &Path,
+  facts: &LaunchFacts,
   eco: &Ecosystem,
   game: &str,
   ctx: &LaunchContext,
@@ -769,16 +998,13 @@ pub fn launch_plan_in(
     return Err(Error::Profile(MACOS_UNSUPPORTED.to_string()));
   }
 
-  let profile = eco
-    .game(game)
-    .and_then(|g| g.profile())
-    .ok_or_else(|| Error::Profile(format!("no ecosystem profile for game {game:?}")))?;
+  let profile = eco.require_profile(game)?;
 
   // Computed before the argv so the loader-script decision is available for
-  // `loader_args` to fold into its Doorstop flag spellings (see
+  // `loader_args_from` to fold into its Doorstop flag spellings (see
   // `is_script_injected`), not just for `resolve_program` below.
-  let injection = script_injection(target_dir, profile, ctx);
-  let mut args = loader_args(target_dir, profile, ctx)?;
+  let injection = script_injection(target_dir, facts, profile, ctx);
+  let mut args = loader_args_from(target_dir, facts, profile, ctx)?;
 
   args.extend(ctx.extra_args.iter().cloned());
 
@@ -859,6 +1085,7 @@ fn resolve_program(
 
 /// Computes the launch invocation for an r2modman-layout profile.
 /// See [`launch_plan_in`].
+#[cfg(feature = "io")]
 pub fn launch_plan(
   base: &Path,
   game: &str,
@@ -1002,6 +1229,7 @@ fi
 ///
 /// The script names no target, so this is written once per game and never
 /// rewritten — see [`wrapper_script_contents`].
+#[cfg(feature = "io")]
 pub fn write_wrapper_script(script_path: &Path) -> Result<()> {
   if let Some(parent) = script_path.parent() {
     std::fs::create_dir_all(parent)
@@ -1047,6 +1275,7 @@ pub fn write_wrapper_script(script_path: &Path) -> Result<()> {
 ///
 /// A script that is already executable is left untouched, so repeated launches do
 /// not rewrite modes.
+#[cfg(feature = "io")]
 pub fn ensure_loader_scripts_executable(target_dir: &Path) -> Result<Vec<PathBuf>> {
   let mut changed = Vec::new();
 
@@ -1072,6 +1301,7 @@ pub fn ensure_loader_scripts_executable(target_dir: &Path) -> Result<Vec<PathBuf
 /// Mirroring the read bits rather than forcing `0o755` keeps a deliberately
 /// private script private: `0o640` becomes `0o750`, not world-readable. It can only
 /// ever *add* execute bits, never widen read or write access.
+#[cfg(feature = "io")]
 fn make_executable(path: &Path) -> Result<bool> {
   #[cfg(unix)]
   {
@@ -1186,6 +1416,7 @@ pub fn stage_destination(
 /// caller should check [`crate::profile::target::InstallTarget::needs_staging`]
 /// first rather than rely on this function to turn that case into an empty
 /// list.
+#[cfg(feature = "io")]
 pub fn stage_for_launch_in(
   target_dir: &Path,
   eco: &Ecosystem,
@@ -1193,20 +1424,40 @@ pub fn stage_for_launch_in(
   game_dir: &Path,
   ctx: &LaunchContext,
 ) -> Result<Vec<PathBuf>> {
+  let staged = stage_files_in(target_dir, eco, game, game_dir, ctx)?;
+  let mut written = staged.created;
+
+  written.extend(staged.replaced);
+  written.sort();
+
+  Ok(written)
+}
+
+/// [`stage_for_launch_in`], keeping files it created apart from files it
+/// overwrote.
+///
+/// Files are staged in name order. When one fails, the files this call created
+/// are removed before the error is returned, so a failed staging leaves no
+/// new file behind; a file it had already overwritten keeps the new copy.
+#[cfg(feature = "io")]
+pub(crate) fn stage_files_in(
+  target_dir: &Path,
+  eco: &Ecosystem,
+  game: &str,
+  game_dir: &Path,
+  ctx: &LaunchContext,
+) -> Result<StagedFiles> {
   if ctx.os == HostOs::MacOs {
     return Err(Error::Profile(MACOS_UNSUPPORTED.to_string()));
   }
 
-  let profile = eco
-    .game(game)
-    .and_then(|g| g.profile())
-    .ok_or_else(|| Error::Profile(format!("no ecosystem profile for game {game:?}")))?;
+  let profile = eco.require_profile(game)?;
 
-  if script_injection(target_dir, profile, ctx).applies() {
-    return Ok(Vec::new());
+  if script_injection_applies(profile, ctx) {
+    return Ok(StagedFiles::default());
   }
 
-  let mut written = Vec::new();
+  let mut copies = Vec::new();
 
   for entry in std::fs::read_dir(target_dir)
     .map_err(|e| Error::Profile(format!("reading {}: {}", target_dir.display(), e)))?
@@ -1234,20 +1485,37 @@ pub fn stage_for_launch_in(
       None => continue,
     };
 
-    let staged = stage_one_file(&entry.path(), &dest)?;
+    copies.push((entry.path(), dest));
+  }
 
-    if staged {
-      written.push(dest);
+  copies.sort();
+
+  let mut staged = StagedFiles::default();
+
+  for (source, dest) in copies {
+    match stage_one_file(&source, &dest) {
+      Ok(StagedFile::InPlace) => {}
+      Ok(StagedFile::Created) => staged.created.push(dest),
+      Ok(StagedFile::Replaced) => staged.replaced.push(dest),
+      Err(error) => {
+        for created in &staged.created {
+          let _ = std::fs::remove_file(created);
+        }
+
+        return Err(error);
+      }
     }
   }
 
-  written.sort();
+  staged.created.sort();
+  staged.replaced.sort();
 
-  Ok(written)
+  Ok(staged)
 }
 
 /// Stages an r2modman-layout profile's loader files into `game_dir`.
 /// See [`stage_for_launch_in`].
+#[cfg(feature = "io")]
 pub fn stage_for_launch(
   base: &Path,
   game: &str,
@@ -1268,22 +1536,24 @@ pub fn stage_for_launch(
 /// Copies one staged file, creating parent directories and refusing to write
 /// through a pre-existing symlink at the destination.
 ///
-/// Returns whether a copy actually happened: `false` means `source` and `dest`
-/// were already [`same_file`], so nothing was written. [`stage_for_launch_in`]
-/// uses that to decide whether `dest` belongs in its returned `Vec<PathBuf>` —
-/// see that function's doc comment for why an already-in-place file must not be
-/// reported as written.
+/// Returns what happened to `dest`: [`StagedFile::InPlace`] means `source` and
+/// `dest` were already [`same_file`], so nothing was written.
+/// [`stage_for_launch_in`] uses that to decide whether `dest` belongs in its
+/// returned `Vec<PathBuf>`; see that function's doc comment for why an
+/// already-in-place file must not be reported as written.
 ///
 /// The symlink refusal is checked first and unconditionally, before the
 /// same-file check: a destination symlink that happens to point at `source`
 /// must still be refused rather than treated as "already in place", so a
 /// pre-planted link can never be silently followed.
-fn stage_one_file(source: &Path, dest: &Path) -> Result<bool> {
-  let dest_is_symlink = std::fs::symlink_metadata(dest)
-    .map(|metadata| metadata.file_type().is_symlink())
-    .unwrap_or(false);
+#[cfg(feature = "io")]
+fn stage_one_file(source: &Path, dest: &Path) -> Result<StagedFile> {
+  let existing = std::fs::symlink_metadata(dest).ok();
 
-  if dest_is_symlink {
+  if existing
+    .as_ref()
+    .is_some_and(|metadata| metadata.file_type().is_symlink())
+  {
     return Err(Error::Profile(format!(
       "refusing to stage through a symlink at {}",
       dest.display()
@@ -1291,7 +1561,7 @@ fn stage_one_file(source: &Path, dest: &Path) -> Result<bool> {
   }
 
   if crate::util::same_file(source, dest) {
-    return Ok(false);
+    return Ok(StagedFile::InPlace);
   }
 
   if let Some(parent) = dest.parent() {
@@ -1302,7 +1572,32 @@ fn stage_one_file(source: &Path, dest: &Path) -> Result<bool> {
   std::fs::copy(source, dest)
     .map_err(|e| Error::Profile(format!("staging {}: {}", dest.display(), e)))?;
 
-  Ok(true)
+  match existing {
+    Some(_) => Ok(StagedFile::Replaced),
+    None => Ok(StagedFile::Created),
+  }
+}
+
+/// What staging did to one destination.
+#[cfg(feature = "io")]
+enum StagedFile {
+  /// The destination is the source itself, so nothing was written.
+  InPlace,
+  /// The destination did not exist and now holds a copy.
+  Created,
+  /// The destination already held a file, now overwritten with a copy.
+  Replaced,
+}
+
+/// The game-folder files one staging wrote, split by whether they existed
+/// before it.
+#[cfg(feature = "io")]
+#[derive(Debug, Default)]
+pub(crate) struct StagedFiles {
+  /// Files this staging created.
+  pub(crate) created: Vec<PathBuf>,
+  /// Files that were already there and were overwritten.
+  pub(crate) replaced: Vec<PathBuf>,
 }
 
 /// The string a user pastes into Steam's launch options for a Linux native launch.
@@ -1333,6 +1628,7 @@ pub fn steam_launch_options(script_path: &Path) -> String {
 }
 
 /// The first of `exe_names` present in `game_dir`.
+#[cfg(feature = "io")]
 pub fn resolve_game_exe(game_dir: &Path, exe_names: &[String]) -> Result<PathBuf> {
   exe_names
     .iter()
@@ -1367,6 +1663,7 @@ pub fn wrapper_path(base: &Path, game: &str) -> PathBuf {
 /// Sets no environment: `steam -applaunch <id>` only messages an already-running
 /// client, which starts the game with its own environment, so anything set here
 /// would silently reach nothing. See [`LaunchPlan::env`].
+#[cfg(feature = "io")]
 fn steam_command(program: &Path, steam_app_id: u32) -> std::process::Command {
   let mut command = std::process::Command::new(program);
 
@@ -1375,6 +1672,7 @@ fn steam_command(program: &Path, steam_app_id: u32) -> std::process::Command {
   command
 }
 
+#[cfg(feature = "io")]
 impl LaunchPlan {
   /// Translates this plan into the process to spawn.
   ///
@@ -1428,9 +1726,31 @@ impl LaunchPlan {
   }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "io"))]
 mod tests {
   use super::*;
+
+  /// Asserts `options` is `script` quoted, then `%command%`. On Unix that is
+  /// `script` exactly; on Windows it holds no `\` and names the same file.
+  pub(super) fn assert_options_name_script(options: &str, script: &Path) {
+    let quoted = options
+      .strip_suffix(" %command%")
+      .and_then(|rest| rest.strip_prefix('"'))
+      .and_then(|rest| rest.strip_suffix('"'))
+      .unwrap_or_else(|| panic!("not a quoted path then %command%: {options}"));
+
+    #[cfg(unix)]
+    assert_eq!(quoted, script.to_str().unwrap());
+
+    #[cfg(not(unix))]
+    {
+      assert!(!quoted.contains('\\'), "{quoted}");
+      assert_eq!(
+        std::fs::canonicalize(quoted).unwrap(),
+        std::fs::canonicalize(script).unwrap()
+      );
+    }
+  }
 
   #[test]
   fn doorstop_version_reads_major_and_defaults_to_three() {
@@ -1974,7 +2294,7 @@ mod tests {
 
     let err = launch_plan_in(dir.path(), &eco, "not-a-game", &ctx(LaunchMode::Modded)).unwrap_err();
 
-    assert!(err.to_string().contains("no ecosystem profile"));
+    assert!(matches!(err, Error::UnknownGame { game } if game == "not-a-game"));
   }
 
   #[test]
@@ -2084,6 +2404,20 @@ mod tests {
 
     // Idempotent: a second launch must not report a change, so repeated launches
     // do not keep rewriting modes.
+    assert!(ensure_loader_scripts_executable(root).unwrap().is_empty());
+  }
+
+  /// Off Unix there is no execute bit, so a loader script is left alone and no
+  /// change is reported for a launch to surface.
+  #[test]
+  #[cfg(not(unix))]
+  fn ensure_loader_scripts_executable_changes_nothing_off_unix() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    std::fs::write(root.join("start_game_bepinex.sh"), b"#!/bin/sh\n").unwrap();
+    std::fs::write(root.join("run_bepinex.sh"), b"#!/bin/sh\n").unwrap();
+
     assert!(ensure_loader_scripts_executable(root).unwrap().is_empty());
   }
 
@@ -2435,6 +2769,12 @@ mod tests {
     assert_eq!(
       steam_launch_options(Path::new("/data/My Games/wrapper.sh")),
       r#""/data/My Games/wrapper.sh" %command%"#
+    );
+
+    // A Windows path is written with `/` separators.
+    assert_eq!(
+      steam_launch_options(Path::new(r"C:\Users\me\launch_wrapper.sh")),
+      r#""C:/Users/me/launch_wrapper.sh" %command%"#
     );
   }
 
@@ -2923,7 +3263,12 @@ mod tests {
     server_profile.instance_type = InstanceType::Server;
 
     let server = resolve_program(
-      &script_injection(&all_three, &server_profile, &context),
+      &script_injection(
+        &all_three,
+        &LaunchFacts::read(&all_three),
+        &server_profile,
+        &context,
+      ),
       &all_three,
       &server_profile,
       &context,
@@ -2940,7 +3285,12 @@ mod tests {
     // A game instance skips the server script even when it is present and first
     // in precedence — exec'ing it would start a dedicated server.
     let game = resolve_program(
-      &script_injection(&all_three, &game_profile, &context),
+      &script_injection(
+        &all_three,
+        &LaunchFacts::read(&all_three),
+        &game_profile,
+        &context,
+      ),
       &all_three,
       &game_profile,
       &context,
@@ -2954,7 +3304,12 @@ mod tests {
 
     // With only the server script on disk, a game instance has no script at all.
     let err = resolve_program(
-      &script_injection(&server_only, &game_profile, &context),
+      &script_injection(
+        &server_only,
+        &LaunchFacts::read(&server_only),
+        &game_profile,
+        &context,
+      ),
       &server_only,
       &game_profile,
       &context,
@@ -3029,7 +3384,7 @@ mod tests {
 
     let options = steam_launch_options(&script_path);
 
-    assert!(options.contains(&script_path.display().to_string()));
+    assert_options_name_script(&options, &script_path);
     assert!(!options.contains("WINEDLLOVERRIDES"));
     assert!(
       std::fs::read_to_string(&script_path)
@@ -3463,5 +3818,252 @@ mod tests {
       )],
       "the plan's env must reach the command unchanged, with nothing added"
     );
+  }
+}
+
+#[cfg(test)]
+mod planning_tests {
+  use super::*;
+
+  const TARGET: &str = "/profiles/main";
+
+  fn ctx(os: HostOs, store: StorePlatform, runtime: Runtime, mode: LaunchMode) -> LaunchContext {
+    LaunchContext::new(os, store, runtime, mode)
+  }
+
+  fn with_preloader() -> LaunchFacts {
+    LaunchFacts {
+      preloader: Some("BepInEx.Preloader.dll".to_string()),
+      ..LaunchFacts::default()
+    }
+  }
+
+  fn plan(facts: &LaunchFacts, context: &LaunchContext) -> Result<LaunchPlan> {
+    launch_plan_from(
+      Path::new(TARGET),
+      facts,
+      &Ecosystem::bundled(),
+      "valheim",
+      context,
+    )
+  }
+
+  #[test]
+  fn doorstop_flags_follow_the_recorded_version() {
+    let windows = ctx(
+      HostOs::Windows,
+      StorePlatform::SteamDirect,
+      Runtime::Native,
+      LaunchMode::Modded,
+    );
+    let mut facts = with_preloader();
+
+    let v3 = plan(&facts, &windows).unwrap();
+
+    facts.doorstop_version = 4;
+
+    let v4 = plan(&facts, &windows).unwrap();
+
+    assert_eq!(v3.args[0], "--doorstop-enable");
+    assert_eq!(v4.args[0], "--doorstop-enabled");
+    assert!(
+      v3.args
+        .contains(&format!("{TARGET}/BepInEx/core/BepInEx.Preloader.dll"))
+    );
+  }
+
+  #[test]
+  fn a_modded_bepinex_launch_needs_a_preloader() {
+    let windows = ctx(
+      HostOs::Windows,
+      StorePlatform::SteamDirect,
+      Runtime::Native,
+      LaunchMode::Modded,
+    );
+
+    let result = plan(&LaunchFacts::default(), &windows);
+
+    assert!(
+      matches!(result, Err(Error::Profile(message)) if message.contains("no BepInEx preloader"))
+    );
+  }
+
+  #[test]
+  fn corlibs_add_the_search_path_override() {
+    let windows = ctx(
+      HostOs::Windows,
+      StorePlatform::SteamDirect,
+      Runtime::Native,
+      LaunchMode::Modded,
+    );
+    let mut facts = with_preloader();
+
+    facts.has_corlibs = true;
+
+    let plan = plan(&facts, &windows).unwrap();
+
+    assert!(
+      plan
+        .args
+        .contains(&"--doorstop-dll-search-override".to_string())
+    );
+    assert!(plan.args.contains(&format!("{TARGET}/unstripped_corlib")));
+  }
+
+  #[test]
+  fn a_listed_loader_script_is_run_on_linux_native() {
+    let linux = ctx(
+      HostOs::Linux,
+      StorePlatform::SteamDirect,
+      Runtime::Native,
+      LaunchMode::Modded,
+    );
+    let mut facts = with_preloader();
+
+    facts.loader_scripts = vec!["start_game_bepinex.sh".to_string()];
+
+    let plan = plan(&facts, &linux).unwrap();
+
+    assert!(matches!(
+      plan.program,
+      LaunchProgram::ProfileScript { ref path, .. }
+        if path == &Path::new(TARGET).join("start_game_bepinex.sh")
+    ));
+    assert_eq!(plan.args[0], "--doorstop-enabled");
+  }
+
+  #[test]
+  fn linux_native_modded_without_a_loader_script_is_refused() {
+    let linux = ctx(
+      HostOs::Linux,
+      StorePlatform::SteamDirect,
+      Runtime::Native,
+      LaunchMode::Modded,
+    );
+
+    let result = plan(&with_preloader(), &linux);
+
+    assert!(matches!(result, Err(Error::Profile(message)) if message.contains("loader script")));
+  }
+
+  #[test]
+  fn the_server_script_is_ignored_for_a_game_instance() {
+    let linux = ctx(
+      HostOs::Linux,
+      StorePlatform::SteamDirect,
+      Runtime::Native,
+      LaunchMode::Modded,
+    );
+    let mut facts = with_preloader();
+
+    facts.loader_scripts = vec!["start_server_bepinex.sh".to_string()];
+
+    assert!(plan(&facts, &linux).is_err());
+  }
+
+  #[test]
+  fn melonloader_regenerates_only_without_its_assemblies() {
+    let eco = Ecosystem::bundled();
+    let profile = eco
+      .games()
+      .filter_map(|game| game.profile())
+      .find(|profile| profile.package_loader == LoaderKind::MelonLoader)
+      .unwrap();
+    let windows = ctx(
+      HostOs::Windows,
+      StorePlatform::SteamDirect,
+      Runtime::Native,
+      LaunchMode::Modded,
+    );
+    let mut facts = LaunchFacts::default();
+
+    let bare = loader_args_from(Path::new(TARGET), &facts, profile, &windows).unwrap();
+
+    facts.melonloader_assemblies = true;
+
+    let built = loader_args_from(Path::new(TARGET), &facts, profile, &windows).unwrap();
+
+    assert!(bare.contains(&"--melonloader.agfregenerate".to_string()));
+    assert!(!built.contains(&"--melonloader.agfregenerate".to_string()));
+  }
+
+  #[test]
+  fn macos_is_refused_whatever_the_facts() {
+    let mac = ctx(
+      HostOs::MacOs,
+      StorePlatform::SteamDirect,
+      Runtime::Native,
+      LaunchMode::Modded,
+    );
+
+    assert!(plan(&with_preloader(), &mac).is_err());
+  }
+
+  #[test]
+  #[cfg(feature = "io")]
+  fn launch_facts_read_what_the_target_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    std::fs::create_dir_all(root.join("BepInEx/core")).unwrap();
+    std::fs::create_dir_all(root.join("unstripped_corlib")).unwrap();
+    std::fs::create_dir_all(root.join("MelonLoader/Il2CppAssemblies")).unwrap();
+    std::fs::write(root.join("BepInEx/core/BepInEx.Preloader.dll"), b"").unwrap();
+    std::fs::write(root.join("run_bepinex.sh"), b"").unwrap();
+    std::fs::write(root.join(".doorstop_version"), b"4.0.0").unwrap();
+    std::fs::write(
+      root.join("MelonLoader/Il2CppAssemblies/Assembly-CSharp.dll"),
+      b"",
+    )
+    .unwrap();
+
+    let facts = LaunchFacts::read(root);
+
+    assert_eq!(facts.doorstop_version, 4);
+    assert_eq!(facts.preloader.as_deref(), Some("BepInEx.Preloader.dll"));
+    assert!(facts.has_corlibs);
+    assert_eq!(facts.loader_scripts, vec!["run_bepinex.sh".to_string()]);
+    assert!(facts.melonloader_assemblies);
+    assert_eq!(
+      LaunchFacts::read(&root.join("missing")),
+      LaunchFacts::default()
+    );
+  }
+
+  #[test]
+  #[cfg(feature = "io")]
+  fn launch_facts_read_the_loader_files_and_recorded_packages() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let version: crate::models::Version = serde_json::from_str(
+      r#"{"name":"GDWeave","full_name":"NotNet-GDWeave","description":"d","icon":"i",
+      "version_number":"2.0.0","dependencies":[],"download_url":"u","downloads":1,
+      "date_created":"2024-01-01T12:00:00Z","website_url":"w","is_active":true,
+      "uuid4":"u","file_size":1}"#,
+    )
+    .unwrap();
+
+    std::fs::create_dir_all(root.join("GDWeave/core")).unwrap();
+    std::fs::write(root.join("GDWeave/core/GDWeave.dll"), b"").unwrap();
+    std::fs::create_dir_all(root.join("R2Northstar")).unwrap();
+    std::fs::write(root.join("R2Northstar/Northstar.dll"), b"").unwrap();
+    crate::profile::modlist::write(
+      root,
+      &[crate::profile::mod_entry_from_version(
+        "NotNet-GDWeave",
+        "NotNet",
+        &version,
+        1,
+      )],
+    )
+    .unwrap();
+
+    let facts = LaunchFacts::read(root);
+
+    assert_eq!(
+      facts.loaders,
+      vec![LoaderKind::GdWeave, LoaderKind::Northstar]
+    );
+    assert_eq!(facts.recorded, vec!["NotNet-GDWeave".to_string()]);
   }
 }

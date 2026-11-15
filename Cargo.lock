@@ -1861,6 +1861,7 @@ dependencies = [
  "crc32fast",
  "futures",
  "lasso",
+ "memchr",
  "mockito",
  "reqwest",
  "serde",

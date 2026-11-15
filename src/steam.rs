@@ -30,7 +30,9 @@
 
 #![deny(missing_docs)]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "io")]
+use std::path::{Component, PathBuf};
 
 /// Path prefixes a sandboxed Steam is known to replace with a private mount, used
 /// only when no running Steam client is available to ask directly.
@@ -121,10 +123,14 @@ fn starts_with_components(path: &Path, prefix: &Path) -> bool {
 /// "does a similarly named file exist here". Taking the root as a parameter is also
 /// what makes the resolution testable against an ordinary directory tree.
 ///
-/// `path`'s leading `/` is stripped before joining, since [`Path::join`] with an
-/// absolute path discards the root it is joined onto.
+/// `path`'s root, and on Windows its drive prefix, is dropped before joining,
+/// since [`Path::join`] with an absolute path discards the root it is joined onto.
+#[cfg(feature = "io")]
 fn visible_in(namespace_root: &Path, path: &Path) -> bool {
-  let relative = path.strip_prefix("/").unwrap_or(path);
+  let relative: PathBuf = path
+    .components()
+    .filter(|component| !matches!(component, Component::Prefix(_) | Component::RootDir))
+    .collect();
 
   namespace_root.join(relative).exists()
 }
@@ -135,6 +141,7 @@ fn visible_in(namespace_root: &Path, path: &Path) -> bool {
 /// accepted only if that pid currently belongs to a process named `steam`. A pid
 /// file outlives the process that wrote it, and a recycled pid would otherwise
 /// have us inspecting an unrelated namespace and reporting nonsense about it.
+#[cfg(feature = "io")]
 pub fn steam_client_pid() -> Option<u32> {
   let home = std::env::var_os("HOME")?;
   let pid_file = PathBuf::from(home).join(".steam").join("steam.pid");
@@ -154,6 +161,7 @@ pub fn steam_client_pid() -> Option<u32> {
 /// Returns [`Visibility::Unknown`] whenever no Steam client can be inspected, be
 /// that Steam not running, a platform without `/proc`, or an unreadable pid file,
 /// because an unproven suspicion must not be reported as a proven failure.
+#[cfg(feature = "io")]
 pub fn visibility(path: &Path) -> Visibility {
   let Some(steam_pid) = steam_client_pid() else {
     return Visibility::Unknown {
@@ -179,32 +187,39 @@ pub fn visibility(path: &Path) -> Visibility {
 }
 
 /// The registry key Steam's Windows installer writes its own location into.
+#[cfg(feature = "io")]
 const STEAM_REGISTRY_KEY: &str = r"Software\Valve\Steam";
 
 /// The value under [`STEAM_REGISTRY_KEY`] holding the full path to `steam.exe`.
+#[cfg(feature = "io")]
 const STEAM_REGISTRY_VALUE: &str = "SteamExe";
 
 /// Environment variables naming the roots Steam installs under, in the order its
 /// installer prefers: a 32-bit application on 64-bit Windows lands in
 /// `Program Files (x86)`, and Steam is one.
+#[cfg(feature = "io")]
 const PROGRAM_FILES_VARS: [&str; 2] = ["ProgramFiles(x86)", "ProgramFiles"];
 
 /// The directory Steam creates under a Program Files root.
+#[cfg(feature = "io")]
 const STEAM_INSTALL_DIR: &str = "Steam";
 
 /// The Steam client executable's file name on Windows.
+#[cfg(feature = "io")]
 const STEAM_EXE_NAME: &str = "steam.exe";
 
 /// The program name used when no executable can be located.
 ///
 /// Correct on Linux and macOS, where the client is on `PATH`, and no worse than a
 /// bare `steam` on a Windows host that has had Steam put on `PATH` by hand.
+#[cfg(feature = "io")]
 const STEAM_FALLBACK: &str = "steam";
 
 /// `steam.exe` under each root's `Steam` directory, in the order given.
 ///
 /// Pure: proposes paths without touching the filesystem, so the preference order
 /// can be asserted on any host.
+#[cfg(feature = "io")]
 fn steam_exe_candidates(roots: &[PathBuf]) -> Vec<PathBuf> {
   roots
     .iter()
@@ -217,6 +232,7 @@ fn steam_exe_candidates(roots: &[PathBuf]) -> Vec<PathBuf> {
 /// Split out from where the candidates come from so the "which one wins"
 /// decision is testable against an ordinary directory tree, with no Windows and
 /// no Steam.
+#[cfg(feature = "io")]
 fn first_existing(candidates: &[PathBuf]) -> Option<PathBuf> {
   candidates
     .iter()
@@ -231,6 +247,7 @@ fn first_existing(candidates: &[PathBuf]) -> Option<PathBuf> {
 /// be tested at all. The guard is load-bearing beyond that: Wine and some CI
 /// images export `ProgramFiles`, and honouring it off Windows would divert a
 /// working launch to a path that cannot be executed.
+#[cfg(feature = "io")]
 fn install_roots() -> Vec<PathBuf> {
   if !cfg!(windows) {
     return Vec::new();
@@ -248,7 +265,7 @@ fn install_roots() -> Vec<PathBuf> {
 /// Preferred over the standard roots because it is the only source that survives
 /// a Steam installed to another drive. Steam writes this value with forward
 /// slashes, which Windows accepts.
-#[cfg(windows)]
+#[cfg(all(windows, feature = "io"))]
 fn registry_steam_exe() -> Option<PathBuf> {
   let key = windows_registry::CURRENT_USER
     .open(STEAM_REGISTRY_KEY)
@@ -259,7 +276,7 @@ fn registry_steam_exe() -> Option<PathBuf> {
 }
 
 /// No registry to read. See the Windows implementation above.
-#[cfg(not(windows))]
+#[cfg(all(not(windows), feature = "io"))]
 fn registry_steam_exe() -> Option<PathBuf> {
   // Referenced so the names stay live off Windows and cannot rot unnoticed.
   let _ = (STEAM_REGISTRY_KEY, STEAM_REGISTRY_VALUE);
@@ -278,6 +295,7 @@ fn registry_steam_exe() -> Option<PathBuf> {
 /// The registry path is re-checked against the filesystem rather than trusted, so
 /// a stale entry left behind by a moved or uninstalled Steam falls through to the
 /// standard roots instead of yielding a path that cannot be spawned.
+#[cfg(feature = "io")]
 fn resolve_steam_exe(registry: Option<PathBuf>, roots: &[PathBuf]) -> PathBuf {
   registry
     .filter(|path| path.is_file())
@@ -296,11 +314,12 @@ fn resolve_steam_exe(registry: Option<PathBuf>, roots: &[PathBuf]) -> PathBuf {
 /// [`crate::profile::launch::LaunchProgram::Steam`], so a caller spawning a
 /// computed plan gets it without asking. It is public for callers assembling a
 /// command themselves.
+#[cfg(feature = "io")]
 pub fn steam_exe() -> PathBuf {
   resolve_steam_exe(registry_steam_exe(), &install_roots())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "io"))]
 mod tests {
   use super::*;
   use tempfile::tempdir;
@@ -354,9 +373,9 @@ mod tests {
     assert!(visible_in(root, Path::new("/home/u/.local/share/vmm")));
   }
 
-  /// The leading `/` has to be stripped: `Path::join` with an absolute path
-  /// discards the root it is joined onto, which would silently check the *host*
-  /// filesystem and call every path reachable.
+  /// The root, and on Windows the drive prefix, has to be dropped: `Path::join`
+  /// with an absolute path discards the root it is joined onto, which would
+  /// silently check the *host* filesystem and call every path reachable.
   #[test]
   fn visible_in_does_not_fall_through_to_the_host_filesystem() {
     let namespace = tempdir().unwrap();
@@ -518,6 +537,31 @@ mod tests {
       steam_exe(),
       PathBuf::from("steam"),
       "off Windows the bare program name is correct and must be preserved"
+    );
+  }
+
+  /// The Windows half of `resolution_is_inert_off_windows`: the registry read
+  /// and the Program Files roots run for real, and whatever the host holds, the
+  /// result is a file that exists or the bare fallback.
+  #[test]
+  #[cfg(windows)]
+  fn resolution_reads_the_host_on_windows() {
+    assert!(
+      !install_roots().is_empty(),
+      "Windows always exports a Program Files root"
+    );
+
+    let recorded = registry_steam_exe();
+    let resolved = steam_exe();
+
+    if let Some(recorded) = recorded.filter(|path| path.is_file()) {
+      assert_eq!(resolved, recorded, "a live registry entry must win");
+    }
+
+    assert!(
+      resolved.is_file() || resolved == Path::new("steam"),
+      "got {}",
+      resolved.display()
     );
   }
 

@@ -6,8 +6,10 @@
 
 #![deny(missing_docs)]
 
+#[cfg(feature = "io")]
 use crate::error::{Error, Result};
-use crate::extract::{extract_zip, should_extract};
+#[cfg(feature = "io")]
+use crate::extract::{ExtractLimits, extract_zip_reporting, should_extract};
 use std::path::{Path, PathBuf};
 
 /// The cache directory for one package version:
@@ -19,6 +21,7 @@ pub fn package_cache_dir(base: &Path, game: &str, full_name: &str, version: &str
 /// Extracts `archive` into the package cache directory if that version is not
 /// already present, and returns the directory. Uses [`should_extract`] so an
 /// unchanged version is not re-extracted.
+#[cfg(feature = "io")]
 pub fn ensure_extracted(
   base: &Path,
   game: &str,
@@ -26,10 +29,24 @@ pub fn ensure_extracted(
   version: &str,
   archive: &Path,
 ) -> Result<PathBuf> {
+  ensure_extracted_reporting(base, game, full_name, version, archive, &mut |_, _| {})
+}
+
+/// [`ensure_extracted`], passing `on_progress` to the extraction. Never called
+/// when the version is already extracted.
+#[cfg(feature = "io")]
+pub(crate) fn ensure_extracted_reporting(
+  base: &Path,
+  game: &str,
+  full_name: &str,
+  version: &str,
+  archive: &Path,
+  on_progress: &mut dyn FnMut(u64, u64),
+) -> Result<PathBuf> {
   let dir = package_cache_dir(base, game, full_name, version);
 
   if should_extract(&dir, version)? {
-    extract_zip(archive, &dir)?;
+    extract_zip_reporting(archive, &dir, &ExtractLimits::default(), on_progress)?;
   }
 
   if !dir.exists() {
@@ -42,7 +59,7 @@ pub fn ensure_extracted(
   Ok(dir)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "io"))]
 mod tests {
   use super::*;
   use std::io::{Cursor, Write};

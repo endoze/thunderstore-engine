@@ -1,7 +1,9 @@
 #![deny(missing_docs)]
 
+use std::fmt;
 use std::io;
 use std::num::ParseIntError;
+use std::sync::Arc;
 use thiserror::Error;
 
 /// A type alias for `Result<T, Error>` used throughout the engine.
@@ -12,28 +14,36 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// This enum is `#[non_exhaustive]`: new variants may be added in future
 /// releases without a breaking change, so downstream `match`es must include a
 /// wildcard arm.
-#[derive(Error, Debug)]
+///
+/// `Error` is `Clone`, so a client can keep one in its state or hand it to
+/// several listeners. Sources that are not `Clone` themselves are held in a
+/// [`Shared`]; `?` still converts them directly, and
+/// [`source`](std::error::Error::source) still downcasts to them.
+#[derive(Error, Debug, Clone)]
 #[non_exhaustive]
 pub enum Error {
   /// Error from the IO system.
   #[error("IO error: {0}")]
-  Io(#[from] io::Error),
+  Io(#[source] Shared<io::Error>),
 
   /// Error from HTTP operations.
+  #[cfg(feature = "io")]
   #[error("HTTP error: {0}")]
-  Http(#[from] reqwest::Error),
+  Http(#[source] Shared<reqwest::Error>),
 
   /// Error from JSON parsing.
   #[error("JSON error: {0}")]
-  Json(#[from] serde_json::Error),
+  Json(#[source] Shared<serde_json::Error>),
 
   /// Error from ZIP operations.
+  #[cfg(feature = "io")]
   #[error("ZIP error: {0}")]
-  Zip(#[from] zip::result::ZipError),
+  Zip(#[source] Shared<zip::result::ZipError>),
 
   /// Error from header parsing.
+  #[cfg(feature = "io")]
   #[error("Header error: {0}")]
-  Header(#[from] reqwest::header::ToStrError),
+  Header(#[source] Shared<reqwest::header::ToStrError>),
 
   /// Error from parsing integers.
   #[error("Parse integer error: {0}")]
@@ -123,15 +133,81 @@ pub enum Error {
   #[error("Profile error: {0}")]
   BadProfile(#[from] crate::profile::layout::BadProfile),
 
+  /// The package is not recorded in the target's `mods.yml`.
+  #[error("Profile error: {package} is not installed")]
+  NotInstalled {
+    /// The `Owner-Name` identifier as given.
+    package: String,
+  },
+
+  /// A requested package, or a package in its dependency closure, is not in
+  /// the package index, so nothing was installed.
+  #[error("Profile error: cannot install {package}: could not resolve {}", .unresolved.join(", "))]
+  UnresolvedDependency {
+    /// The identifier whose install was requested.
+    package: String,
+    /// Every identifier that could not be resolved, sorted.
+    unresolved: Vec<String>,
+  },
+
+  /// The index has the package, but not the version the request names.
+  #[error("Profile error: cannot install {package}-{version}: {package} has no version {version}")]
+  MissingVersion {
+    /// The `Owner-Name` identifier.
+    package: String,
+    /// The requested version.
+    version: String,
+  },
+
+  /// The ecosystem has no game with this slug.
+  #[error("Profile error: unknown game {game:?}")]
+  UnknownGame {
+    /// The game slug as given.
+    game: String,
+  },
+
+  /// The game is known, but the ecosystem gives it no profile, so there are no
+  /// install rules to route its packages with.
+  #[error("Profile error: no ecosystem profile for game {game:?}")]
+  NoGameProfile {
+    /// The game slug as given.
+    game: String,
+  },
+
+  /// A modded launch found no mod loader installed in the target, so its mods
+  /// would not load.
+  #[error("Profile error: no {loader:?} mod loader is installed")]
+  NoModLoader {
+    /// The loader the game's mods need.
+    loader: crate::ecosystem::LoaderKind,
+  },
+
+  /// The game folder a launch needs does not exist.
+  #[error("Profile error: the game folder {} does not exist", .path.display())]
+  MissingGameDir {
+    /// The game folder as given.
+    path: std::path::PathBuf,
+  },
+
   /// One or more files in a batch download failed.
-  #[error("{failed} of {total} downloads failed; first error: {first}")]
+  #[error("{} of {total} downloads failed: {}", .failures.len(), list_failures(.failures))]
   Download {
-    /// How many files failed.
-    failed: usize,
     /// How many files were attempted.
     total: usize,
-    /// The first failure's message.
-    first: String,
+    /// Each file that failed, with the reason, sorted by file name.
+    failures: Vec<(String, Error)>,
+  },
+
+  /// An import stopped because one or more of its mods failed to install, so
+  /// its config files were not restored. Importing again once the causes are
+  /// fixed skips the mods already installed and completes it.
+  #[error(
+    "Profile error: {}; the import is unfinished (its config files were not restored)",
+    list_import_failures(.failures)
+  )]
+  ImportUnfinished {
+    /// Each exported identifier that failed, with the reason.
+    failures: Vec<(String, Error)>,
   },
 
   /// A response header was present but could not be parsed, e.g. an
@@ -156,6 +232,94 @@ pub enum Error {
   },
 }
 
+/// Renders `name: reason` pairs as one line, separated by `; `.
+fn list_failures(failures: &[(String, Error)]) -> String {
+  failures
+    .iter()
+    .map(|(name, error)| format!("{name}: {error}"))
+    .collect::<Vec<_>>()
+    .join("; ")
+}
+
+/// An error that is not `Clone`, shared behind an [`Arc`] so [`Error`] can be.
+///
+/// It derefs to the error it holds, and that error, not the `Shared`, is what
+/// [`Error`]'s [`source`](std::error::Error::source) returns, so a caller can
+/// downcast it:
+///
+/// ```
+/// use std::error::Error as _;
+/// use thunderstore_engine::Error;
+///
+/// let err = Error::from(std::io::Error::other("gone"));
+///
+/// assert!(err.source().unwrap().downcast_ref::<std::io::Error>().is_some());
+/// ```
+#[derive(Debug)]
+pub struct Shared<T>(Arc<T>);
+
+impl<T> Clone for Shared<T> {
+  fn clone(&self) -> Self {
+    Self(Arc::clone(&self.0))
+  }
+}
+
+impl<T> std::ops::Deref for Shared<T> {
+  type Target = T;
+
+  fn deref(&self) -> &T {
+    &self.0
+  }
+}
+
+impl<T: fmt::Display> fmt::Display for Shared<T> {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    self.0.fmt(f)
+  }
+}
+
+/// Renders import failures as `importing name: reason`, separated by `; `.
+fn list_import_failures(failures: &[(String, Error)]) -> String {
+  failures
+    .iter()
+    .map(|(name, error)| format!("importing {name}: {error}"))
+    .collect::<Vec<_>>()
+    .join("; ")
+}
+
+impl From<io::Error> for Error {
+  fn from(error: io::Error) -> Self {
+    Self::Io(Shared(Arc::new(error)))
+  }
+}
+
+#[cfg(feature = "io")]
+impl From<reqwest::Error> for Error {
+  fn from(error: reqwest::Error) -> Self {
+    Self::Http(Shared(Arc::new(error)))
+  }
+}
+
+impl From<serde_json::Error> for Error {
+  fn from(error: serde_json::Error) -> Self {
+    Self::Json(Shared(Arc::new(error)))
+  }
+}
+
+#[cfg(feature = "io")]
+impl From<zip::result::ZipError> for Error {
+  fn from(error: zip::result::ZipError) -> Self {
+    Self::Zip(Shared(Arc::new(error)))
+  }
+}
+
+#[cfg(feature = "io")]
+impl From<reqwest::header::ToStrError> for Error {
+  fn from(error: reqwest::header::ToStrError) -> Self {
+    Self::Header(Shared(Arc::new(error)))
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -165,5 +329,35 @@ mod tests {
     let err = Error::Profile("bad profile".to_string());
 
     assert_eq!(err.to_string(), "Profile error: bad profile");
+  }
+
+  #[test]
+  fn a_cloned_error_keeps_its_message_and_source() {
+    let err = Error::from(io::Error::new(io::ErrorKind::NotFound, "gone"));
+
+    let kept = err.clone();
+
+    assert_eq!(kept.to_string(), "IO error: gone");
+    assert_eq!(
+      std::error::Error::source(&kept).map(|source| source.to_string()),
+      Some("gone".to_string())
+    );
+  }
+
+  #[test]
+  fn a_wrapped_source_downcasts_to_the_original_error() {
+    let io = Error::from(io::Error::new(io::ErrorKind::NotFound, "gone"));
+    let json = Error::from(serde_json::from_str::<u8>("x").unwrap_err());
+
+    let io_source =
+      std::error::Error::source(&io).and_then(|source| source.downcast_ref::<io::Error>());
+    let json_source = std::error::Error::source(&json)
+      .and_then(|source| source.downcast_ref::<serde_json::Error>());
+
+    assert_eq!(
+      io_source.map(io::Error::kind),
+      Some(io::ErrorKind::NotFound)
+    );
+    assert!(json_source.is_some());
   }
 }

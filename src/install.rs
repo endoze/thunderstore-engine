@@ -24,9 +24,11 @@
 
 use crate::ecosystem::{Ecosystem, GameProfile, InstallRule, ModloaderPackage, TrackingMethod};
 use crate::error::{Error, Result};
+#[cfg(feature = "io")]
 use crate::util::io_context;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "io")]
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -79,6 +81,7 @@ pub fn state_tracker_from_plan(plan: &InstallPlan, mod_name: &str) -> Option<Mod
 /// disk while the mod is `enabled`, since disabling removes it. Shared `none`
 /// files are not checked: a user may delete a config on purpose. A plan that
 /// tracks nothing (a modpack of only metadata) is trivially on disk.
+#[cfg(feature = "io")]
 pub fn plan_is_on_disk(plan: &InstallPlan, root: &Path, mod_name: &str, enabled: bool) -> bool {
   let has_tracker = state_file_path(root, mod_name).exists();
 
@@ -114,6 +117,7 @@ pub fn state_file_path(profile_dir: &Path, mod_name: &str) -> PathBuf {
 }
 
 /// Writes a mod's state tracker to `<profile_dir>/_state/<mod>-state.yml`.
+#[cfg(feature = "io")]
 pub fn write_state_file(profile_dir: &Path, tracker: &ModFileTracker) -> Result<()> {
   let path = state_file_path(profile_dir, &tracker.mod_name);
 
@@ -129,6 +133,7 @@ pub fn write_state_file(profile_dir: &Path, tracker: &ModFileTracker) -> Result<
 }
 
 /// Reads a mod's state tracker, or `None` if the file does not exist.
+#[cfg(feature = "io")]
 pub fn read_state_file(profile_dir: &Path, mod_name: &str) -> Result<Option<ModFileTracker>> {
   let path = state_file_path(profile_dir, mod_name);
 
@@ -152,6 +157,7 @@ pub fn read_state_file(profile_dir: &Path, mod_name: &str) -> Result<Option<ModF
 /// payload file that is already gone (e.g. the mod was disabled first) is
 /// skipped. Unlike [`disable_mod`], this also deletes the tracker itself, since
 /// after an uninstall there is nothing left to restore.
+#[cfg(feature = "io")]
 pub fn remove_state_payload(profile_dir: &Path, mod_name: &str) -> Result<()> {
   clear_state_files(profile_dir, mod_name)?;
 
@@ -162,6 +168,7 @@ pub fn remove_state_payload(profile_dir: &Path, mod_name: &str) -> Result<()> {
 /// a reinstall that fails before writing a new one still leaves the record that
 /// [`remove_state_payload`] needs to uninstall the mod. A missing `_state` file
 /// is a no-op.
+#[cfg(feature = "io")]
 pub fn clear_state_files(profile_dir: &Path, mod_name: &str) -> Result<()> {
   match read_state_file(profile_dir, mod_name)? {
     Some(tracker) => remove_state_files(profile_dir, &tracker),
@@ -171,6 +178,7 @@ pub fn clear_state_files(profile_dir: &Path, mod_name: &str) -> Result<()> {
 
 /// Removes a mod's `_state` file, if it has one, leaving any payload files it
 /// names in place.
+#[cfg(feature = "io")]
 pub fn remove_state_file(profile_dir: &Path, mod_name: &str) -> Result<()> {
   let path = state_file_path(profile_dir, mod_name);
 
@@ -233,12 +241,13 @@ pub struct FileManifest {
   pub written: Vec<PathBuf>,
 }
 
-/// Builds an [`InstallPlan`] for a package.
+/// Builds an [`InstallPlan`] for a package extracted at `extracted_root`.
 ///
-/// If `package_full_name` is in the ecosystem's mod-loader registry, the package
-/// is a loader pack and unpacks to the root; otherwise its files are routed by the
-/// profile's [`InstallRule`]s. `archive_path` is the package's original zip, needed
+/// Walks the extracted directory and plans from what it finds; see
+/// [`plan_install_from`] for the routing rules and for planning from a file list
+/// without touching disk. `archive_path` is the package's original zip, needed
 /// only for `package-zip` loaders (e.g. GodotML); pass `None` when unavailable.
+#[cfg(feature = "io")]
 pub fn plan_install(
   ecosystem: &Ecosystem,
   profile: &GameProfile,
@@ -246,30 +255,164 @@ pub fn plan_install(
   extracted_root: &Path,
   archive_path: Option<&Path>,
 ) -> Result<InstallPlan> {
-  if let Some(pack) = ecosystem.modloader_package(package_full_name) {
-    return plan_loader_pack(pack, profile, extracted_root);
+  let walk_root = match ecosystem.modloader_package(package_full_name) {
+    Some(pack) if !pack.root_folder.is_empty() => match extracted_root.join(&pack.root_folder) {
+      nested if nested.is_dir() => nested,
+      _ => extracted_root.to_path_buf(),
+    },
+    Some(_) => extracted_root.to_path_buf(),
+    None if installs_whole_archive(profile) => {
+      return plan_install_from(
+        ecosystem,
+        profile,
+        package_full_name,
+        extracted_root,
+        &[],
+        archive_path,
+      );
+    }
+    None => extracted_root.to_path_buf(),
+  };
+
+  let files: Vec<PathBuf> = walk_files(&walk_root)?
+    .into_iter()
+    .map(|file| {
+      file
+        .strip_prefix(extracted_root)
+        .map(Path::to_path_buf)
+        .unwrap_or(file)
+    })
+    .collect();
+
+  plan_install_from(
+    ecosystem,
+    profile,
+    package_full_name,
+    extracted_root,
+    &files,
+    archive_path,
+  )
+}
+
+/// Builds an [`InstallPlan`] for a package from its file list, without touching
+/// disk.
+///
+/// `files` lists the package's regular files as paths relative to
+/// `extracted_root`, in any order; an archive's entry names work as they are,
+/// and its folder entries (empty, or ending in `/` or `\`) are skipped.
+/// Each planned [`InstallEntry::source`] is `extracted_root` joined with one of
+/// them, so `extracted_root` should be where the files are, or will be, extracted.
+///
+/// If `package_full_name` is in the ecosystem's mod-loader registry, the package
+/// is a loader pack and unpacks to the root; otherwise its files are routed by the
+/// profile's [`InstallRule`]s. `archive_path` is the package's original zip, needed
+/// only for `package-zip` loaders (e.g. GodotML); pass `None` when unavailable.
+///
+/// # Errors
+///
+/// [`Error::Install`] if a listed path is absolute or climbs out with `..`, if a
+/// destination would escape the install root, or if two files route to the same
+/// destination.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::{Path, PathBuf};
+/// use thunderstore_engine::ecosystem::Ecosystem;
+/// use thunderstore_engine::install::plan_install_from;
+///
+/// let eco = Ecosystem::bundled();
+/// let profile = eco.game("valheim").and_then(|game| game.profile()).unwrap();
+/// let files = [PathBuf::from("plugins/Mod.dll")];
+///
+/// let plan = plan_install_from(&eco, profile, "Owner-Mod", Path::new("/cache/Owner-Mod"), &files, None)?;
+///
+/// assert_eq!(plan.entries[0].source, Path::new("/cache/Owner-Mod/plugins/Mod.dll"));
+/// assert_eq!(plan.entries[0].dest_relative, Path::new("BepInEx/plugins/Owner-Mod/Mod.dll"));
+/// # Ok::<(), thunderstore_engine::Error>(())
+/// ```
+pub fn plan_install_from(
+  ecosystem: &Ecosystem,
+  profile: &GameProfile,
+  package_full_name: &str,
+  extracted_root: &Path,
+  files: &[PathBuf],
+  archive_path: Option<&Path>,
+) -> Result<InstallPlan> {
+  let mut files: Vec<PathBuf> = files
+    .iter()
+    .filter(|file| !names_a_folder(file))
+    .cloned()
+    .collect();
+
+  for file in &files {
+    ensure_safe_relative(file)?;
   }
 
-  plan_regular_mod(profile, package_full_name, extracted_root, archive_path)
+  files.sort();
+
+  if let Some(pack) = ecosystem.modloader_package(package_full_name) {
+    return plan_loader_pack(pack, profile, extracted_root, &files);
+  }
+
+  plan_regular_mod(
+    profile,
+    package_full_name,
+    extracted_root,
+    &files,
+    archive_path,
+  )
+}
+
+/// Whether `file` is an archive's folder entry rather than a file: empty, or
+/// ending in a separator.
+fn names_a_folder(file: &Path) -> bool {
+  matches!(
+    file.as_os_str().as_encoded_bytes().last(),
+    None | Some(b'/' | b'\\')
+  )
+}
+
+/// Whether `profile` installs a regular mod as its whole archive (a `package-zip`
+/// default rule), in which case planning needs no file list.
+#[cfg(feature = "io")]
+fn installs_whole_archive(profile: &GameProfile) -> bool {
+  let mut flat = Vec::new();
+
+  flatten_rules(&profile.install_rules, Path::new(""), &mut flat);
+
+  whole_archive_rule(&flat).is_some()
+}
+
+/// The `package-zip` default rule, if the profile has one.
+fn whole_archive_rule<'a, 'b>(flat: &'b [FlatRule<'a>]) -> Option<&'b FlatRule<'a>> {
+  flat
+    .iter()
+    .find(|r| r.rule.is_default_location && r.rule.tracking_method == TrackingMethod::PackageZip)
 }
 
 /// Plans a loader pack: unpack its payload to the profile root.
 ///
 /// Many packs nest their payload under a single subfolder;
 /// [`ModloaderPackage::root_folder`](crate::ecosystem::ModloaderPackage::root_folder)
-/// names it so the folder's *contents* land at the root. Package-root metadata
-/// (`manifest.json`, `icon.png`, `README.md`) is dropped. Files landing under an
-/// untracked route (e.g. the pack's own `BepInEx/config/`) are preserved across
-/// reinstalls; the rest are recorded so the loader can be uninstalled exactly.
+/// names it so the folder's *contents* land at the root. The subfolder is used
+/// when any listed file sits under it; otherwise the package root is. Package-root
+/// metadata (`manifest.json`, `icon.png`, `README.md`) is dropped. Files landing
+/// under an untracked route (e.g. the pack's own `BepInEx/config/`) are preserved
+/// across reinstalls; the rest are recorded so the loader can be uninstalled
+/// exactly.
 fn plan_loader_pack(
   pack: &ModloaderPackage,
   profile: &GameProfile,
   extracted_root: &Path,
+  files: &[PathBuf],
 ) -> Result<InstallPlan> {
-  let base = match extracted_root.join(&pack.root_folder) {
-    nested if !pack.root_folder.is_empty() && nested.is_dir() => nested,
-    _ => extracted_root.to_path_buf(),
-  };
+  let nested = Path::new(&pack.root_folder);
+  let has_nested = !pack.root_folder.is_empty()
+    && files
+      .iter()
+      .any(|file| file.starts_with(nested) && file != nested);
+  let base = if has_nested { nested } else { Path::new("") };
 
   let mut untracked = Vec::new();
 
@@ -282,15 +425,17 @@ fn plan_loader_pack(
 
   let mut entries = Vec::new();
 
-  for file in walk_files(&base)? {
-    let rel = file.strip_prefix(&base).unwrap_or(&file).to_path_buf();
+  for file in files {
+    let Ok(rel) = file.strip_prefix(base) else {
+      continue;
+    };
 
     if let Some(tracking) =
-      classify_loader_file(&rel, &untracked, &profile.relative_file_exclusions)?
+      classify_loader_file(rel, &untracked, &profile.relative_file_exclusions)?
     {
       entries.push(InstallEntry {
-        source: file,
-        dest_relative: rel,
+        source: extracted_root.join(file),
+        dest_relative: rel.to_path_buf(),
         tracking,
       });
     }
@@ -339,6 +484,7 @@ fn plan_regular_mod(
   profile: &GameProfile,
   ident: &str,
   extracted_root: &Path,
+  files: &[PathBuf],
   archive_path: Option<&Path>,
 ) -> Result<InstallPlan> {
   let mut flat = Vec::new();
@@ -347,38 +493,30 @@ fn plan_regular_mod(
 
   // Whole-package zip loaders (e.g. GodotML): the catch-all rule is `package-zip`,
   // so the entire archive is installed as a single file rather than per-file.
-  if let Some(rule) = flat
-    .iter()
-    .find(|r| r.rule.is_default_location && r.rule.tracking_method == TrackingMethod::PackageZip)
-  {
+  if let Some(rule) = whole_archive_rule(&flat) {
     return plan_package_zip(&rule.full_route, ident, archive_path);
   }
 
   let mut entries = Vec::new();
   let mut claimed: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
 
-  for file in walk_files(extracted_root)? {
-    let rel = file
-      .strip_prefix(extracted_root)
-      .unwrap_or(&file)
-      .to_path_buf();
-
-    match route_file(profile, &flat, ident, &rel)? {
+  for rel in files {
+    match route_file(profile, &flat, ident, rel)? {
       RouteOutcome::Route {
         dest_relative,
         tracking,
       } => {
         if let Some(earlier) = claimed.insert(dest_relative.clone(), rel.clone()) {
-          return Err(colliding_files(&earlier, &rel, &dest_relative));
+          return Err(colliding_files(&earlier, rel, &dest_relative));
         }
 
         entries.push(InstallEntry {
-          source: file,
+          source: extracted_root.join(rel),
           dest_relative,
           tracking,
         });
       }
-      RouteOutcome::Skip(reason) => log_route_skip(&rel, reason),
+      RouteOutcome::Skip(reason) => log_route_skip(rel, reason),
     }
   }
 
@@ -786,12 +924,27 @@ fn collect_routes<F: Fn(&InstallRule) -> bool>(
 /// best-effort: it inspects the final path component only (not symlinked parent
 /// directories) and is not race-free against a concurrent attacker mutating
 /// `root` mid-install.
+#[cfg(feature = "io")]
 pub fn apply_install(plan: &InstallPlan, root: &Path) -> Result<FileManifest> {
+  apply_install_reporting(plan, root, &mut |_, _| {})
+}
+
+/// [`apply_install`], calling `on_progress(done, total)` in plan entries before
+/// each entry and once more after the last.
+#[cfg(feature = "io")]
+pub(crate) fn apply_install_reporting(
+  plan: &InstallPlan,
+  root: &Path,
+  on_progress: &mut dyn FnMut(u64, u64),
+) -> Result<FileManifest> {
   let mut written = Vec::with_capacity(plan.entries.len());
   let mut created: Vec<PathBuf> = Vec::new();
   let mut created_dirs: Vec<PathBuf> = Vec::new();
+  let total = plan.entries.len() as u64;
 
-  for entry in &plan.entries {
+  for (done, entry) in plan.entries.iter().enumerate() {
+    on_progress(done as u64, total);
+
     if let Err(err) = ensure_safe_relative(&entry.dest_relative) {
       rollback_partial_install(&created, &created_dirs);
 
@@ -834,12 +987,15 @@ pub fn apply_install(plan: &InstallPlan, root: &Path) -> Result<FileManifest> {
     }
   }
 
+  on_progress(total, total);
+
   Ok(FileManifest { written })
 }
 
 /// What [`apply_install`] should do with one entry, given the state at its
 /// destination.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "io")]
 enum ApplyAction {
   /// Copy the source into place; `record` says whether to add it to the
   /// [`FileManifest`] (tracked files are recorded, shared config is not).
@@ -853,6 +1009,7 @@ enum ApplyAction {
 /// Decides what to do with an entry from its tracking method and whether the
 /// destination already exists / is a symlink. Pure — no filesystem access — so
 /// the write/skip/refuse policy is exhaustively table-testable.
+#[cfg(feature = "io")]
 fn classify_entry(tracking: TrackingMethod, exists: bool, is_symlink: bool) -> ApplyAction {
   if tracking == TrackingMethod::None && (exists || is_symlink) {
     return ApplyAction::SkipExistingConfig;
@@ -869,6 +1026,7 @@ fn classify_entry(tracking: TrackingMethod, exists: bool, is_symlink: bool) -> A
 
 /// Copies one entry's source to `dest`, creating parent directories as needed and
 /// recording any it newly created in `created_dirs` so a failed apply can undo them.
+#[cfg(feature = "io")]
 fn copy_entry(
   entry: &InstallEntry,
   dest: &Path,
@@ -906,6 +1064,7 @@ fn copy_entry(
 /// directory trees this call introduced — never `root` itself and never a
 /// directory that already existed. Already-recorded (now-existing) directories are
 /// skipped, so entries sharing a parent do not double-record it.
+#[cfg(feature = "io")]
 fn record_created_dirs(dir: &Path, root: &Path, created_dirs: &mut Vec<PathBuf>) {
   let mut missing = Vec::new();
   let mut current = dir;
@@ -930,6 +1089,7 @@ fn record_created_dirs(dir: &Path, root: &Path, created_dirs: &mut Vec<PathBuf>)
 /// deepest-first (children before parents) and only if empty, so a pre-existing or
 /// still-populated directory is never taken. Cleanup errors are logged, not
 /// propagated: the caller needs to see the original failure, not a secondary one.
+#[cfg(feature = "io")]
 fn rollback_partial_install(created: &[PathBuf], created_dirs: &[PathBuf]) {
   for path in created.iter().rev() {
     if let Err(err) = fs::remove_file(path) {
@@ -969,11 +1129,53 @@ fn rollback_partial_install(created: &[PathBuf], created_dirs: &[PathBuf]) {
 ///
 /// Sorted and deduplicated, which `read_dir` order alone does not give, so a
 /// caller listing these one per line reads the same list every run.
+///
+/// Lists each route from [`namespaced_routes`] and decides with
+/// [`plan_delisted_from`].
+#[cfg(feature = "io")]
 pub fn plan_delisted(
   profile: &GameProfile,
   root: &Path,
   keep: &BTreeSet<String>,
 ) -> Result<Vec<PathBuf>> {
+  let mut entries = Vec::new();
+
+  for route in namespaced_routes(profile)? {
+    let dir = root.join(&route);
+
+    if !dir.is_dir() {
+      continue;
+    }
+
+    for entry in fs::read_dir(&dir)
+      .map_err(|e| io_context(format!("reading install route {}", dir.display()), e))?
+    {
+      let entry =
+        entry.map_err(|e| io_context(format!("reading an entry under {}", dir.display()), e))?;
+      let path = entry.path();
+      let metadata = fs::symlink_metadata(&path)
+        .map_err(|e| io_context(format!("inspecting {}", path.display()), e))?;
+
+      entries.push(RouteEntry::new(
+        route.join(entry.file_name()),
+        metadata.is_dir(),
+        metadata.file_type().is_symlink(),
+      ));
+    }
+  }
+
+  Ok(plan_delisted_from(&entries, keep))
+}
+
+/// The root-relative routes under which each regular mod gets its own
+/// `<Owner-Name>` folder: every rule whose tracking method is namespaced.
+///
+/// These are the folders a caller lists to feed [`plan_delisted_from`].
+///
+/// # Errors
+///
+/// [`Error::Install`] if a route from the schema would escape the install root.
+pub fn namespaced_routes(profile: &GameProfile) -> Result<Vec<PathBuf>> {
   let mut routes = Vec::new();
 
   collect_routes(
@@ -983,37 +1185,73 @@ pub fn plan_delisted(
     &mut routes,
   );
 
-  let mut planned = BTreeSet::new();
-
-  for route in routes {
-    ensure_safe_relative(&route)?;
-
-    let dir = root.join(&route);
-
-    if !dir.is_dir() {
-      continue;
-    }
-
-    let mut listing = Vec::new();
-
-    for entry in fs::read_dir(&dir)
-      .map_err(|e| io_context(format!("reading install route {}", dir.display()), e))?
-    {
-      let path = entry
-        .map_err(|e| io_context(format!("reading an entry under {}", dir.display()), e))?
-        .path();
-      let metadata = fs::symlink_metadata(&path)
-        .map_err(|e| io_context(format!("inspecting {}", path.display()), e))?;
-
-      listing.push((path, metadata.is_dir(), metadata.file_type().is_symlink()));
-    }
-
-    for path in plan_reconcile(&listing, keep) {
-      planned.insert(path.strip_prefix(root).unwrap_or(&path).to_path_buf());
-    }
+  for route in &routes {
+    ensure_safe_relative(route)?;
   }
 
-  Ok(planned.into_iter().collect())
+  Ok(routes)
+}
+
+/// One entry found directly inside a namespaced install route, as input to
+/// [`plan_delisted_from`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RouteEntry {
+  /// The entry's path relative to the install root, e.g.
+  /// `BepInEx/plugins/Owner-Mod`.
+  pub path: PathBuf,
+  /// Whether the entry is a directory, without following a symlink.
+  pub is_dir: bool,
+  /// Whether the entry is a symlink.
+  pub is_symlink: bool,
+}
+
+impl RouteEntry {
+  /// Builds a [`RouteEntry`].
+  pub fn new(path: impl Into<PathBuf>, is_dir: bool, is_symlink: bool) -> Self {
+    Self {
+      path: path.into(),
+      is_dir,
+      is_symlink,
+    }
+  }
+}
+
+/// The mod folders a reconcile sweep would remove, decided from a listing of the
+/// [`namespaced_routes`] without touching disk.
+///
+/// A real directory whose name has the `<Owner-Name>` shape and is not in `keep`
+/// is selected. Symlinks, files, and folders of any other shape (a loader's
+/// `MMHOOK`, a user's own folder) are left alone. Returns the selected
+/// [`RouteEntry::path`]s, sorted and deduplicated.
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::BTreeSet;
+/// use std::path::PathBuf;
+/// use thunderstore_engine::install::{RouteEntry, plan_delisted_from};
+///
+/// let listing = [
+///   RouteEntry::new("BepInEx/plugins/Owner-Kept", true, false),
+///   RouteEntry::new("BepInEx/plugins/Owner-Gone", true, false),
+///   RouteEntry::new("BepInEx/plugins/MMHOOK", true, false),
+/// ];
+/// let keep = BTreeSet::from(["Owner-Kept".to_string()]);
+///
+/// assert_eq!(
+///   plan_delisted_from(&listing, &keep),
+///   vec![PathBuf::from("BepInEx/plugins/Owner-Gone")]
+/// );
+/// ```
+pub fn plan_delisted_from(entries: &[RouteEntry], keep: &BTreeSet<String>) -> Vec<PathBuf> {
+  let listing: Vec<(PathBuf, bool, bool)> = entries
+    .iter()
+    .map(|entry| (entry.path.clone(), entry.is_dir, entry.is_symlink))
+    .collect();
+  let planned: BTreeSet<PathBuf> = plan_reconcile(&listing, keep).into_iter().collect();
+
+  planned.into_iter().collect()
 }
 
 /// Reconciles the on-disk install to a desired set, removing the folders of mods
@@ -1022,6 +1260,7 @@ pub fn plan_delisted(
 /// This is [`plan_delisted`] followed by the removal, so there is one enumeration
 /// and one decision about what the sweep covers. Returns the removed directories
 /// (relative to `root`), which is exactly what `plan_delisted` returned.
+#[cfg(feature = "io")]
 pub fn remove_delisted(
   profile: &GameProfile,
   root: &Path,
@@ -1046,6 +1285,7 @@ pub fn remove_delisted(
 /// Shared routes (`none`, `state`) are untouched; a mod's `State`-tracked files
 /// are removed by [`remove_state_payload`] instead. A symlink where the folder
 /// would be is left alone, never followed, as [`remove_delisted`] does.
+#[cfg(feature = "io")]
 pub fn remove_mod_folders(profile: &GameProfile, root: &Path, ident: &str) -> Result<()> {
   let mut components = Path::new(ident).components();
 
@@ -1128,6 +1368,7 @@ fn looks_like_mod_ident(name: &str) -> bool {
 }
 
 /// Recursively collects all file paths under `dir` (skipping directories).
+#[cfg(feature = "io")]
 fn walk_files(dir: &Path) -> Result<Vec<PathBuf>> {
   let mut files = Vec::new();
   let mut stack = vec![dir.to_path_buf()];
@@ -1187,8 +1428,9 @@ pub fn plan_suffix_renames(files: &[PathBuf], disable: bool) -> Vec<(PathBuf, Pa
 /// Disables an installed mod: renames its `Subdir`-tracked files to `.old` and
 /// removes its `State`-tracked files (recoverable via the `_state` file on
 /// enable). Leaves shared/`none` config and the loader untouched.
+#[cfg(feature = "io")]
 pub fn disable_mod(profile: &GameProfile, profile_dir: &Path, mod_name: &str) -> Result<()> {
-  let tracker = read_state_file(profile_dir, mod_name)?;
+  let tracker = read_safe_state_file(profile_dir, mod_name)?;
 
   toggle_subdir_files(profile, profile_dir, mod_name, true)?;
 
@@ -1198,16 +1440,65 @@ pub fn disable_mod(profile: &GameProfile, profile_dir: &Path, mod_name: &str) ->
 /// Enables an installed mod: strips `.old` from its `Subdir`-tracked files and
 /// restores its `State`-tracked files by copying them back from the cache
 /// sources recorded in the `_state` file.
+///
+/// # Errors
+///
+/// [`Error::Install`] before anything is touched if the `_state` file names a
+/// destination outside `profile_dir`, or a source that is not a file of the
+/// same name in this mod's own package cache (`.../cache/<mod_name>/...`), so a
+/// tampered or imported record cannot copy any other file into the profile.
+#[cfg(feature = "io")]
 pub fn enable_mod(profile: &GameProfile, profile_dir: &Path, mod_name: &str) -> Result<()> {
-  let tracker = read_state_file(profile_dir, mod_name)?;
+  let tracker = read_safe_state_file(profile_dir, mod_name)?;
+
+  for (source, install_rel) in tracker.iter().flat_map(|tracker| &tracker.files) {
+    ensure_cached_source(mod_name, source, install_rel)?;
+  }
 
   toggle_subdir_files(profile, profile_dir, mod_name, false)?;
 
   toggle_state_files(profile_dir, tracker, false)
 }
 
+/// [`read_state_file`], refusing a tracker with any destination outside the
+/// profile so a toggle fails before it moves anything.
+#[cfg(feature = "io")]
+fn read_safe_state_file(profile_dir: &Path, mod_name: &str) -> Result<Option<ModFileTracker>> {
+  let tracker = read_state_file(profile_dir, mod_name)?;
+
+  for (_, install_rel) in tracker.iter().flat_map(|tracker| &tracker.files) {
+    ensure_safe_relative(Path::new(install_rel))?;
+  }
+
+  Ok(tracker)
+}
+
+/// Refuses a `_state` source that installing `mod_name` could not have
+/// recorded: anything but an absolute path, with no `..`, inside
+/// `cache/<mod_name>/`, naming a file called what `install_rel` is called.
+#[cfg(feature = "io")]
+fn ensure_cached_source(mod_name: &str, source: &str, install_rel: &str) -> Result<()> {
+  let path = Path::new(source);
+  let components: Vec<Component> = path.components().collect();
+  let in_own_cache = components
+    .windows(2)
+    .any(|pair| pair[0].as_os_str() == "cache" && pair[1].as_os_str() == mod_name);
+  let same_name =
+    path.file_name().is_some() && path.file_name() == Path::new(install_rel).file_name();
+
+  if path.is_absolute() && !components.contains(&Component::ParentDir) && in_own_cache && same_name
+  {
+    return Ok(());
+  }
+
+  Err(Error::Install(format!(
+    "the state record for {mod_name} restores {install_rel} from {source}, which is not in its package cache"
+  )))
+}
+
 /// Applies the `.old` rename policy to every file under each namespaced route's
 /// `<route>/<mod_name>/` folder.
+#[cfg(feature = "io")]
 fn toggle_subdir_files(
   profile: &GameProfile,
   profile_dir: &Path,
@@ -1248,6 +1539,7 @@ fn toggle_subdir_files(
 /// unreadable record failed only after [`toggle_subdir_files`] had renamed the
 /// mod's files, leaving them toggled on disk while the caller's `mods.yml` still
 /// recorded the old state.
+#[cfg(feature = "io")]
 fn toggle_state_files(
   profile_dir: &Path,
   tracker: Option<ModFileTracker>,
@@ -1270,6 +1562,7 @@ fn toggle_state_files(
 /// Each recorded path is re-validated before use: the `_state` file sits in a
 /// caller-owned directory and could be hand-edited, so a tampered entry must not
 /// delete a file outside the profile root.
+#[cfg(feature = "io")]
 fn remove_state_files(profile_dir: &Path, tracker: &ModFileTracker) -> Result<()> {
   for (_, install_rel) in &tracker.files {
     ensure_safe_relative(Path::new(install_rel))?;
@@ -1288,8 +1581,14 @@ fn remove_state_files(profile_dir: &Path, tracker: &ModFileTracker) -> Result<()
 
 /// Copies each `State`-tracked file back from its recorded cache source,
 /// creating any missing destination directories.
+///
+/// Each recorded path is re-validated before use, as [`remove_state_files`]
+/// does, so a tampered entry cannot direct a copy outside the profile root.
+#[cfg(feature = "io")]
 fn restore_state_files(profile_dir: &Path, tracker: &ModFileTracker) -> Result<()> {
   for (source, install_rel) in &tracker.files {
+    ensure_safe_relative(Path::new(install_rel))?;
+
     let dest = profile_dir.join(install_rel);
 
     if let Some(parent) = dest.parent() {
@@ -1308,8 +1607,11 @@ fn restore_state_files(profile_dir: &Path, tracker: &ModFileTracker) -> Result<(
 mod tests {
   use super::*;
   use crate::ecosystem::{Ecosystem, GameProfile};
+  #[cfg(feature = "io")]
   use std::fs::File;
+  #[cfg(feature = "io")]
   use std::io::Write;
+  #[cfg(feature = "io")]
   use tempfile::tempdir;
 
   fn eco() -> Ecosystem {
@@ -1320,6 +1622,7 @@ mod tests {
     eco.game(slug).unwrap().profile().unwrap().clone()
   }
 
+  #[cfg(feature = "io")]
   fn write(path: &Path, contents: &[u8]) {
     if let Some(parent) = path.parent() {
       fs::create_dir_all(parent).unwrap();
@@ -1341,6 +1644,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_bepinex_regular_mod_routing() {
     let eco = eco();
     let profile = profile(&eco, "valheim");
@@ -1430,6 +1734,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn classify_entry_truth_table() {
     // Shared config (`none`): skip if a file or a symlink already sits there;
     // otherwise write it, but never record it in the manifest.
@@ -1518,6 +1823,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn apply_install_empty_plan_writes_nothing() {
     let root = tempdir().unwrap();
 
@@ -1527,6 +1833,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_subdir_override_folder_preserves_subpath() {
     let eco = eco();
     let profile = profile(&eco, "valheim");
@@ -1549,6 +1856,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_subdir_override_folder_keeps_same_named_files_apart() {
     let eco = eco();
     let profile = profile(&eco, "valheim");
@@ -1572,6 +1880,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_override_folder_inside_a_wrapper_folder_is_matched() {
     let eco = eco();
     let profile = profile(&eco, "valheim");
@@ -1615,6 +1924,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_wrapper_folder_without_an_override_folder_still_flattens() {
     let eco = eco();
     let profile = profile(&eco, "valheim");
@@ -1638,6 +1948,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_subdir_default_route_flattens_nested_file() {
     let eco = eco();
     let profile = profile(&eco, "valheim");
@@ -1660,6 +1971,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_plan_refuses_files_flattened_onto_the_same_destination() {
     let eco = eco();
     let profile = profile(&eco, "valheim");
@@ -1682,6 +1994,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_root_file_named_like_override_folder_is_not_a_folder_match() {
     let eco = eco();
     let profile = profile(&eco, "valheim");
@@ -1704,6 +2017,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_toggle_and_uninstall_handle_nested_subdir_files() {
     let eco = eco();
     let profile = profile(&eco, "valheim");
@@ -1745,6 +2059,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_subdir_no_flatten_preserves_subpath() {
     let eco = eco();
     let profile = profile(&eco, "rumble");
@@ -1763,6 +2078,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_extension_routing_applies_to_nested_files() {
     let eco = eco();
     let profile = profile(&eco, "valheim");
@@ -1783,6 +2099,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_loader_pack_unpacks_to_root_stripping_nested_subfolder() {
     let eco = eco();
     let profile = profile(&eco, "valheim");
@@ -1809,6 +2126,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_loader_pack_preserves_config_on_reinstall() {
     let eco = eco();
     let profile = profile(&eco, "valheim");
@@ -1852,6 +2170,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_loader_pack_without_nesting_falls_back_to_root() {
     let eco = eco();
     let profile = profile(&eco, "valheim");
@@ -1870,6 +2189,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_loader_pack_skips_relative_file_exclusions() {
     let eco = eco();
     // The boneworks profile lists LICENCE in relativeFileExclusions.
@@ -1893,6 +2213,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_config_is_preserved_across_reinstall() {
     let eco = eco();
     let profile = profile(&eco, "valheim");
@@ -1928,6 +2249,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_apply_and_manifest_roundtrip() {
     let eco = eco();
     let profile = profile(&eco, "valheim");
@@ -1955,6 +2277,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_apply_install_rolls_back_on_failure() {
     let src = tempdir().unwrap();
 
@@ -1996,6 +2319,7 @@ mod tests {
 
   #[test]
   #[cfg(unix)]
+  #[cfg(feature = "io")]
   fn test_apply_install_preserves_symlinked_shared_config() {
     use std::os::unix::fs::symlink;
 
@@ -2034,6 +2358,7 @@ mod tests {
 
   #[test]
   #[cfg(unix)]
+  #[cfg(feature = "io")]
   fn test_apply_install_refuses_to_write_through_symlink() {
     use std::os::unix::fs::symlink;
 
@@ -2070,6 +2395,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_remove_delisted_removes_only_unwanted_mod_folders() {
     let eco = eco();
     let profile = profile(&eco, "valheim");
@@ -2095,6 +2421,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn plan_delisted_lists_what_remove_delisted_would_take_without_taking_it() {
     let eco = eco();
     let profile = profile(&eco, "valheim");
@@ -2136,6 +2463,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_remove_delisted_ignores_non_mod_directories() {
     let eco = eco();
     let profile = profile(&eco, "valheim");
@@ -2158,6 +2486,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_melonloader_flat_routing() {
     let eco = eco();
     let profile = profile(&eco, "boneworks");
@@ -2177,6 +2506,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_melonloader_specific_extension_wins_over_generic() {
     let eco = eco();
     let profile = profile(&eco, "boneworks");
@@ -2195,6 +2525,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_melonloader_subroute_extension_routing() {
     let eco = eco();
     let profile = profile(&eco, "bonelab");
@@ -2215,6 +2546,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_northstar_state_routing_and_exclusions() {
     let eco = eco();
     let profile = profile(&eco, "northstar");
@@ -2235,6 +2567,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_godotml_package_zip() {
     let eco = eco();
     let profile = profile(&eco, "brotato");
@@ -2258,6 +2591,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_plan_install_rejects_traversal_in_package_name() {
     let eco = eco();
     let profile = profile(&eco, "valheim");
@@ -2282,6 +2616,7 @@ mod tests {
 
   #[cfg(unix)]
   #[test]
+  #[cfg(feature = "io")]
   fn test_walk_files_skips_symlinks() {
     use std::os::unix::fs::symlink;
 
@@ -2335,6 +2670,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn remove_state_payload_deletes_files_then_tracker() {
     let dir = tempdir().unwrap();
     let root = dir.path();
@@ -2367,6 +2703,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn remove_state_payload_rejects_traversal_in_tracker() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("profile");
@@ -2387,6 +2724,110 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
+  fn enable_refuses_a_tracker_that_points_outside_the_profile() {
+    let eco = eco();
+    let profile = profile(&eco, "valheim");
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("profile");
+    let source = dir.path().join("cache/payload.dll");
+    let outside = dir.path().join("outside.dll");
+    let absolute = dir.path().join("absolute.dll");
+
+    write(&source, b"payload");
+    write(
+      &root.join("BepInEx/plugins/Author-Evil/plugin.dll.old"),
+      b"dll",
+    );
+
+    for escape in [
+      "../outside.dll".to_string(),
+      absolute.to_string_lossy().to_string(),
+    ] {
+      let tracker = ModFileTracker {
+        mod_name: "Author-Evil".to_string(),
+        files: vec![
+          (
+            source.to_string_lossy().to_string(),
+            "BepInEx/core/ok.dll".to_string(),
+          ),
+          (source.to_string_lossy().to_string(), escape.clone()),
+        ],
+      };
+
+      write_state_file(&root, &tracker).unwrap();
+
+      assert!(
+        enable_mod(&profile, &root, "Author-Evil").is_err(),
+        "{escape:?} must be refused"
+      );
+      assert!(!outside.exists() && !absolute.exists(), "for {escape:?}");
+      // Refused before anything moved, so the mod is still wholly disabled.
+      assert!(!root.join("BepInEx/core/ok.dll").exists(), "for {escape:?}");
+      assert!(
+        root
+          .join("BepInEx/plugins/Author-Evil/plugin.dll.old")
+          .exists(),
+        "for {escape:?}"
+      );
+    }
+  }
+
+  #[test]
+  #[cfg(feature = "io")]
+  fn enable_restores_only_files_from_the_mods_own_package_cache() {
+    let eco = eco();
+    let profile = profile(&eco, "valheim");
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("profile");
+    let cached = dir.path().join("cache/Author-Evil/1.0.0");
+    let secret = dir.path().join("home/.ssh/id_rsa");
+
+    write(&cached.join("ok.dll"), b"payload");
+    write(&cached.join("evil.cfg"), b"imported");
+    write(&secret, b"secret");
+
+    for (source, dest) in [
+      (secret.clone(), "BepInEx/config/id_rsa"),
+      (cached.join("evil.cfg"), "BepInEx/core/evil.dll"),
+      (
+        dir.path().join("cache/Other-Mod/1.0.0/ok.dll"),
+        "BepInEx/core/ok.dll",
+      ),
+    ] {
+      let tracker = ModFileTracker {
+        mod_name: "Author-Evil".to_string(),
+        files: vec![(source.to_string_lossy().to_string(), dest.to_string())],
+      };
+
+      write_state_file(&root, &tracker).unwrap();
+
+      assert!(
+        enable_mod(&profile, &root, "Author-Evil").is_err(),
+        "{source:?} must be refused"
+      );
+      assert!(!root.join(dest).exists(), "for {source:?}");
+    }
+
+    let tracker = ModFileTracker {
+      mod_name: "Author-Evil".to_string(),
+      files: vec![(
+        cached.join("ok.dll").to_string_lossy().to_string(),
+        "BepInEx/core/ok.dll".to_string(),
+      )],
+    };
+
+    write_state_file(&root, &tracker).unwrap();
+    enable_mod(&profile, &root, "Author-Evil").unwrap();
+
+    assert_eq!(
+      fs::read(root.join("BepInEx/core/ok.dll")).unwrap(),
+      b"payload"
+    );
+  }
+
+  #[test]
+  #[cfg(feature = "io")]
   fn state_file_round_trips() {
     let dir = tempdir().unwrap();
     let tracker = ModFileTracker {
@@ -2436,6 +2877,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn disable_enable_subdir_renames_files() {
     let eco = eco();
     let profile = profile(&eco, "valheim");
@@ -2459,6 +2901,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn disable_enable_state_removes_and_restores_from_cache() {
     let eco = eco();
     let profile = profile(&eco, "valheim");
@@ -2468,7 +2911,7 @@ mod tests {
 
     // A cached source file and its installed copy under a State route.
     let cache = tempdir().unwrap();
-    let src = cache.path().join("loader.dll");
+    let src = cache.path().join("cache/Author-Loader/1.0.0/loader.dll");
     write(&src, b"loader");
     write(&root.join("BepInEx/core/loader.dll"), b"loader");
 
@@ -2488,5 +2931,265 @@ mod tests {
     enable_mod(&profile, root, "Author-Loader").unwrap();
 
     assert!(root.join("BepInEx/core/loader.dll").exists());
+  }
+
+  fn listed(files: &[&str]) -> Vec<PathBuf> {
+    files.iter().map(PathBuf::from).collect()
+  }
+
+  #[test]
+  fn plan_install_from_routes_a_listed_regular_mod() {
+    let eco = eco();
+    let profile = profile(&eco, "valheim");
+    let root = Path::new("/cache/Author-Mod/1.0.0");
+
+    let plan = plan_install_from(
+      &eco,
+      &profile,
+      "Author-Mod",
+      root,
+      &listed(&["plugins/Mod.dll", "config/Mod.cfg"]),
+      None,
+    )
+    .unwrap();
+
+    let routed = plan
+      .entries
+      .iter()
+      .find(|entry| entry.dest_relative == Path::new("BepInEx/plugins/Author-Mod/Mod.dll"))
+      .unwrap();
+
+    assert_eq!(routed.source, root.join("plugins/Mod.dll"));
+    assert!(dest_set(&plan).contains(&"BepInEx/config/Mod.cfg".to_string()));
+  }
+
+  #[test]
+  fn plan_install_from_skips_the_folder_entries_an_archive_lists() {
+    let eco = eco();
+    let profile = profile(&eco, "valheim");
+
+    let regular = plan_install_from(
+      &eco,
+      &profile,
+      "Author-Mod",
+      Path::new("/cache/Author-Mod/1.0.0"),
+      &listed(&["plugins/", "plugins/Mod.dll", "config\\", "config/Mod.cfg"]),
+      None,
+    )
+    .unwrap();
+    let pack = plan_install_from(
+      &eco,
+      &profile,
+      "denikson-BepInExPack_Valheim",
+      Path::new("/cache/pack"),
+      &listed(&[
+        "BepInExPack_Valheim/",
+        "BepInExPack_Valheim/BepInEx/",
+        "BepInExPack_Valheim/BepInEx/core/BepInEx.dll",
+      ]),
+      None,
+    )
+    .unwrap();
+
+    assert_eq!(
+      dest_set(&regular),
+      [
+        "BepInEx/config/Mod.cfg",
+        "BepInEx/plugins/Author-Mod/Mod.dll"
+      ]
+    );
+    assert_eq!(dest_set(&pack), ["BepInEx/core/BepInEx.dll"]);
+  }
+
+  #[test]
+  fn plan_install_from_is_independent_of_listing_order() {
+    let eco = eco();
+    let profile = profile(&eco, "valheim");
+    let root = Path::new("/cache/Author-Mod");
+    let files = listed(&["plugins/b.dll", "plugins/a.dll", "README.md"]);
+    let mut reversed = files.clone();
+
+    reversed.reverse();
+
+    let forward = plan_install_from(&eco, &profile, "Author-Mod", root, &files, None).unwrap();
+    let backward = plan_install_from(&eco, &profile, "Author-Mod", root, &reversed, None).unwrap();
+
+    assert_eq!(forward.entries, backward.entries);
+  }
+
+  #[test]
+  fn plan_install_from_unpacks_a_listed_loader_pack_from_its_root_folder() {
+    let eco = eco();
+    let profile = profile(&eco, "valheim");
+    let root = Path::new("/cache/pack");
+
+    let plan = plan_install_from(
+      &eco,
+      &profile,
+      "denikson-BepInExPack_Valheim",
+      root,
+      &listed(&[
+        "manifest.json",
+        "icon.png",
+        "BepInExPack_Valheim/winhttp.dll",
+        "BepInExPack_Valheim/BepInEx/core/BepInEx.dll",
+      ]),
+      None,
+    )
+    .unwrap();
+
+    assert_eq!(
+      dest_set(&plan),
+      vec![
+        "BepInEx/core/BepInEx.dll".to_string(),
+        "winhttp.dll".to_string()
+      ]
+    );
+    assert!(
+      plan
+        .entries
+        .iter()
+        .any(|entry| entry.source == root.join("BepInExPack_Valheim/winhttp.dll"))
+    );
+  }
+
+  #[test]
+  fn plan_install_from_falls_back_to_the_package_root_without_the_root_folder() {
+    let eco = eco();
+    let profile = profile(&eco, "valheim");
+
+    let plan = plan_install_from(
+      &eco,
+      &profile,
+      "denikson-BepInExPack_Valheim",
+      Path::new("/cache/pack"),
+      &listed(&["manifest.json", "winhttp.dll", "BepInEx/core/BepInEx.dll"]),
+      None,
+    )
+    .unwrap();
+
+    assert_eq!(
+      dest_set(&plan),
+      vec![
+        "BepInEx/core/BepInEx.dll".to_string(),
+        "winhttp.dll".to_string()
+      ]
+    );
+  }
+
+  #[test]
+  fn plan_install_from_rejects_listed_paths_that_escape_the_root() {
+    let eco = eco();
+    let profile = profile(&eco, "valheim");
+    let root = Path::new("/cache/Author-Mod");
+
+    for bad in ["../outside.dll", "/etc/passwd"] {
+      let result = plan_install_from(&eco, &profile, "Author-Mod", root, &listed(&[bad]), None);
+
+      assert!(
+        matches!(result, Err(Error::Install(_))),
+        "{bad} was accepted"
+      );
+    }
+  }
+
+  #[test]
+  fn plan_install_from_refuses_files_flattened_onto_one_destination() {
+    let eco = eco();
+    let profile = profile(&eco, "valheim");
+
+    let result = plan_install_from(
+      &eco,
+      &profile,
+      "Author-Mod",
+      Path::new("/cache/Author-Mod"),
+      &listed(&["one/Mod.dll", "two/Mod.dll"]),
+      None,
+    );
+
+    assert!(matches!(result, Err(Error::Install(_))));
+  }
+
+  #[test]
+  fn plan_install_from_needs_no_listing_for_a_whole_archive_install() {
+    let eco = eco();
+    let profile = profile(&eco, "brotato");
+    let archive = Path::new("/downloads/Author-Mod-1.0.0.zip");
+
+    let plan = plan_install_from(
+      &eco,
+      &profile,
+      "Author-Mod",
+      Path::new("/cache/Author-Mod"),
+      &[],
+      Some(archive),
+    )
+    .unwrap();
+
+    assert_eq!(dest_set(&plan), vec!["mods/Author-Mod.zip".to_string()]);
+    assert_eq!(plan.entries[0].source, archive);
+  }
+
+  #[test]
+  #[cfg(feature = "io")]
+  fn plan_install_matches_plan_install_from_over_the_walked_files() {
+    let eco = eco();
+    let profile = profile(&eco, "valheim");
+    let pkg = tempdir().unwrap();
+    let root = pkg.path();
+
+    write(&root.join("manifest.json"), b"{}");
+    write(&root.join("plugins/Mod.dll"), b"dll");
+    write(&root.join("plugins/sub/Extra.dll"), b"dll");
+    write(&root.join("config/Mod.cfg"), b"cfg");
+
+    let walked = plan_install(&eco, &profile, "Author-Mod", root, None).unwrap();
+    let listed = plan_install_from(
+      &eco,
+      &profile,
+      "Author-Mod",
+      root,
+      &listed(&[
+        "config/Mod.cfg",
+        "manifest.json",
+        "plugins/Mod.dll",
+        "plugins/sub/Extra.dll",
+      ]),
+      None,
+    )
+    .unwrap();
+
+    assert_eq!(walked.entries, listed.entries);
+  }
+
+  #[test]
+  fn namespaced_routes_lists_each_per_mod_route() {
+    let eco = eco();
+    let routes = namespaced_routes(&profile(&eco, "valheim")).unwrap();
+
+    assert!(routes.contains(&PathBuf::from("BepInEx/plugins")));
+    assert!(!routes.contains(&PathBuf::from("BepInEx/config")));
+  }
+
+  #[test]
+  fn plan_delisted_from_selects_unkept_mod_folders_only() {
+    let keep = BTreeSet::from(["Owner-Kept".to_string()]);
+    let listing = [
+      RouteEntry::new("BepInEx/plugins/Owner-Kept", true, false),
+      RouteEntry::new("BepInEx/plugins/Owner-Gone", true, false),
+      RouteEntry::new("BepInEx/patchers/Owner-Gone", true, false),
+      RouteEntry::new("BepInEx/plugins/Owner-Linked", true, true),
+      RouteEntry::new("BepInEx/plugins/Owner-File", false, false),
+      RouteEntry::new("BepInEx/plugins/MMHOOK", true, false),
+      RouteEntry::new("BepInEx/plugins/Owner-Gone", true, false),
+    ];
+
+    assert_eq!(
+      plan_delisted_from(&listing, &keep),
+      vec![
+        PathBuf::from("BepInEx/patchers/Owner-Gone"),
+        PathBuf::from("BepInEx/plugins/Owner-Gone"),
+      ]
+    );
   }
 }

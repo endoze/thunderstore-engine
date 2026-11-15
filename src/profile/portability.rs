@@ -14,16 +14,25 @@
 
 #![deny(missing_docs)]
 
+#[cfg(feature = "io")]
 use crate::client::ThunderstoreClient;
 use crate::error::{Error, Result};
 use crate::profile::modlist::{ProfileMod, SemVer};
+#[cfg(feature = "io")]
 use crate::util::{canonicalize_missing, same_file};
+#[cfg(feature = "io")]
 use base64::Engine as _;
+#[cfg(feature = "io")]
 use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "io")]
 use std::fs;
+#[cfg(feature = "io")]
 use std::io::{Cursor, Read, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
+#[cfg(feature = "io")]
+use std::path::{Component, Path};
+#[cfg(feature = "io")]
 use zip::write::{FileOptions, ZipWriter};
 
 /// One entry of an `export.r2x` mod list.
@@ -89,6 +98,7 @@ pub fn parse_export_r2x(yaml: &str) -> Result<ExportFormat> {
 }
 
 /// Filename suffixes r2modman treats as config files worth exporting.
+#[cfg(feature = "io")]
 const CONFIG_EXTENSIONS: [&str; 6] = [".cfg", ".txt", ".json", ".yml", ".yaml", ".ini"];
 
 /// Whether a target-relative path is excluded from an export.
@@ -97,6 +107,7 @@ const CONFIG_EXTENSIONS: [&str; 6] = [".cfg", ".txt", ".json", ".yml", ".yaml", 
 /// the runtime it never ships (`dotnet/`, `MelonLoader/`, `GDWeave/core|mods`),
 /// per-mod package metadata, and `BepInEx/config/` (added separately under the
 /// zip's `config/` folder). Pure — no filesystem access.
+#[cfg(feature = "io")]
 fn is_pruned(rel: &Path) -> bool {
   let normalized = rel.to_string_lossy().replace('\\', "/");
 
@@ -122,6 +133,7 @@ fn is_pruned(rel: &Path) -> bool {
 
 /// Whether a path is a per-mod `BepInEx/plugins/<Owner-Name>/manifest.json`,
 /// which r2modman strips from an export.
+#[cfg(feature = "io")]
 fn is_plugin_manifest(normalized: &str) -> bool {
   let parts: Vec<&str> = normalized.split('/').collect();
 
@@ -133,6 +145,7 @@ fn is_plugin_manifest(normalized: &str) -> bool {
 
 /// Whether a filename ends with one of [`CONFIG_EXTENSIONS`] (case-insensitive).
 /// Pure — no filesystem access.
+#[cfg(feature = "io")]
 fn is_config_file(rel: &Path) -> bool {
   let name = match rel.file_name().and_then(|n| n.to_str()) {
     Some(name) => name.to_ascii_lowercase(),
@@ -144,6 +157,7 @@ fn is_config_file(rel: &Path) -> bool {
 
 /// Collects the target-relative paths an export should carry: config files that
 /// survive the prune list, sorted for a deterministic archive.
+#[cfg(feature = "io")]
 fn collect_export_paths(target_dir: &Path) -> Result<Vec<PathBuf>> {
   let mut found = Vec::new();
 
@@ -161,6 +175,7 @@ fn collect_export_paths(target_dir: &Path) -> Result<Vec<PathBuf>> {
 
 /// Recursively collects file paths under `dir`, relative to `root`, skipping
 /// symlinks so an export cannot escape the target (mirrors `install::walk_files`).
+#[cfg(feature = "io")]
 fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
   if !dir.is_dir() {
     return Ok(());
@@ -189,12 +204,15 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> 
 }
 
 /// The manifest filename inside a `.r2z`.
+#[cfg(feature = "io")]
 const EXPORT_MANIFEST: &str = "export.r2x";
 
 /// The archive folder that a target's `BepInEx/config/` tree is re-rooted into.
+#[cfg(feature = "io")]
 const ARCHIVE_CONFIG_DIR: &str = "config";
 
 /// The target-relative path of the shared BepInEx config tree.
+#[cfg(feature = "io")]
 const BEPINEX_CONFIG_DIR: &str = "BepInEx/config";
 
 /// Builds the `.r2z` bytes for `target_dir`.
@@ -225,6 +243,7 @@ const BEPINEX_CONFIG_DIR: &str = "BepInEx/config";
 /// std::fs::write("my-profile.r2z", &bytes)?;
 /// # Ok::<(), thunderstore_engine::Error>(())
 /// ```
+#[cfg(feature = "io")]
 pub fn build_r2z_in(target_dir: &Path, profile_name: &str) -> Result<Vec<u8>> {
   let mods = crate::profile::modlist::read(target_dir)?;
   let manifest = export_r2x_to_string(&export_format_from_mods(profile_name, &mods))?;
@@ -269,6 +288,7 @@ pub fn build_r2z_in(target_dir: &Path, profile_name: &str) -> Result<Vec<u8>> {
 }
 
 /// Adds one file to the archive under `archive_path`.
+#[cfg(feature = "io")]
 fn add_zip_file(
   zip: &mut ZipWriter<Cursor<Vec<u8>>>,
   options: FileOptions<'_, ()>,
@@ -290,16 +310,20 @@ fn add_zip_file(
 
 /// Writes `target_dir`'s export to `<out_dir>/<profile_name>_<timestamp_millis>.r2z`
 /// and returns the path. `timestamp_millis` is supplied by the caller so the
-/// filename is deterministic and testable. `profile_name` is validated (see
-/// [`crate::profile::layout::validate_name`]) because it becomes part of the
-/// output filename; an unchecked name could otherwise write outside `out_dir`.
+/// filename is deterministic and testable. `profile_name` is refused as
+/// [`BadProfile::InvalidName`](crate::profile::layout::BadProfile::InvalidName)
+/// if it could escape `out_dir`, since it becomes part of the output filename.
+/// It is not held to the stricter
+/// [`crate::profile::layout::validate_name`] rules, so a profile named under
+/// older rules can still be exported.
+#[cfg(feature = "io")]
 pub fn export_to_file_in(
   target_dir: &Path,
   profile_name: &str,
   out_dir: &Path,
   timestamp_millis: u64,
 ) -> Result<PathBuf> {
-  crate::profile::layout::validate_name(profile_name)?;
+  crate::profile::layout::validate_existing_name(profile_name)?;
 
   let bytes = build_r2z_in(target_dir, profile_name)?;
 
@@ -316,6 +340,7 @@ pub fn export_to_file_in(
 
 /// Exports an r2modman-layout profile into `<base>/<game>/exports/`.
 /// See [`export_to_file_in`].
+#[cfg(feature = "io")]
 pub fn export_to_file(
   base: &Path,
   game: &str,
@@ -331,14 +356,17 @@ pub fn export_to_file(
 }
 
 /// Upstream ceiling on a shared profile's zip, before base64.
+#[cfg(feature = "io")]
 const MAX_EXPORT_CODE_BYTES: usize = 20_000_000;
 
 /// The literal prefix Thunderstore's profile-code payload carries.
+#[cfg(feature = "io")]
 const PROFILE_DATA_PREFIX: &str = "#r2modman";
 
 /// Wraps `.r2z` bytes in the profile-code payload: the `#r2modman` prefix, a
 /// newline, then base64 of the zip. Rejects a zip above the upstream 20 MB cap
 /// before any upload is attempted.
+#[cfg(feature = "io")]
 fn encode_profile_payload(zip_bytes: &[u8]) -> Result<Vec<u8>> {
   if zip_bytes.len() > MAX_EXPORT_CODE_BYTES {
     return Err(Error::SizeLimitExceeded {
@@ -360,6 +388,7 @@ fn encode_profile_payload(zip_bytes: &[u8]) -> Result<Vec<u8>> {
 /// `profile_name` is not validated here: unlike [`export_to_file_in`], it never
 /// becomes part of a filesystem path — it only rides inside the `export.r2x`
 /// manifest carried by the uploaded payload.
+#[cfg(feature = "io")]
 pub async fn export_code_in(
   target_dir: &Path,
   profile_name: &str,
@@ -371,6 +400,7 @@ pub async fn export_code_in(
 }
 
 /// Exports an r2modman-layout profile as a shareable code. See [`export_code_in`].
+#[cfg(feature = "io")]
 pub async fn export_code(
   base: &Path,
   game: &str,
@@ -387,12 +417,14 @@ pub async fn export_code(
 
 /// Extensions never written by an import: a shared profile carries config, not
 /// executable code, so a hostile `.r2z` cannot plant a binary.
+#[cfg(feature = "io")]
 const BLOCKED_IMPORT_EXTENSIONS: [&str; 12] = [
   ".dll", ".exe", ".bat", ".cmd", ".com", ".ps1", ".sh", ".js", ".vbs", ".msi", ".scr", ".jar",
 ];
 
 /// Unwraps a profile-code response body into `.r2z` bytes: validates the
 /// `#r2modman` prefix, then base64-decodes the remainder.
+#[cfg(feature = "io")]
 fn decode_profile_payload(body: &[u8]) -> Result<Vec<u8>> {
   let text = std::str::from_utf8(body)
     .map_err(|e| Error::Profile(format!("profile code is not valid UTF-8: {e}")))?;
@@ -410,9 +442,11 @@ fn decode_profile_payload(body: &[u8]) -> Result<Vec<u8>> {
 /// size of an import. A shared profile carries text config, so this sits far
 /// above any legitimate export while rejecting a decompression bomb (DEFLATE
 /// can reach ~1032:1, so a tiny `.r2z` can otherwise inflate to gigabytes).
+#[cfg(feature = "io")]
 const MAX_IMPORT_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
 
 /// See `MAX_IMPORT_ENTRY_BYTES`.
+#[cfg(feature = "io")]
 const MAX_IMPORT_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Reads one archive entry fully into memory, capped at `MAX_IMPORT_ENTRY_BYTES`.
@@ -421,6 +455,7 @@ const MAX_IMPORT_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 /// decompressor, not any size the archive declares, so a crafted high-ratio
 /// entry cannot forge its way past it. Returns [`Error::ExtractLimitExceeded`]
 /// on breach — the same variant [`crate::extract`] uses for this class of guard.
+#[cfg(feature = "io")]
 fn read_capped_entry(entry: &mut impl Read, label: &str) -> Result<Vec<u8>> {
   let mut bytes = Vec::new();
 
@@ -439,6 +474,7 @@ fn read_capped_entry(entry: &mut impl Read, label: &str) -> Result<Vec<u8>> {
 }
 
 /// Reads an export manifest from either a `.r2z` archive or bare `.r2x` YAML.
+#[cfg(feature = "io")]
 pub fn read_export(bytes: &[u8]) -> Result<ExportFormat> {
   match zip::ZipArchive::new(Cursor::new(bytes.to_vec())) {
     Ok(mut archive) => {
@@ -464,14 +500,16 @@ pub fn read_export(bytes: &[u8]) -> Result<ExportFormat> {
 /// Maps an archive entry name to its target-relative destination, or `None` when
 /// the entry must not be written.
 ///
-/// The manifest and `mods.yml` are skipped (the mod list is applied by installing,
-/// not by copying), a `config/…` entry is re-rooted back under `BepInEx/`, and any
+/// The manifest, `mods.yml`, and `_state/` are skipped (the mod list and its
+/// state records come from installing, not copying; an export never holds
+/// them), a `config/…` entry is re-rooted back under `BepInEx/`, and any
 /// executable extension or unsafe path is refused. Pure — no filesystem access.
 ///
 /// The blocklist check is matched against the name with trailing dots and
 /// spaces stripped: Windows silently drops those from the final path component
 /// on create, so an entry named e.g. `Evil.dll.` would otherwise land on disk as
 /// `Evil.dll` and bypass the filter on the platform that matters most here.
+#[cfg(feature = "io")]
 fn import_config_key(name: &str) -> Option<PathBuf> {
   let normalized = name.replace('\\', "/");
 
@@ -507,6 +545,15 @@ fn import_config_key(name: &str) -> Option<PathBuf> {
     }
   }
 
+  let first = path.components().find_map(|component| match component {
+    Component::Normal(name) => Some(name.to_string_lossy().to_ascii_lowercase()),
+    _ => None,
+  });
+
+  if first.is_some_and(|first| first.trim_end_matches(['.', ' ']) == "_state") {
+    return None;
+  }
+
   Some(path)
 }
 
@@ -518,6 +565,7 @@ fn import_config_key(name: &str) -> Option<PathBuf> {
 /// does. This distinguishes "not a zip at all" from "a zip that failed to
 /// parse" — the latter is a real corruption and must still surface as an
 /// error rather than be swallowed as "no configs".
+#[cfg(feature = "io")]
 fn looks_like_zip(bytes: &[u8]) -> bool {
   bytes.len() >= 2 && &bytes[0..2] == b"PK"
 }
@@ -530,6 +578,7 @@ fn looks_like_zip(bytes: &[u8]) -> bool {
 /// target. This is best-effort: it inspects the final path component only
 /// (not symlinked parent directories) and is not race-free against a
 /// concurrent attacker mutating the target mid-import.
+#[cfg(feature = "io")]
 fn refuse_symlink_dest(dest: &Path) -> Result<()> {
   let is_symlink = fs::symlink_metadata(dest)
     .map(|metadata| metadata.file_type().is_symlink())
@@ -562,6 +611,7 @@ fn refuse_symlink_dest(dest: &Path) -> Result<()> {
 /// Each entry is bounded by `MAX_IMPORT_ENTRY_BYTES`, and the running total
 /// across the whole import by `MAX_IMPORT_TOTAL_BYTES`, so a decompression
 /// bomb hiding in an otherwise-valid config entry cannot exhaust memory.
+#[cfg(feature = "io")]
 pub fn extract_configs_in(target_dir: &Path, zip_bytes: &[u8]) -> Result<Vec<PathBuf>> {
   if !looks_like_zip(zip_bytes) {
     return Ok(Vec::new());
@@ -643,6 +693,7 @@ pub fn extract_configs_in(target_dir: &Path, zip_bytes: &[u8]) -> Result<Vec<Pat
 /// skipped as already current, so importing a profile the target already
 /// matches reports every mod as unchanged.
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "io")]
 pub async fn import_r2z_in(
   target_dir: &Path,
   cache_base: &Path,
@@ -694,16 +745,20 @@ pub async fn import_r2z_in(
   // Importing again once the cause is fixed skips the mods already installed
   // and completes it. A missing exported version is never fixed by a retry
   // alone, so the message does not promise one will.
-  if let Some((name, error)) = outcome.failed.into_iter().next() {
-    return Err(Error::Profile(format!(
-      "importing {name}: {error}; the import is unfinished (its config files were \
-       not restored)"
-    )));
+  if !outcome.failed.is_empty() {
+    return Err(Error::ImportUnfinished {
+      failures: outcome.failed,
+    });
   }
 
   // Configs are extracted after every install, so an exported per-mod config
   // wins over the package default the install just wrote.
-  extract_configs_in(target_dir, zip_bytes)?;
+  let config_dir = target_dir.to_path_buf();
+  let config_zip = zip_bytes.to_vec();
+
+  tokio::task::spawn_blocking(move || extract_configs_in(&config_dir, &config_zip))
+    .await
+    .map_err(|e| Error::Install(format!("config extraction task failed: {e}")))??;
 
   // `install_batch` already sorts, dedups, and keeps the two lists disjoint.
   Ok(ImportedMods {
@@ -733,6 +788,7 @@ pub struct ImportedMods {
 
 /// Imports a shared profile by its Thunderstore code. See [`import_r2z_in`].
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "io")]
 pub async fn import_code_in(
   target_dir: &Path,
   cache_base: &Path,
@@ -785,6 +841,7 @@ pub async fn import_code_in(
 /// Failure can leave `target_dir` partially populated: the copy is not
 /// transactional, so a caller that must not keep a half-imported profile should
 /// import into a scratch directory and move it into place on success.
+#[cfg(feature = "io")]
 pub fn import_r2modman_dir(source_profile_dir: &Path, target_dir: &Path) -> Result<()> {
   if !source_profile_dir.is_dir() {
     return Err(Error::Profile(format!(
@@ -847,6 +904,7 @@ pub struct AdoptedProfile {
 /// `cache_base` is the package cache root and must not be `target_dir`; see
 /// [`crate::profile::install_mod_in`].
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "io")]
 pub async fn adopt_r2modman_dir_in(
   source_profile_dir: &Path,
   target_dir: &Path,
@@ -952,6 +1010,7 @@ pub struct AdoptOutcome {
 /// file present but incomplete. Keying on the file's existence would both hide
 /// that and refuse the retry, stranding the remaining mods on disk where a later
 /// reconcile would sweep them.
+#[cfg(feature = "io")]
 pub fn needs_adoption(target_dir: &Path, desired: &[String]) -> Result<bool> {
   if desired.is_empty() {
     return Ok(false);
@@ -982,6 +1041,7 @@ pub fn needs_adoption(target_dir: &Path, desired: &[String]) -> Result<bool> {
 /// ([`now_millis`](crate::profile::modlist::now_millis)); reusing one from an
 /// earlier install reports the mods that install placed as adopted again.
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "io")]
 pub async fn adopt_names_in(
   target_dir: &Path,
   cache_base: &Path,
@@ -1059,10 +1119,7 @@ pub async fn adopt_names_in(
     });
   }
 
-  let game_profile = eco
-    .game(game)
-    .and_then(|g| g.profile())
-    .ok_or_else(|| Error::Profile(format!("no ecosystem profile for game {game:?}")))?;
+  let game_profile = eco.require_profile(game)?;
   let keep: std::collections::BTreeSet<String> =
     recorded.iter().map(|entry| entry.name.clone()).collect();
   let swept = crate::install::remove_delisted(game_profile, target_dir, &keep)?;
@@ -1094,6 +1151,7 @@ pub async fn adopt_names_in(
 /// reached through a symlinked directory still compares equal to what it names. A
 /// path that cannot be resolved is compared as written rather than assumed
 /// disjoint.
+#[cfg(feature = "io")]
 pub fn ensure_disjoint_trees(source: &Path, target: &Path) -> Result<()> {
   let source_at = resolve_as_far_as_it_exists(source);
   let target_at = resolve_as_far_as_it_exists(target);
@@ -1148,6 +1206,7 @@ pub fn ensure_disjoint_trees(source: &Path, target: &Path) -> Result<()> {
 /// prefix, or a permissions error). That fallback is intentional and matches
 /// `ensure_disjoint_trees`'s documented behavior: compare something rather
 /// than assume disjoint.
+#[cfg(feature = "io")]
 fn resolve_as_far_as_it_exists(path: &Path) -> PathBuf {
   if let Ok(canonical) = path.canonicalize() {
     return canonical;
@@ -1176,6 +1235,7 @@ fn resolve_as_far_as_it_exists(path: &Path) -> PathBuf {
 /// A pre-existing symlink at a file's destination in `dst` is refused rather
 /// than followed (see `refuse_symlink_dest`), so a planted leaf link cannot
 /// redirect a copy outside `dst`.
+#[cfg(feature = "io")]
 fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
   fs::create_dir_all(dst)
     .map_err(|e| Error::Profile(format!("creating {}: {}", dst.display(), e)))?;
@@ -1239,6 +1299,7 @@ pub enum ImportSource {
   Code(String),
 }
 
+#[cfg(feature = "io")]
 impl ImportSource {
   /// Classifies one import source string.
   ///
@@ -1304,6 +1365,7 @@ pub struct ImportOutcome {
 ///
 /// `cache_base` is the package cache root and must not be `target_dir`; see
 /// [`crate::profile::install_mod_in`].
+#[cfg(feature = "io")]
 pub async fn import_in(
   target_dir: &Path,
   cache_base: &Path,
@@ -1390,6 +1452,7 @@ pub async fn import_in(
 
 /// Imports a `.r2z` into an r2modman-layout profile. See [`import_r2z_in`].
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "io")]
 pub async fn import_r2z(
   base: &Path,
   game: &str,
@@ -1416,6 +1479,7 @@ pub async fn import_r2z(
 /// Imports a shared profile code into an r2modman-layout profile.
 /// See [`import_code_in`].
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "io")]
 pub async fn import_code(
   base: &Path,
   game: &str,
@@ -1439,7 +1503,7 @@ pub async fn import_code(
   .await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "io"))]
 mod tests {
   use super::*;
 
@@ -1688,6 +1752,20 @@ mods:
   }
 
   #[test]
+  #[cfg(unix)]
+  fn export_to_file_accepts_a_profile_named_under_the_old_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("profile");
+    let out = dir.path().join("exports");
+
+    crate::profile::modlist::write(&root, &[profile_mod("Author-A", true)]).unwrap();
+
+    let path = export_to_file_in(&root, "v2: test", &out, 1).unwrap();
+
+    assert_eq!(path, out.join("v2: test_1.r2z"));
+  }
+
+  #[test]
   fn encode_profile_payload_prefixes_and_base64s() {
     let payload = encode_profile_payload(b"ABC").unwrap();
 
@@ -1727,6 +1805,8 @@ mods:
     // Manifest and manager state are skipped.
     assert_eq!(import_config_key("export.r2x"), None);
     assert_eq!(import_config_key("mods.yml"), None);
+    assert_eq!(import_config_key("_state/Author-Mod-state.yml"), None);
+    assert_eq!(import_config_key("./_STATE /Author-Mod-state.yml"), None);
     // Executables are refused even inside an otherwise valid path.
     assert_eq!(import_config_key("BepInEx/plugins/evil.dll"), None);
     // Traversal is refused.
@@ -1756,6 +1836,16 @@ mods:
 
     // An ordinary config entry is unaffected.
     assert_eq!(import_config_key("a.cfg"), Some(PathBuf::from("a.cfg")));
+  }
+
+  /// A drive prefix only parses as one on Windows, so that is the only host
+  /// where the guard can be seen to catch it.
+  #[test]
+  #[cfg(windows)]
+  fn import_config_key_refuses_a_drive_prefix() {
+    assert_eq!(import_config_key(r"C:\Windows\evil.cfg"), None);
+    assert_eq!(import_config_key("C:evil.cfg"), None);
+    assert_eq!(import_config_key(r"\\server\share\evil.cfg"), None);
   }
 
   #[test]

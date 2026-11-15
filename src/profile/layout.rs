@@ -6,21 +6,27 @@
 //!
 //! # Errors
 //!
-//! Every fallible function in this module returns
-//! [`Error::Profile`](crate::Error::Profile) and nothing else. Underlying IO
-//! failures are wrapped with the offending path rather than surfaced as
+//! A refused or missing profile name is
+//! [`Error::BadProfile`](crate::Error::BadProfile); every other failure is
+//! [`Error::Profile`](crate::Error::Profile). Underlying IO failures are wrapped
+//! with the offending path rather than surfaced as
 //! [`Error::Io`](crate::Error::Io), so a caller can render the message directly
-//! and does not need to match other variants or prepend a path itself.
+//! and does not need to prepend a path itself.
 //!
-//! Every function taking a profile name calls
-//! [`validate_name`](crate::profile::layout::validate_name) before touching the
-//! filesystem, so a name containing a separator, NUL, `.`, or `..` is rejected
-//! before it can escape the profiles directory. Individual functions document
-//! only the conditions beyond that shared contract.
+//! A name for a new profile (`create`, and the destination of `rename` and
+//! `duplicate`) goes through
+//! [`validate_name`](crate::profile::layout::validate_name), so a name that
+//! could escape the profiles directory, or that Windows cannot hold, is refused
+//! before the filesystem is touched. A name for an existing profile is refused
+//! only if it could escape the profiles directory, so a profile named under
+//! older, looser rules stays usable. Individual functions document only the
+//! conditions beyond that shared contract.
 
 #![deny(missing_docs)]
 
+#[cfg(feature = "io")]
 use crate::error::{Error, Result};
+#[cfg(feature = "io")]
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -34,21 +40,136 @@ pub fn profile_dir(base: &Path, game: &str, name: &str) -> PathBuf {
   profiles_dir(base, game).join(name)
 }
 
-/// Rejects a profile name that is empty, a path component (`.`/`..`), or that
-/// contains a path separator or NUL — so a name can never escape the profiles
-/// directory.
-pub fn validate_name(name: &str) -> Result<()> {
-  let bad = name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', '\0']);
+/// Refuses a profile name that could escape the profiles directory or that
+/// Windows cannot hold as a folder name, with the reason as a [`BadName`].
+///
+/// The Windows rules apply on every OS so a profile stays portable. The error
+/// is always [`BadProfile::InvalidName`].
+///
+/// # Examples
+///
+/// ```
+/// use thunderstore_engine::profile::layout::{BadName, BadProfile, validate_name};
+///
+/// assert!(validate_name("Main").is_ok());
+/// assert!(matches!(
+///   validate_name("CON.txt"),
+///   Err(BadProfile::InvalidName { reason: BadName::Reserved, .. })
+/// ));
+/// ```
+pub fn validate_name(name: &str) -> std::result::Result<(), BadProfile> {
+  refuse_if(
+    name,
+    escape_problem(name).or_else(|| portability_problem(name)),
+  )
+}
 
-  if bad {
-    return Err(Error::Profile(format!("invalid profile name {name:?}")));
+/// Refuses the name of an existing profile only when it could escape the
+/// profiles directory, so a profile named under older, looser rules can still
+/// be used, renamed, and deleted.
+#[cfg(feature = "io")]
+pub(crate) fn validate_existing_name(name: &str) -> std::result::Result<(), BadProfile> {
+  refuse_if(name, escape_problem(name))
+}
+
+fn refuse_if(name: &str, problem: Option<BadName>) -> std::result::Result<(), BadProfile> {
+  match problem {
+    Some(reason) => Err(BadProfile::InvalidName {
+      name: name.to_string(),
+      reason,
+    }),
+    None => Ok(()),
+  }
+}
+
+/// Why `name` could resolve outside the profiles directory, if it could.
+fn escape_problem(name: &str) -> Option<BadName> {
+  if name.is_empty() {
+    return Some(BadName::Empty);
   }
 
-  Ok(())
+  // Windows drops trailing dots and spaces from a path's last component, so
+  // `" "` or `"..."` would resolve to the profiles directory itself.
+  let resolved = name.trim_end_matches(['.', ' ']);
+
+  if matches!(resolved, "" | "." | "..") || name.contains(['/', '\\']) {
+    return Some(BadName::Escapes);
+  }
+
+  let mut chars = name.chars();
+
+  if matches!((chars.next(), chars.next()), (Some(drive), Some(':')) if drive.is_ascii_alphabetic())
+  {
+    return Some(BadName::DrivePrefix);
+  }
+
+  None
+}
+
+/// The first Windows folder-name rule `name` breaks, checked from most to least
+/// specific.
+fn portability_problem(name: &str) -> Option<BadName> {
+  if let Some(found) = name
+    .chars()
+    .find(|c| c.is_ascii_control() || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+  {
+    return Some(BadName::ForbiddenChar(found));
+  }
+
+  if name.ends_with(['.', ' ']) {
+    return Some(BadName::TrailingDotOrSpace);
+  }
+
+  if is_reserved_device(name) {
+    return Some(BadName::Reserved);
+  }
+
+  None
+}
+
+/// Whether the part of `name` before its first `.` is a Windows device name,
+/// per Microsoft's "Naming Files, Paths, and Namespaces", which also reserves
+/// `COM` and `LPT` followed by 0 or a superscript 1, 2, or 3.
+fn is_reserved_device(name: &str) -> bool {
+  let stem = name
+    .split('.')
+    .next()
+    .unwrap_or(name)
+    .trim_end_matches(' ')
+    .to_ascii_uppercase();
+
+  match stem.as_str() {
+    "CON" | "PRN" | "AUX" | "NUL" => true,
+    _ => {
+      let numbered = stem
+        .strip_prefix("COM")
+        .or_else(|| stem.strip_prefix("LPT"));
+
+      matches!(
+        numbered,
+        Some(
+          "0"
+            | "1"
+            | "2"
+            | "3"
+            | "4"
+            | "5"
+            | "6"
+            | "7"
+            | "8"
+            | "9"
+            | "\u{b9}"
+            | "\u{b2}"
+            | "\u{b3}"
+        )
+      )
+    }
+  }
 }
 
 /// Lists profile names (immediate subdirectories) for a game, sorted. A missing
 /// profiles directory yields an empty list.
+#[cfg(feature = "io")]
 pub fn list(base: &Path, game: &str) -> Result<Vec<String>> {
   let dir = profiles_dir(base, game);
 
@@ -77,6 +198,7 @@ pub fn list(base: &Path, game: &str) -> Result<Vec<String>> {
 
 /// Creates a new, empty profile directory. Errors if it already exists so a
 /// create never silently adopts an existing profile.
+#[cfg(feature = "io")]
 pub fn create(base: &Path, game: &str, name: &str) -> Result<PathBuf> {
   validate_name(name)?;
 
@@ -97,12 +219,11 @@ pub fn create(base: &Path, game: &str, name: &str) -> Result<PathBuf> {
 ///
 /// # Errors
 ///
-/// Errors if the profile does not exist, so deleting an already-deleted profile
-/// is reported rather than treated as success.
+/// [`BadProfile::Missing`] if the profile does not exist, so deleting an
+/// already-deleted profile is reported rather than treated as success.
+#[cfg(feature = "io")]
 pub fn delete(base: &Path, game: &str, name: &str) -> Result<()> {
-  validate_name(name)?;
-
-  let dir = profile_dir(base, game, name);
+  let dir = require_profile(base, game, name)?;
 
   fs::remove_dir_all(&dir)
     .map_err(|e| Error::Profile(format!("deleting {}: {}", dir.display(), e)))?;
@@ -118,16 +239,18 @@ pub fn delete(base: &Path, game: &str, name: &str) -> Result<()> {
 ///
 /// # Errors
 ///
-/// Errors if `to` already exists, so a rename never clobbers another profile.
+/// [`BadProfile::Missing`] if `from` does not exist. Errors if `to` already
+/// exists, so a rename never clobbers another profile.
 ///
 /// Not transactional: the rename can succeed and the selection update then fail,
 /// leaving the selection naming a profile that no longer exists. Callers that
 /// care can re-read it with [`read_selection`].
+#[cfg(feature = "io")]
 pub fn rename(base: &Path, game: &str, from: &str, to: &str) -> Result<()> {
-  validate_name(from)?;
+  let src = require_profile(base, game, from)?;
+
   validate_name(to)?;
 
-  let src = profile_dir(base, game, from);
   let dst = profile_dir(base, game, to);
 
   if dst.exists() {
@@ -160,13 +283,15 @@ pub fn rename(base: &Path, game: &str, from: &str, to: &str) -> Result<()> {
 ///
 /// # Errors
 ///
-/// Errors if `to` already exists. A failed copy can leave `to` partially
-/// written; it is not cleaned up.
+/// [`BadProfile::Missing`] if `from` does not exist. Errors if `to` already
+/// exists. A failed copy can leave `to` partially written; it is not cleaned
+/// up.
+#[cfg(feature = "io")]
 pub fn duplicate(base: &Path, game: &str, from: &str, to: &str) -> Result<PathBuf> {
-  validate_name(from)?;
+  let src = require_profile(base, game, from)?;
+
   validate_name(to)?;
 
-  let src = profile_dir(base, game, from);
   let dst = profile_dir(base, game, to);
 
   if dst.exists() {
@@ -180,6 +305,7 @@ pub fn duplicate(base: &Path, game: &str, from: &str, to: &str) -> Result<PathBu
 
 /// Recursively copies a directory tree, creating `dst`. Skips symlinks (never
 /// follows them out of the tree), like the install layer's `walk_files`.
+#[cfg(feature = "io")]
 fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
   fs::create_dir_all(dst)
     .map_err(|e| Error::Profile(format!("creating {}: {}", dst.display(), e)))?;
@@ -232,6 +358,7 @@ pub fn selection_path(base: &Path, game: &str) -> PathBuf {
 }
 
 /// The persisted selection, or `None` when absent, empty, or unreadable.
+#[cfg(feature = "io")]
 pub fn read_selection(base: &Path, game: &str) -> Option<String> {
   let text = fs::read_to_string(selection_path(base, game)).ok()?;
   let name = text.trim();
@@ -243,6 +370,7 @@ pub fn read_selection(base: &Path, game: &str) -> Option<String> {
 }
 
 /// Persists `name` as the selected profile.
+#[cfg(feature = "io")]
 pub fn write_selection(base: &Path, game: &str, name: &str) -> Result<()> {
   let path = selection_path(base, game);
 
@@ -256,6 +384,7 @@ pub fn write_selection(base: &Path, game: &str, name: &str) -> Result<()> {
 
 /// Removes the persisted selection, returning to game-directory mode. Absent is
 /// not an error.
+#[cfg(feature = "io")]
 pub fn clear_selection(base: &Path, game: &str) -> Result<()> {
   let path = selection_path(base, game);
 
@@ -280,13 +409,15 @@ pub fn clear_selection(base: &Path, game: &str) -> Result<()> {
 /// appears, rather than printing a generic fallback for a case nobody worded.
 /// [`Error`] being `#[non_exhaustive]` does not weaken that: the wildcard arm a
 /// client needs there is for other kinds of failure, not for other refusals.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BadProfile {
-  /// The name is not a safe single path component, so it could escape the
-  /// profiles directory. See [`validate_name`].
+  /// The name is refused by [`validate_name`] or, for an existing profile,
+  /// could escape the profiles directory.
   InvalidName {
     /// The name as given.
     name: String,
+    /// Which rule the name breaks.
+    reason: BadName,
   },
   /// No profile directory exists at `dir`.
   Missing {
@@ -300,7 +431,7 @@ pub enum BadProfile {
 impl std::fmt::Display for BadProfile {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match self {
-      Self::InvalidName { name } => write!(f, "invalid profile name {name:?}"),
+      Self::InvalidName { name, .. } => write!(f, "invalid profile name {name:?}"),
       Self::Missing { name, .. } => write!(f, "there is no profile named {name:?}"),
     }
   }
@@ -308,20 +439,60 @@ impl std::fmt::Display for BadProfile {
 
 impl std::error::Error for BadProfile {}
 
+/// Why [`validate_name`] refuses a profile name.
+///
+/// Not `#[non_exhaustive]`, for the reason [`BadProfile`] gives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BadName {
+  /// The name is empty.
+  Empty,
+  /// The name is `.` or `..`, or contains `/` or `\`, so it could resolve
+  /// outside the profiles directory.
+  Escapes,
+  /// The name starts with a drive letter and a colon (`C:foo`), which Windows
+  /// resolves on that drive instead of under the profiles directory.
+  DrivePrefix,
+  /// A Windows device name (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`,
+  /// `LPT1`-`LPT9`, and `COM`/`LPT` with a superscript `¹`, `²`, or `³`), in
+  /// any case, alone or followed by an extension.
+  Reserved,
+  /// A character Windows forbids in a folder name: `< > : " | ? *` or a
+  /// control character.
+  ForbiddenChar(char),
+  /// The name ends with `.` or a space, which Windows strips.
+  TrailingDotOrSpace,
+}
+
+impl std::fmt::Display for BadName {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Self::Empty => write!(f, "the name is empty"),
+      Self::Escapes => write!(f, "the name is a path, not a single folder name"),
+      Self::DrivePrefix => write!(f, "the name starts with a drive letter"),
+      Self::Reserved => write!(f, "the name is reserved by Windows"),
+      Self::ForbiddenChar(found) => write!(f, "the name contains {found:?}"),
+      Self::TrailingDotOrSpace => write!(f, "the name ends with a dot or a space"),
+    }
+  }
+}
+
 /// The directory of an existing profile, classifying why not when there is none.
 ///
 /// The single place that decides "is this a usable profile name": both
 /// [`use_profile`] and [`crate::profile::target::InstallTarget::resolve`] go
 /// through it, so they cannot drift apart, and a caller that wants to word the
 /// refusal itself gets the reason rather than a sentence.
+///
+/// Only a name that could escape the profiles directory is refused as
+/// [`BadProfile::InvalidName`]; the stricter [`validate_name`] rules apply to
+/// new names, so a profile named under older rules can still be found here.
+#[cfg(feature = "io")]
 pub fn require_profile(
   base: &Path,
   game: &str,
   name: &str,
 ) -> std::result::Result<PathBuf, BadProfile> {
-  validate_name(name).map_err(|_| BadProfile::InvalidName {
-    name: name.to_string(),
-  })?;
+  validate_existing_name(name)?;
 
   let dir = profile_dir(base, game, name);
 
@@ -336,6 +507,7 @@ pub fn require_profile(
 }
 
 /// Selects `name` as the active profile, refusing one that does not exist.
+#[cfg(feature = "io")]
 pub fn use_profile(base: &Path, game: &str, name: &str) -> Result<()> {
   require_profile(base, game, name)?;
 
@@ -367,7 +539,9 @@ pub fn select_profile(
 #[cfg(test)]
 mod tests {
   use super::*;
+  #[cfg(feature = "io")]
   use std::fs;
+  #[cfg(feature = "io")]
   use tempfile::tempdir;
 
   #[test]
@@ -393,7 +567,99 @@ mod tests {
     assert!(validate_name("a\\b").is_err());
   }
 
+  fn refusal(name: &str) -> Option<BadName> {
+    match validate_name(name) {
+      Ok(()) => None,
+      Err(BadProfile::InvalidName { reason, .. }) => Some(reason),
+      Err(other) => panic!("{name:?} must be refused as a name; got: {other:?}"),
+    }
+  }
+
   #[test]
+  fn names_windows_cannot_hold_are_refused_on_every_os() {
+    let cases = [
+      ("", BadName::Empty),
+      (".", BadName::Escapes),
+      ("..", BadName::Escapes),
+      ("a/b", BadName::Escapes),
+      ("a\\b", BadName::Escapes),
+      ("/abs", BadName::Escapes),
+      ("C:foo", BadName::DrivePrefix),
+      ("c:", BadName::DrivePrefix),
+      ("CON", BadName::Reserved),
+      ("con", BadName::Reserved),
+      ("Nul.txt", BadName::Reserved),
+      ("aux.tar.gz", BadName::Reserved),
+      ("NUL .txt", BadName::Reserved),
+      ("PRN", BadName::Reserved),
+      ("COM1", BadName::Reserved),
+      ("com9.log", BadName::Reserved),
+      ("LPT5", BadName::Reserved),
+      ("COM0", BadName::Reserved),
+      ("lpt0.bak", BadName::Reserved),
+      ("COM\u{b9}", BadName::Reserved),
+      ("com\u{b2}.log", BadName::Reserved),
+      ("COM\u{b3}", BadName::Reserved),
+      ("LPT\u{b9}", BadName::Reserved),
+      ("lpt\u{b2}", BadName::Reserved),
+      ("LPT\u{b3}.txt", BadName::Reserved),
+      ("a:b", BadName::DrivePrefix),
+      ("ab:c", BadName::ForbiddenChar(':')),
+      ("why?", BadName::ForbiddenChar('?')),
+      ("a*b", BadName::ForbiddenChar('*')),
+      ("a<b", BadName::ForbiddenChar('<')),
+      ("a>b", BadName::ForbiddenChar('>')),
+      ("a|b", BadName::ForbiddenChar('|')),
+      ("say \"hi\"", BadName::ForbiddenChar('"')),
+      ("tab\there", BadName::ForbiddenChar('\t')),
+      ("nul\0byte", BadName::ForbiddenChar('\0')),
+      ("trailing.", BadName::TrailingDotOrSpace),
+      ("trailing ", BadName::TrailingDotOrSpace),
+      ("...", BadName::Escapes),
+    ];
+
+    for (name, expected) in cases {
+      assert_eq!(refusal(name), Some(expected), "for {name:?}");
+    }
+  }
+
+  #[test]
+  fn names_that_only_resemble_reserved_ones_are_allowed() {
+    for name in [
+      "Main",
+      "work profile",
+      "CONSOLE",
+      "COM10",
+      "COM\u{2074}",
+      "LPT\u{b9}\u{b2}",
+      "nul-run",
+      "my.profile",
+      ".hidden",
+      "1.0",
+    ] {
+      assert_eq!(refusal(name), None, "for {name:?}");
+    }
+  }
+
+  #[test]
+  fn a_refused_name_keeps_its_message_and_carries_the_reason() {
+    let error = crate::Error::from(validate_name("CON").unwrap_err());
+
+    assert_eq!(
+      error.to_string(),
+      "Profile error: invalid profile name \"CON\""
+    );
+    assert!(matches!(
+      error,
+      crate::Error::BadProfile(BadProfile::InvalidName {
+        reason: BadName::Reserved,
+        ..
+      })
+    ));
+  }
+
+  #[test]
+  #[cfg(feature = "io")]
   fn create_list_rename_duplicate_delete() {
     let dir = tempdir().unwrap();
     let base = dir.path();
@@ -428,6 +694,141 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
+  fn delete_rename_and_duplicate_refuse_a_missing_profile_by_reason() {
+    let base = tempdir().unwrap();
+    let root = base.path();
+    let expected = profile_dir(root, "valheim", "ghost");
+    let is_missing = |error: Error| {
+      matches!(error, Error::BadProfile(BadProfile::Missing { name, dir })
+        if name == "ghost" && dir == expected)
+    };
+
+    assert!(is_missing(delete(root, "valheim", "ghost").unwrap_err()));
+    assert!(is_missing(
+      rename(root, "valheim", "ghost", "other").unwrap_err()
+    ));
+    assert!(is_missing(
+      duplicate(root, "valheim", "ghost", "other").unwrap_err()
+    ));
+    assert!(
+      !profile_dir(root, "valheim", "other").exists(),
+      "a refused duplicate must not leave a target behind"
+    );
+  }
+
+  #[test]
+  #[cfg(feature = "io")]
+  fn create_rename_and_duplicate_refuse_a_name_windows_cannot_hold() {
+    let base = tempdir().unwrap();
+    let root = base.path();
+
+    create(root, "valheim", "Main").unwrap();
+
+    for error in [
+      create(root, "valheim", "C:evil").unwrap_err(),
+      rename(root, "valheim", "Main", "CON").unwrap_err(),
+      duplicate(root, "valheim", "Main", "copy.").unwrap_err(),
+    ] {
+      assert!(
+        matches!(error, Error::BadProfile(BadProfile::InvalidName { .. })),
+        "got: {error:?}"
+      );
+    }
+
+    assert_eq!(list(root, "valheim").unwrap(), vec!["Main".to_string()]);
+  }
+
+  #[test]
+  #[cfg(all(unix, feature = "io"))]
+  fn a_profile_named_under_the_old_rules_stays_usable() {
+    let base = tempdir().unwrap();
+    let root = base.path();
+    let legacy = ["Modded.", "v2: test", "aux"];
+
+    for name in legacy {
+      fs::create_dir_all(profile_dir(root, "valheim", name)).unwrap();
+    }
+
+    assert_eq!(
+      list(root, "valheim").unwrap(),
+      vec!["Modded.", "aux", "v2: test"]
+    );
+
+    use_profile(root, "valheim", "Modded.").unwrap();
+    rename(root, "valheim", "Modded.", "Modded").unwrap();
+
+    assert_eq!(read_selection(root, "valheim"), Some("Modded".to_string()));
+
+    duplicate(root, "valheim", "v2: test", "v2 copy").unwrap();
+    delete(root, "valheim", "aux").unwrap();
+    delete(root, "valheim", "v2: test").unwrap();
+
+    assert_eq!(list(root, "valheim").unwrap(), vec!["Modded", "v2 copy"]);
+
+    let resolved = crate::profile::target::InstallTarget::resolve(
+      root.to_path_buf(),
+      root.join("game"),
+      "valheim",
+      Some("v2 copy"),
+    )
+    .unwrap();
+
+    assert_eq!(resolved.dir, profile_dir(root, "valheim", "v2 copy"));
+  }
+
+  #[test]
+  #[cfg(all(unix, feature = "io"))]
+  fn an_existing_profile_still_cannot_be_renamed_to_a_name_windows_cannot_hold() {
+    let base = tempdir().unwrap();
+    let root = base.path();
+
+    fs::create_dir_all(profile_dir(root, "valheim", "aux")).unwrap();
+
+    for error in [
+      rename(root, "valheim", "aux", "nul").unwrap_err(),
+      duplicate(root, "valheim", "aux", "copy.").unwrap_err(),
+    ] {
+      assert!(
+        matches!(error, Error::BadProfile(BadProfile::InvalidName { .. })),
+        "got: {error:?}"
+      );
+    }
+  }
+
+  #[test]
+  #[cfg(feature = "io")]
+  fn an_existing_profile_name_that_escapes_is_still_refused() {
+    let base = tempdir().unwrap();
+    let root = base.path();
+
+    for (name, expected) in [
+      ("", BadName::Empty),
+      (".", BadName::Escapes),
+      ("..", BadName::Escapes),
+      (" ", BadName::Escapes),
+      ("...", BadName::Escapes),
+      (". .", BadName::Escapes),
+      (".. ", BadName::Escapes),
+      ("../escape", BadName::Escapes),
+      ("a\\b", BadName::Escapes),
+      ("C:evil", BadName::DrivePrefix),
+    ] {
+      let refused = require_profile(root, "valheim", name).unwrap_err();
+
+      assert_eq!(
+        refused,
+        BadProfile::InvalidName {
+          name: name.to_string(),
+          reason: expected,
+        },
+        "for {name:?}"
+      );
+    }
+  }
+
+  #[test]
+  #[cfg(feature = "io")]
   fn the_selection_follows_a_rename_and_clears_on_delete() {
     let base = tempdir().unwrap();
     let root = base.path();
@@ -469,6 +870,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn require_profile_classifies_why_a_name_is_unusable() {
     let base = tempdir().unwrap();
     let root = base.path();
@@ -483,7 +885,7 @@ mod tests {
     let unsafe_name = require_profile(root, "valheim", "../escape").unwrap_err();
 
     assert!(
-      matches!(&unsafe_name, BadProfile::InvalidName { name } if name == "../escape"),
+      matches!(&unsafe_name, BadProfile::InvalidName { name, .. } if name == "../escape"),
       "an unsafe name must be told apart from an absent one; got: {unsafe_name:?}"
     );
 
@@ -499,6 +901,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn use_profile_and_resolve_refuse_a_missing_profile_identically() {
     let base = tempdir().unwrap();
     let root = base.path();

@@ -21,7 +21,9 @@
 #![deny(missing_docs)]
 
 use crate::error::{Error, Result};
+#[cfg(feature = "io")]
 use crate::retry::{RetryPolicy, retry_http};
+#[cfg(feature = "io")]
 use crate::util::SizeCap;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
@@ -50,6 +52,7 @@ pub const DEFAULT_ECOSYSTEM_URL: &str =
 /// Maximum size of an ecosystem schema fetched over the network. The real schema
 /// is small relative to this generous cap, which bounds the memory a misbehaving or
 /// compromised endpoint can force [`Ecosystem::fetch_latest`] to allocate.
+#[cfg(feature = "io")]
 const MAX_ECOSYSTEM_BYTES: u64 = 64 * 1024 * 1024;
 
 /// A parsed ecosystem schema: the known games plus the mod-loader package registry.
@@ -127,6 +130,7 @@ impl Ecosystem {
   /// trust — see the [`DEFAULT_ECOSYSTEM_URL`] trust note. The response body is
   /// size-bounded (see `MAX_ECOSYSTEM_BYTES`) so a misbehaving endpoint cannot
   /// force unbounded allocation.
+  #[cfg(feature = "io")]
   pub async fn fetch_latest(client: &reqwest::Client, url: &str) -> Result<Self> {
     Self::fetch_latest_bounded(client, url, MAX_ECOSYSTEM_BYTES, &RetryPolicy::default()).await
   }
@@ -134,6 +138,7 @@ impl Ecosystem {
   /// [`fetch_latest`](Self::fetch_latest) with an explicit body-size cap and
   /// retry policy. Transient network failures are retried; a size-cap breach or
   /// a parse failure is terminal.
+  #[cfg(feature = "io")]
   async fn fetch_latest_bounded(
     client: &reqwest::Client,
     url: &str,
@@ -172,6 +177,35 @@ impl Ecosystem {
   /// Returns the game definition for a community slug, if known.
   pub fn game(&self, slug: &str) -> Option<&GameDef> {
     self.games.get(slug)
+  }
+
+  /// Returns the primary profile for a game (see [`GameDef::profile`]), the
+  /// lookup every install, uninstall, and launch operation starts from.
+  ///
+  /// # Errors
+  ///
+  /// [`Error::UnknownGame`] if no game has the slug `game`, and
+  /// [`Error::NoGameProfile`] if the game is known but has no profile.
+  ///
+  /// # Examples
+  ///
+  /// ```
+  /// use thunderstore_engine::Error;
+  /// use thunderstore_engine::ecosystem::Ecosystem;
+  ///
+  /// let eco = Ecosystem::bundled();
+  ///
+  /// assert!(eco.require_profile("valheim").is_ok());
+  /// assert!(matches!(eco.require_profile("not-a-game"), Err(Error::UnknownGame { .. })));
+  /// ```
+  pub fn require_profile(&self, game: &str) -> Result<&GameProfile> {
+    let def = self.game(game).ok_or_else(|| Error::UnknownGame {
+      game: game.to_string(),
+    })?;
+
+    def.profile().ok_or_else(|| Error::NoGameProfile {
+      game: game.to_string(),
+    })
   }
 
   /// Iterates over all known games.
@@ -232,6 +266,13 @@ impl GameDef {
       .iter()
       .find(|p| p.instance_type == InstanceType::Game)
       .or_else(|| self.profiles.first())
+  }
+
+  /// The Thunderstore community of the primary [`profile`](Self::profile).
+  ///
+  /// See [`GameProfile::community`].
+  pub fn community(&self) -> Option<&str> {
+    self.profile()?.community()
   }
 }
 
@@ -294,6 +335,37 @@ impl GameProfile {
       .iter()
       .find(|d| d.platform == "steam")
       .and_then(|d| d.identifier.parse().ok())
+  }
+
+  /// The Thunderstore community slug this profile's packages come from, read
+  /// from the `/c/<community>/` segment of [`package_index`](Self::package_index).
+  ///
+  /// The slug can differ from the profile's own identifiers: the Outward
+  /// Definitive profile (`OutwardDe`) and the Valheim dedicated server
+  /// (`ValheimServer`) both use their game's community. Returns `None` when the
+  /// profile has no package index or its path is not `/c/<slug>/...`.
+  ///
+  /// # Examples
+  ///
+  /// ```
+  /// use thunderstore_engine::ecosystem::Ecosystem;
+  ///
+  /// let eco = Ecosystem::bundled();
+  /// let valheim = eco.game("valheim").unwrap().profile().unwrap();
+  ///
+  /// assert_eq!(valheim.community(), Some("valheim"));
+  /// ```
+  pub fn community(&self) -> Option<&str> {
+    let url = self.package_index.as_deref()?;
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let (_, path) = after_scheme.split_once('/')?;
+    let (community, _) = path.strip_prefix("c/")?.split_once('/')?;
+    let is_slug = !community.is_empty()
+      && community
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+
+    is_slug.then_some(community)
   }
 }
 
@@ -569,6 +641,58 @@ mod tests {
   }
 
   #[test]
+  fn community_comes_from_the_profile_package_index() {
+    let eco = Ecosystem::bundled();
+    let outward = eco.game("outward").expect("outward present");
+    let definitive = outward
+      .profiles
+      .iter()
+      .find(|p| p.settings_identifier.as_deref() == Some("OutwardDe"))
+      .expect("Outward Definitive profile");
+
+    assert_eq!(definitive.community(), Some("outward"));
+    assert_eq!(outward.community(), Some("outward"));
+
+    let server = eco
+      .game("valheim")
+      .expect("valheim present")
+      .profiles
+      .iter()
+      .find(|p| p.instance_type == InstanceType::Server)
+      .expect("valheim server profile");
+
+    assert_eq!(server.settings_identifier.as_deref(), Some("ValheimServer"));
+    assert_eq!(server.community(), Some("valheim"));
+  }
+
+  #[test]
+  fn community_is_none_without_a_usable_package_index() {
+    let community_of = |index: Option<&str>| {
+      let json = serde_json::json!({
+        "games": { "g": { "r2modman": [{ "packageIndex": index }] } }
+      });
+      let eco = Ecosystem::from_json(&json.to_string()).unwrap();
+
+      eco.game("g").unwrap().community().map(str::to_string)
+    };
+
+    assert_eq!(
+      community_of(Some("https://example.com/c/my-game/api/v1/package/")),
+      Some("my-game".to_string())
+    );
+    assert_eq!(community_of(None), None);
+    assert_eq!(
+      community_of(Some("https://thunderstore.io/api/v1/package/")),
+      None
+    );
+    assert_eq!(
+      community_of(Some("https://thunderstore.io/c/../api/v1/package/")),
+      None
+    );
+    assert_eq!(community_of(Some("https://thunderstore.io/c/")), None);
+  }
+
+  #[test]
   fn test_modloader_registry_lookup() {
     let eco = Ecosystem::bundled();
 
@@ -613,6 +737,27 @@ mod tests {
     let profile = eco.game("x").unwrap().profile().unwrap();
 
     assert_eq!(profile.package_loader, LoaderKind::Other);
+  }
+
+  #[test]
+  fn require_profile_tells_an_unknown_game_from_one_without_a_profile() {
+    let json = r#"{
+      "games": {
+        "bare": { "label": "bare", "r2modman": [] },
+        "x": { "label": "x", "r2modman": [ { "packageLoader": "bepinex", "installRules": [] } ] }
+      }
+    }"#;
+    let eco = Ecosystem::from_json(json).unwrap();
+
+    assert!(eco.require_profile("x").is_ok());
+    assert!(matches!(
+      eco.require_profile("ghost"),
+      Err(Error::UnknownGame { game }) if game == "ghost"
+    ));
+    assert!(matches!(
+      eco.require_profile("bare"),
+      Err(Error::NoGameProfile { game }) if game == "bare"
+    ));
   }
 
   #[test]
@@ -670,6 +815,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_fetch_latest_rejects_declared_oversize_body() {
     let mut server = mockito::Server::new();
     let body = "x".repeat(1000);
@@ -697,6 +843,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_fetch_latest_rejects_streamed_oversize_body() {
     let mut server = mockito::Server::new();
 
@@ -725,6 +872,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn test_fetch_latest_parses_network_schema() {
     let mut server = mockito::Server::new();
 

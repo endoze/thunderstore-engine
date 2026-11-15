@@ -1,6 +1,8 @@
 #![deny(missing_docs)]
 
-use lasso::{Key, Rodeo, Spur};
+#[cfg(feature = "io")]
+use lasso::Key;
+use lasso::{Rodeo, Spur};
 
 /// A string interner that stores unique strings and returns small integer keys
 /// to retrieve them later, reducing memory usage for repeated strings.
@@ -25,6 +27,11 @@ impl StringInterner {
     InternKey(self.0.get_or_intern(s))
   }
 
+  /// The key of `s` if it has been interned, without interning it.
+  pub fn get(&self, s: &str) -> Option<InternKey> {
+    self.0.get(s).map(InternKey)
+  }
+
   /// Resolves a key back to its string.
   ///
   /// # Panics
@@ -37,11 +44,13 @@ impl StringInterner {
   }
 
   /// Iterates over the interned strings in insertion order.
+  #[cfg(feature = "io")]
   pub fn strings(&self) -> impl Iterator<Item = &str> {
     self.0.strings()
   }
 
   /// Returns the number of unique strings stored in the interner.
+  #[cfg(feature = "io")]
   pub fn len(&self) -> usize {
     self.0.len()
   }
@@ -49,12 +58,14 @@ impl StringInterner {
 
 impl InternKey {
   /// The key's stable integer index, used when serializing to a string table.
+  #[cfg(feature = "io")]
   pub(crate) fn to_index(self) -> usize {
     self.0.into_usize()
   }
 
   /// Reconstructs a key from a stable integer index, or `None` if the index is
   /// not representable as a key.
+  #[cfg(feature = "io")]
   pub(crate) fn from_index(index: usize) -> Option<Self> {
     Spur::try_from_usize(index).map(InternKey)
   }

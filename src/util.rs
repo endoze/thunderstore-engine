@@ -2,8 +2,11 @@
 
 #![deny(missing_docs)]
 
+#[cfg(feature = "io")]
 use crate::error::{Error, Result};
+#[cfg(feature = "io")]
 use std::fs;
+#[cfg(feature = "io")]
 use std::path::{Path, PathBuf};
 
 /// Enforces a byte ceiling in two phases: an up-front check of a declared
@@ -15,12 +18,14 @@ use std::path::{Path, PathBuf};
 /// any network or filesystem I/O. Both rejection paths return
 /// [`Error::SizeLimitExceeded`] carrying the `context` label and the observed
 /// size.
+#[cfg(feature = "io")]
 pub(crate) struct SizeCap {
   context: &'static str,
   limit: u64,
   seen: u64,
 }
 
+#[cfg(feature = "io")]
 impl SizeCap {
   /// Creates a cap of `limit` bytes. `context` is a short label naming what is
   /// being read (e.g. `"download body"`), surfaced in the error message.
@@ -71,8 +76,51 @@ impl SizeCap {
 ///
 /// Used to turn a bare `?`-propagated I/O error (which says only "No such file
 /// or directory") into one that names what failed and where.
+#[cfg(feature = "io")]
 pub(crate) fn io_context(context: impl std::fmt::Display, err: std::io::Error) -> Error {
-  Error::Io(std::io::Error::new(err.kind(), format!("{context}: {err}")))
+  Error::from(std::io::Error::new(err.kind(), format!("{context}: {err}")))
+}
+
+/// Replaces `path` with `contents` so a crash leaves either the old file or the
+/// new one, never a truncated one.
+///
+/// Writes a temp file in the same directory, flushes it to disk, then renames
+/// it over `path`. The temp file is removed if any step fails.
+#[cfg(feature = "io")]
+pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+  use std::io::Write;
+  use std::sync::atomic::{AtomicU64, Ordering};
+
+  static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+  let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+  let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+  let tmp = path.with_file_name(format!(".{name}.{}.{seq}.tmp", std::process::id()));
+
+  let written = (|| {
+    let mut file = fs::File::create(&tmp)?;
+
+    file.write_all(contents)?;
+    file.sync_all()?;
+
+    fs::rename(&tmp, path)
+  })();
+
+  if written.is_err() {
+    let _ = fs::remove_file(&tmp);
+
+    return written;
+  }
+
+  // Best effort: makes the rename itself durable on Unix; Windows cannot open
+  // a directory this way.
+  if let Some(parent) = path.parent()
+    && let Ok(dir) = fs::File::open(parent)
+  {
+    let _ = dir.sync_all();
+  }
+
+  Ok(())
 }
 
 /// The `Owner-Name` prefix (the first two hyphen-separated segments) of a
@@ -115,6 +163,7 @@ pub(crate) fn split_version(s: &str) -> Option<(&str, &str)> {
 /// as an `Err` and falls through to the plain path comparison below, since
 /// this exists only to avoid a destructive self-copy, never to validate that a
 /// path exists.
+#[cfg(feature = "io")]
 pub(crate) fn same_file(source: &Path, dest: &Path) -> bool {
   let canonical_dest = fs::canonicalize(dest).or_else(|_| canonicalize_missing(dest));
 
@@ -132,6 +181,7 @@ pub(crate) fn same_file(source: &Path, dest: &Path) -> bool {
 /// and so on) is left as an `Err` for [`same_file`] to fall back on a plain
 /// path comparison: this exists only to avoid a destructive self-copy, never
 /// to validate that a path exists.
+#[cfg(feature = "io")]
 pub(crate) fn canonicalize_missing(path: &Path) -> std::io::Result<PathBuf> {
   let parent = path
     .parent()
@@ -148,6 +198,7 @@ mod tests {
   use super::*;
 
   #[test]
+  #[cfg(feature = "io")]
   fn check_declared_accepts_none_and_within_limit() {
     let cap = SizeCap::new("body", 100);
 
@@ -156,6 +207,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn check_declared_rejects_over_limit() {
     let cap = SizeCap::new("body", 100);
 
@@ -172,6 +224,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn add_accumulates_and_rejects_when_total_exceeds() {
     let mut cap = SizeCap::new("body", 10);
 
@@ -192,6 +245,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn add_accepts_exactly_at_limit() {
     let mut cap = SizeCap::new("body", 10);
 
@@ -199,6 +253,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "io")]
   fn io_context_prefixes_message_and_preserves_kind() {
     let base = std::io::Error::new(std::io::ErrorKind::NotFound, "nope");
 
