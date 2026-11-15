@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/endoze/thunderstore-engine/compare/v0.3.0...v0.4.0) - 2026-11-15
+
+### Added
+
+- *(launch)* prepare a launch in one call
+- *(profile)* [**breaking**] harden profile operations and report their progress
+- *(query)* add package queries that run without io
+- *(client)* read the cached index and fetch readmes
+- *(error)* [**breaking**] type common refusals and make Error Clone
+- add io and test-support features
+
+### Other
+
+- *(query)* search a flat index and skip packages by scan
+
 ## [0.3.0](https://github.com/endoze/thunderstore-engine/compare/v0.2.0...v0.3.0) - 2026-10-13
 
 ### Added
