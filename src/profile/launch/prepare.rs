@@ -5,11 +5,8 @@ use super::{
   HostOs, LOADER_FILES, LaunchContext, LaunchFacts, LaunchMode, LaunchPlan, launch_plan_from,
 };
 #[cfg(feature = "io")]
-use super::{LaunchProgram, Runtime, proxy_dll};
-#[cfg(feature = "io")]
 use super::{
-  StagedFiles, ensure_loader_scripts_executable, stage_files_in, steam_launch_options,
-  wrapper_path, write_wrapper_script,
+  StagedFiles, ensure_loader_scripts_executable, stage_files_in, wrapper_path, write_wrapper_script,
 };
 use crate::ecosystem::{Ecosystem, LoaderKind};
 use crate::error::{Error, Result};
@@ -168,26 +165,21 @@ pub fn prepare_launch(
   let command = plan.to_command(&target.game_dir)?;
   let mut notices = Vec::new();
 
-  if plan.steam_wrapper.is_some() {
-    let script = wrapper_path(&target.base, &target.game);
+  let script = wrapper_path(&target.base, &target.game);
 
-    write_wrapper_script(&script)?;
-    notices.push(LaunchNotice::SteamWrapper {
-      launch_options: steam_launch_options(&script),
-      script,
-    });
-  }
-
-  if ctx.mode == LaunchMode::Modded
-    && ctx.runtime == Runtime::Proton
-    && matches!(plan.program, LaunchProgram::Steam { .. })
-  {
-    let dll = proxy_dll(eco.require_profile(&target.game)?.package_loader);
-
-    notices.push(LaunchNotice::ProtonDllOverride {
-      dll: dll.to_string(),
-      launch_options: format!("WINEDLLOVERRIDES=\"{dll}=n,b\" %command%"),
-    });
+  if let Some(launch_options) = plan.steam_launch_options(&script) {
+    if plan.steam_wrapper.is_some() {
+      write_wrapper_script(&script)?;
+      notices.push(LaunchNotice::SteamWrapper {
+        launch_options,
+        script,
+      });
+    } else if let Some(dll) = plan.steam_dll_override() {
+      notices.push(LaunchNotice::ProtonDllOverride {
+        dll: dll.to_string(),
+        launch_options,
+      });
+    }
   }
 
   for path in ensure_loader_scripts_executable(&target.dir)? {
@@ -741,14 +733,16 @@ mod io_tests {
     )
     .unwrap();
 
+    let pasted = vec![LaunchNotice::ProtonDllOverride {
+      dll: "winhttp".to_string(),
+      launch_options: "WINEDLLOVERRIDES=\"winhttp=n,b\" %command%".to_string(),
+    }];
+
+    assert_eq!(modded.notices, pasted);
     assert_eq!(
-      modded.notices,
-      vec![LaunchNotice::ProtonDllOverride {
-        dll: "winhttp".to_string(),
-        launch_options: "WINEDLLOVERRIDES=\"winhttp=n,b\" %command%".to_string(),
-      }]
+      vanilla.notices, pasted,
+      "Steam keeps one launch-options string for both modes"
     );
-    assert!(vanilla.notices.is_empty());
   }
 
   #[test]

@@ -1028,7 +1028,7 @@ pub fn launch_plan_from(
 
   if ctx.runtime == Runtime::Proton {
     env.push((
-      "WINEDLLOVERRIDES".to_string(),
+      WINE_DLL_OVERRIDES.to_string(),
       format!("{}=n,b", proxy_dll(profile.package_loader)),
     ));
   }
@@ -1615,17 +1615,83 @@ pub(crate) struct StagedFiles {
 /// function anyway: [`LaunchPlan::steam_wrapper`] is populated only when
 /// `script_injection` applies, which requires [`Runtime::Native`].
 ///
-/// Under Proton the override *is* required — Wine prefers its own builtin
-/// `winhttp` over the loader's, so the proxy never loads without it — but launch
-/// options are the wrong channel for it. [`LaunchPlan::env`] carries it for the
-/// direct-spawn path, and [`proxy_dll`] exposes the name for a caller writing it
-/// into a prefix itself, as r2modman does via `user.reg`.
+/// Under Proton the override *is* required, since Wine prefers its own builtin
+/// `winhttp` over the loader's. [`LaunchPlan::steam_launch_options`] gives the
+/// line for either case.
 pub fn steam_launch_options(script_path: &Path) -> String {
   format!(
     r#""{script}" %command%"#,
     script = script_path.to_string_lossy().replace('\\', "/"),
   )
 }
+
+impl LaunchPlan {
+  /// What the user pastes into the game's Steam launch options for this plan,
+  /// or `None` when the plan needs nothing there.
+  ///
+  /// Steam keeps one launch-options string for every launch of a game, so the
+  /// answer is the same for a modded or a vanilla plan:
+  ///
+  /// - With a [`steam_wrapper`](Self::steam_wrapper) (Linux native), the line
+  ///   running `wrapper_script`, as [`steam_launch_options`] builds it.
+  /// - For a [`LaunchProgram::Steam`] launch under Proton, the
+  ///   `WINEDLLOVERRIDES` line. Steam starts the game with its own environment,
+  ///   so the override in [`env`](Self::env) reaches it only from here.
+  ///
+  /// ```
+  /// use std::path::Path;
+  /// use thunderstore_engine::ecosystem::Ecosystem;
+  /// use thunderstore_engine::profile::launch::{
+  ///   HostOs, LaunchContext, LaunchFacts, LaunchMode, Runtime, StorePlatform, launch_plan_from,
+  /// };
+  ///
+  /// let mut facts = LaunchFacts::default();
+  ///
+  /// facts.preloader = Some("BepInEx.Preloader.dll".to_string());
+  ///
+  /// let proton = LaunchContext::new(HostOs::Linux, StorePlatform::Steam, Runtime::Proton, LaunchMode::Vanilla);
+  /// let plan = launch_plan_from(Path::new("/profile"), &facts, &Ecosystem::bundled(), "valheim", &proton)?;
+  ///
+  /// assert_eq!(
+  ///   plan.steam_launch_options(Path::new("/base/valheim/steam-wrapper.sh")).as_deref(),
+  ///   Some(r#"WINEDLLOVERRIDES="winhttp=n,b" %command%"#),
+  /// );
+  /// # Ok::<(), thunderstore_engine::Error>(())
+  /// ```
+  pub fn steam_launch_options(&self, wrapper_script: &Path) -> Option<String> {
+    if self.steam_wrapper.is_some() {
+      return Some(steam_launch_options(wrapper_script));
+    }
+
+    if !matches!(self.program, LaunchProgram::Steam { .. }) {
+      return None;
+    }
+
+    self
+      .env
+      .iter()
+      .find(|(key, _)| key == WINE_DLL_OVERRIDES)
+      .map(|(key, value)| format!(r#"{key}="{value}" %command%"#))
+  }
+
+  /// The proxy DLL this plan's Steam launch options override, when they carry
+  /// the Proton override.
+  #[cfg(feature = "io")]
+  pub(crate) fn steam_dll_override(&self) -> Option<&str> {
+    if self.steam_wrapper.is_some() || !matches!(self.program, LaunchProgram::Steam { .. }) {
+      return None;
+    }
+
+    self
+      .env
+      .iter()
+      .find(|(key, _)| key == WINE_DLL_OVERRIDES)
+      .and_then(|(_, value)| value.split('=').next())
+  }
+}
+
+/// The Wine variable that makes a loader's proxy DLL win over Wine's builtin.
+const WINE_DLL_OVERRIDES: &str = "WINEDLLOVERRIDES";
 
 /// The first of `exe_names` present in `game_dir`.
 #[cfg(feature = "io")]
@@ -3930,6 +3996,86 @@ mod planning_tests {
         if path == &Path::new(TARGET).join("start_game_bepinex.sh")
     ));
     assert_eq!(plan.args[0], "--doorstop-enabled");
+  }
+
+  #[test]
+  fn a_proton_launch_through_steam_pastes_the_override_in_either_mode() {
+    for mode in [LaunchMode::Modded, LaunchMode::Vanilla] {
+      let proton = ctx(HostOs::Linux, StorePlatform::Steam, Runtime::Proton, mode);
+      let plan = plan(&with_preloader(), &proton).unwrap();
+
+      assert_eq!(
+        plan.steam_launch_options(Path::new("/base/valheim/steam-wrapper.sh")),
+        Some(r#"WINEDLLOVERRIDES="winhttp=n,b" %command%"#.to_string()),
+        "{mode:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn a_linux_native_launch_through_steam_pastes_the_wrapper_line() {
+    let native = ctx(
+      HostOs::Linux,
+      StorePlatform::Steam,
+      Runtime::Native,
+      LaunchMode::Modded,
+    );
+    let mut facts = with_preloader();
+
+    facts.loader_scripts = vec!["start_game_bepinex.sh".to_string()];
+
+    let plan = plan(&facts, &native).unwrap();
+
+    assert_eq!(
+      plan.steam_launch_options(Path::new("/base/valheim/steam-wrapper.sh")),
+      Some(r#""/base/valheim/steam-wrapper.sh" %command%"#.to_string())
+    );
+  }
+
+  #[test]
+  fn a_launch_steam_does_not_start_has_nothing_to_paste() {
+    for (os, runtime) in [
+      (HostOs::Windows, Runtime::Native),
+      (HostOs::Linux, Runtime::Proton),
+    ] {
+      let direct = ctx(os, StorePlatform::SteamDirect, runtime, LaunchMode::Modded);
+      let plan = plan(&with_preloader(), &direct).unwrap();
+
+      assert_eq!(
+        plan.steam_launch_options(Path::new("/base/valheim/steam-wrapper.sh")),
+        None,
+        "{os:?} {runtime:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn no_plan_needs_both_the_wrapper_and_the_proton_override() {
+    let mut facts = with_preloader();
+
+    facts.loader_scripts = vec!["start_game_bepinex.sh".to_string()];
+
+    for os in [HostOs::Windows, HostOs::Linux] {
+      for store in [
+        StorePlatform::Steam,
+        StorePlatform::SteamDirect,
+        StorePlatform::Other,
+      ] {
+        for runtime in [Runtime::Native, Runtime::Proton] {
+          for mode in [LaunchMode::Modded, LaunchMode::Vanilla] {
+            let Ok(plan) = plan(&facts, &ctx(os, store, runtime, mode)) else {
+              continue;
+            };
+            let overrides = plan.env.iter().any(|(key, _)| key == "WINEDLLOVERRIDES");
+
+            assert!(
+              !(plan.steam_wrapper.is_some() && overrides),
+              "{os:?} {store:?} {runtime:?} {mode:?}"
+            );
+          }
+        }
+      }
+    }
   }
 
   #[test]
