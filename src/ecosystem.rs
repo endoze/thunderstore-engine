@@ -246,8 +246,9 @@ pub struct GameDef {
   /// Store distributions (Steam/Epic/etc.) at the game level.
   #[serde(default, deserialize_with = "null_as_default")]
   pub distributions: Vec<Distribution>,
-  /// Per-manager profiles. Most games have one; a few add a dedicated-server
-  /// profile whose install rules match the primary profile's.
+  /// Per-manager profiles, one per r2modman entry. Most games have one. A few
+  /// have more: a dedicated server (Risk of Rain 2, Valheim) or a second game
+  /// edition with its own folder (Outward's `OutwardDe`).
   #[serde(rename = "r2modman", default, deserialize_with = "null_as_default")]
   pub profiles: Vec<GameProfile>,
 }
@@ -273,6 +274,41 @@ impl GameDef {
   /// See [`GameProfile::community`].
   pub fn community(&self) -> Option<&str> {
     self.profile()?.community()
+  }
+
+  /// Every distinct r2modman data folder this game's profiles use (see
+  /// [`GameProfile::internal_folder_name`]), in entry order.
+  ///
+  /// An importer of r2modman data reads `<data root>/<folder>/profiles/` for
+  /// each one. A server entry can share its game's folder (Risk of Rain 2,
+  /// Valheim), which then holds the profiles of both, while a second edition
+  /// can have its own (Outward has `Outward` and `OutwardDe`), so reading only
+  /// the primary profile's folder misses profiles.
+  ///
+  /// # Examples
+  ///
+  /// ```
+  /// use thunderstore_engine::ecosystem::Ecosystem;
+  ///
+  /// let eco = Ecosystem::bundled();
+  ///
+  /// assert_eq!(eco.game("valheim").unwrap().r2modman_folders(), ["Valheim"]);
+  /// assert_eq!(eco.game("outward").unwrap().r2modman_folders(), ["Outward", "OutwardDe"]);
+  /// ```
+  pub fn r2modman_folders(&self) -> Vec<&str> {
+    let mut folders: Vec<&str> = Vec::new();
+
+    for folder in self
+      .profiles
+      .iter()
+      .filter_map(|p| p.internal_folder_name.as_deref())
+    {
+      if !folders.contains(&folder) {
+        folders.push(folder);
+      }
+    }
+
+    folders
   }
 }
 
@@ -319,9 +355,19 @@ pub struct GameProfile {
   /// The loader-specific data subdirectory, when the schema records one.
   #[serde(rename = "dataFolderName", default)]
   pub data_folder_name: Option<String>,
-  /// The manager's settings identifier for this profile.
+  /// The manager's settings identifier for this profile. Unique per entry, but
+  /// not the name of r2modman's data folder; that is
+  /// [`internal_folder_name`](Self::internal_folder_name).
   #[serde(rename = "settingsIdentifier", default)]
   pub settings_identifier: Option<String>,
+  /// The folder under r2modman's data root that holds this profile's package
+  /// cache and profiles: `<data root>/<internal_folder_name>/profiles/<name>/`.
+  ///
+  /// It differs from [`settings_identifier`](Self::settings_identifier) for
+  /// several games (`ETG` vs `EnterTheGungeon`, `DiscoElysium` vs
+  /// `Disco Elysium`), and a server entry can share its game's folder.
+  #[serde(rename = "internalFolderName", default)]
+  pub internal_folder_name: Option<String>,
   /// The package-index URL for this community.
   #[serde(rename = "packageIndex", default)]
   pub package_index: Option<String>,
@@ -663,6 +709,129 @@ mod tests {
 
     assert_eq!(server.settings_identifier.as_deref(), Some("ValheimServer"));
     assert_eq!(server.community(), Some("valheim"));
+  }
+
+  #[test]
+  fn r2modman_folder_differs_from_settings_identifier_where_the_schema_says() {
+    let eco = Ecosystem::bundled();
+    let cases = [
+      ("disco-elysium", "Disco Elysium", "DiscoElysium"),
+      ("enter-the-gungeon", "EnterTheGungeon", "ETG"),
+      ("i-am-your-beast", "I Am Your Beast", "IAmYourBeast"),
+      (
+        "old-market-simulator",
+        "Old Market Simulator",
+        "OldMarketSimulator",
+      ),
+      ("peaks-of-yore", "Peaks of Yore", "PeaksOfYore"),
+      (
+        "tcg-card-shop-simulator",
+        "TCG Card Shop Simulator",
+        "TCGCardShopSimulator",
+      ),
+      (
+        "totally-accurate-battle-simulator",
+        "TotallyAccurateBattleSimulator",
+        "TABS",
+      ),
+    ];
+
+    for (slug, settings, folder) in cases {
+      let profile = eco.require_profile(slug).unwrap();
+
+      assert_eq!(
+        profile.settings_identifier.as_deref(),
+        Some(settings),
+        "{slug}"
+      );
+      assert_eq!(
+        profile.internal_folder_name.as_deref(),
+        Some(folder),
+        "{slug}"
+      );
+      assert_eq!(
+        eco.game(slug).unwrap().r2modman_folders(),
+        [folder],
+        "{slug}"
+      );
+    }
+  }
+
+  #[test]
+  fn a_server_entry_shares_its_games_r2modman_folder() {
+    let eco = Ecosystem::bundled();
+
+    for (slug, server_settings, folder) in [
+      ("riskofrain2", "RiskOfRain2Server", "RiskOfRain2"),
+      ("valheim", "ValheimServer", "Valheim"),
+    ] {
+      let game = eco.game(slug).unwrap();
+      let server = game
+        .profiles
+        .iter()
+        .find(|p| p.instance_type == InstanceType::Server)
+        .unwrap();
+
+      assert_eq!(
+        server.settings_identifier.as_deref(),
+        Some(server_settings),
+        "{slug}"
+      );
+      assert_eq!(
+        server.internal_folder_name.as_deref(),
+        Some(folder),
+        "{slug}"
+      );
+      assert_eq!(
+        game.profile().unwrap().internal_folder_name.as_deref(),
+        Some(folder),
+        "{slug}"
+      );
+      assert_eq!(game.r2modman_folders(), [folder], "{slug}");
+    }
+  }
+
+  #[test]
+  fn outward_editions_each_have_their_own_r2modman_folder() {
+    let eco = Ecosystem::bundled();
+    let outward = eco.game("outward").unwrap();
+
+    assert!(
+      outward
+        .profiles
+        .iter()
+        .all(|p| p.instance_type == InstanceType::Game)
+    );
+    assert_eq!(outward.r2modman_folders(), ["Outward", "OutwardDe"]);
+  }
+
+  #[test]
+  fn every_bundled_r2modman_entry_names_its_folder() {
+    let eco = Ecosystem::bundled();
+    let unnamed: Vec<&str> = eco
+      .games()
+      .filter(|g| {
+        g.profiles
+          .iter()
+          .any(|p| p.internal_folder_name.as_deref().is_none_or(str::is_empty))
+      })
+      .map(|g| g.slug.as_str())
+      .collect();
+
+    assert!(unnamed.is_empty(), "{unnamed:?}");
+  }
+
+  #[test]
+  fn r2modman_folders_is_empty_without_r2modman_entries() {
+    let eco = Ecosystem::bundled();
+
+    assert!(
+      eco
+        .game("phasmophobia")
+        .unwrap()
+        .r2modman_folders()
+        .is_empty()
+    );
   }
 
   #[test]
