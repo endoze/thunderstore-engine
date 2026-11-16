@@ -92,50 +92,70 @@ fn parse_leading_u32(component: Option<&str>) -> u32 {
 /// One installed mod, mirroring r2modman's `ManifestV2`. Field order matches
 /// r2modman's declaration order; `icon` is never serialized.
 ///
+/// Reading is as lenient as r2modman's: only `name` and `versionNumber` are
+/// required. A missing `enabled` reads as disabled, as r2modman reads it; every
+/// other missing key reads as `0`, `false`, or empty.
+///
 /// `#[non_exhaustive]`: fields may be added as the schema grows.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct ProfileMod {
   /// The `manifest.json` schema version the package declared.
+  #[serde(default)]
   pub manifest_version: u32,
   /// The package name, without its owner prefix.
   pub name: String,
   /// The package owner, as Thunderstore spells it.
+  #[serde(default)]
   pub author_name: String,
   /// The package's homepage, or empty when it declared none.
+  #[serde(default)]
   pub website_url: String,
   /// The name to show a user, which may differ from [`Self::name`].
+  #[serde(default)]
   pub display_name: String,
   /// The package's own description, shown verbatim. Not validated or truncated,
   /// so a UI must treat it as untrusted text from an arbitrary uploader.
+  #[serde(default)]
   pub description: String,
   /// The game version the package declared, carried through verbatim.
+  #[serde(default)]
   pub game_version: String,
   /// r2modman's network-mode marker, carried through verbatim.
+  #[serde(default)]
   pub network_mode: String,
   /// r2modman's package-type marker, carried through verbatim.
+  #[serde(default)]
   pub package_type: String,
   /// r2modman's install-mode marker, carried through verbatim.
+  #[serde(default)]
   pub install_mode: String,
   /// When the mod was installed, as a Unix timestamp in milliseconds.
+  #[serde(default)]
   pub installed_at_time: u64,
   /// Mod loaders the package declared support for.
+  #[serde(default)]
   pub loaders: Vec<String>,
   /// Full `Owner-Name-Version` dependency strings.
+  #[serde(default)]
   pub dependencies: Vec<String>,
   /// Packages this one declares it cannot coexist with.
+  #[serde(default)]
   pub incompatibilities: Vec<String>,
   /// Dependencies the package treats as optional.
+  #[serde(default)]
   pub optional_dependencies: Vec<String>,
   /// The installed version.
   pub version_number: SemVer,
   /// Whether the mod is currently enabled in the profile.
+  #[serde(default)]
   pub enabled: bool,
   /// Never written to `mods.yml` (r2modman strips it); ignored on read.
   #[serde(skip)]
   pub icon: String,
   /// Whether the mod came from Thunderstore rather than a local import.
+  #[serde(default)]
   pub online_source: bool,
   /// Absent from the `mods.yml` that installed r2modmanPlus versions actually
   /// write, so it must not be required: demanding it made importing a real
@@ -460,6 +480,48 @@ mod tests {
     // Absent means false: the conservative reading of "is this package trusted",
     // and nothing in the engine branches on it, so a default cannot change behavior.
     assert!(!mods[0].trusted_package);
+  }
+
+  /// r2modman's `ManifestV2.fromJsObject` defaults `installedAtTime`,
+  /// `onlineSource`, and `trustedPackage`, and disables an entry with no
+  /// `enabled`, so a sparse entry an older r2modman wrote must still read.
+  #[test]
+  fn parses_a_sparse_r2modman_entry_as_r2modman_does() {
+    let yaml = r#"- name: Author-Mod
+  versionNumber:
+    major: 1
+    minor: 2
+    patch: 3
+"#;
+
+    let mods: Vec<ProfileMod> = serde_yaml_ng::from_str(yaml).unwrap();
+
+    assert_eq!(mods.len(), 1);
+    assert_eq!(mods[0].name, "Author-Mod");
+    assert_eq!(mods[0].version_number, SemVer::parse("1.2.3"));
+    assert!(!mods[0].enabled);
+    assert_eq!(mods[0].installed_at_time, 0);
+    assert!(!mods[0].online_source);
+    assert!(mods[0].dependencies.is_empty());
+  }
+
+  #[test]
+  fn an_entry_without_a_name_or_version_is_refused() {
+    let no_version = "- name: Author-Mod\n";
+    let no_name = "- versionNumber: {major: 1, minor: 0, patch: 0}\n";
+
+    assert!(serde_yaml_ng::from_str::<Vec<ProfileMod>>(no_version).is_err());
+    assert!(serde_yaml_ng::from_str::<Vec<ProfileMod>>(no_name).is_err());
+  }
+
+  #[test]
+  #[cfg(feature = "io")]
+  fn reads_the_json_empty_list_r2modman_creates() {
+    let dir = tempdir().unwrap();
+
+    std::fs::write(dir.path().join(MODS_YML), "[]").unwrap();
+
+    assert!(read(dir.path()).unwrap().is_empty());
   }
 
   #[test]
