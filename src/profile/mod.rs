@@ -2430,7 +2430,7 @@ mod tests {
 
   fn build_mod_zip() -> Vec<u8> {
     let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
-    let opts: FileOptions<'_, ()> =
+    let opts: FileOptions<'_, '_, ()> =
       FileOptions::default().compression_method(zip::CompressionMethod::Stored);
 
     for (name, body) in [
@@ -3388,7 +3388,7 @@ mod tests {
 
     fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {
       let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
-      let opts: FileOptions<'_, ()> =
+      let opts: FileOptions<'_, '_, ()> =
         FileOptions::default().compression_method(zip::CompressionMethod::Stored);
 
       for (name, body) in files {

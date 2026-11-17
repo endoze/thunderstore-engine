@@ -73,83 +73,299 @@ pub(crate) struct VersionTable {
   pub file_sizes: Vec<Option<u64>>,
 }
 
-/// The on-disk cache format version. `bincode` is not self-describing, so this
-/// leading tag lets a build reject a cache written by an incompatible layout
-/// (rather than silently misdecoding it) — bump it on any change to the
-/// serialized field layout.
+/// The on-disk cache format version, stored first so a build rejects a cache
+/// written by an incompatible layout instead of misdecoding it. Bump it on any
+/// change to the serialized field layout.
 ///
-/// Version 2 switched the cache from the `bincode` serde bridge to `bincode`'s
-/// native `Encode`/`Decode` (so container allocation is bounded by the decode
-/// limit) and stores timestamps as `i128` Unix-nanosecond values.
+/// Version 3 moved the cache from `bincode` to `postcard`, under a new file
+/// name, so a version 2 cache is never read at all.
 #[cfg(feature = "io")]
-pub(crate) const CACHE_FORMAT_VERSION: u32 = 2;
+pub(crate) const CACHE_FORMAT_VERSION: u32 = 3;
 
-/// On-disk (`bincode`) representation of a [`PackageIndex`].
+/// On-disk (`postcard`) representation of a [`PackageIndex`].
 ///
-/// This structure converts the runtime PackageIndex into a format that can be
-/// efficiently serialized and deserialized. The string interner is converted to a simple
-/// vector of strings (the string table), and all interned keys become u32 indices into
-/// this table.
+/// The string interner becomes a plain string table and every interned key a
+/// `u32` index into it. Each field parallels the same-named field of
+/// [`PackageIndex`]. Timestamps are stored as `i128` Unix nanoseconds (see
+/// [`encode_dates`]/[`decode_dates`]).
 ///
-/// This separation allows for optimal serialization performance while maintaining the
-/// memory efficiency benefits of string interning at runtime.
-///
-/// This is the on-disk cache encoding written and read by [`crate::client`]
-/// (`zstd` + `bincode`). Each field parallels the same-named field of
-/// [`PackageIndex`], with interned keys stored as `u32` indices into
-/// `string_table`.
-///
-/// Encoded and decoded with `bincode`'s native `Encode`/`Decode` (not the serde
-/// bridge) so the decode limit bounds container allocation, and timestamps are
-/// stored as `i128` Unix nanoseconds (see [`encode_dates`]/[`decode_dates`])
-/// because `time::OffsetDateTime` is not a native `bincode` type.
+/// Every `Vec` field decodes through [`bounded::vec`], so decoding draws on the
+/// allocation budget given to [`decode_cache`].
 #[cfg(feature = "io")]
-#[derive(bincode::Encode, bincode::Decode, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub(crate) struct SerializedPackageIndex {
   /// Cache-format tag; must equal [`CACHE_FORMAT_VERSION`]. Kept first so it is
   /// the first value decoded from the stream.
   pub format_version: u32,
+  #[serde(deserialize_with = "bounded::vec")]
   pub string_table: Vec<String>,
+  #[serde(deserialize_with = "bounded::vec")]
   pub names: Vec<Option<u32>>,
+  #[serde(deserialize_with = "bounded::vec")]
   pub full_names: Vec<Option<u32>>,
+  #[serde(deserialize_with = "bounded::vec")]
   pub owners: Vec<Option<u32>>,
+  #[serde(deserialize_with = "bounded::vec")]
   pub package_urls: Vec<Option<u32>>,
   /// Package creation/update times as `i128` Unix nanoseconds.
+  #[serde(deserialize_with = "bounded::vec")]
   pub dates_created: Vec<i128>,
+  #[serde(deserialize_with = "bounded::vec")]
   pub dates_updated: Vec<i128>,
+  #[serde(deserialize_with = "bounded::vec")]
   pub uuid4s: Vec<Option<u32>>,
+  #[serde(deserialize_with = "bounded::vec")]
   pub rating_scores: Vec<Option<u32>>,
+  #[serde(deserialize_with = "bounded::vec")]
   pub is_pinned: Vec<Option<bool>>,
+  #[serde(deserialize_with = "bounded::vec")]
   pub is_deprecated: Vec<Option<bool>>,
+  #[serde(deserialize_with = "bounded::vec")]
   pub has_nsfw_content: Vec<Option<bool>>,
+  #[serde(deserialize_with = "bounded::vec")]
   pub categories: Vec<Vec<u32>>,
+  #[serde(deserialize_with = "bounded::vec")]
   pub version_ranges: Vec<(usize, usize)>,
   pub versions: SerializedVersionTable,
 }
 
-/// Serializable representation of interned version data.
-///
-/// Contains version information with string values represented as u32 indices into
-/// the parent manifest's string table. This allows efficient serialization while
-/// maintaining the benefits of string interning.
+/// Serializable representation of interned version data, with string values as
+/// `u32` indices into the parent index's string table.
 #[cfg(feature = "io")]
-#[derive(bincode::Encode, bincode::Decode, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub(crate) struct SerializedVersionTable {
+  #[serde(deserialize_with = "bounded::vec")]
   pub package_indices: Vec<usize>,
+  #[serde(deserialize_with = "bounded::vec")]
   pub names: Vec<Option<u32>>,
+  #[serde(deserialize_with = "bounded::vec")]
   pub full_names: Vec<Option<u32>>,
+  #[serde(deserialize_with = "bounded::vec")]
   pub version_numbers: Vec<Option<u32>>,
+  #[serde(deserialize_with = "bounded::vec")]
   pub download_urls: Vec<Option<u32>>,
+  #[serde(deserialize_with = "bounded::vec")]
   pub dependencies: Vec<Vec<u32>>,
   /// Version creation times as `i128` Unix nanoseconds.
+  #[serde(deserialize_with = "bounded::vec")]
   pub dates_created: Vec<i128>,
+  #[serde(deserialize_with = "bounded::vec")]
   pub descriptions: Vec<Option<u32>>,
+  #[serde(deserialize_with = "bounded::vec")]
   pub icons: Vec<Option<u32>>,
+  #[serde(deserialize_with = "bounded::vec")]
   pub downloads: Vec<Option<u32>>,
+  #[serde(deserialize_with = "bounded::vec")]
   pub website_urls: Vec<Option<u32>>,
+  #[serde(deserialize_with = "bounded::vec")]
   pub is_active: Vec<Option<bool>>,
+  #[serde(deserialize_with = "bounded::vec")]
   pub uuid4s: Vec<Option<u32>>,
+  #[serde(deserialize_with = "bounded::vec")]
   pub file_sizes: Vec<Option<u64>>,
+}
+
+/// Encodes the cache blob (before compression).
+#[cfg(feature = "io")]
+pub(crate) fn encode_cache(index: &SerializedPackageIndex) -> Result<Vec<u8>, Error> {
+  postcard::to_allocvec(index)
+    .map_err(|e| Error::Cache(format!("failed to encode manifest cache: {e}")))
+}
+
+/// Decodes a cache blob, allocating at most `budget` bytes for its tables.
+///
+/// Fails with [`Error::Cache`] when the blob is malformed, has trailing bytes,
+/// or would need more than `budget` bytes. The format version is checked later,
+/// by the `TryFrom` conversion into a [`PackageIndex`].
+#[cfg(feature = "io")]
+pub(crate) fn decode_cache(bytes: &[u8], budget: usize) -> Result<SerializedPackageIndex, Error> {
+  let (decoded, exhausted) = bounded::with_budget(budget, || {
+    postcard::take_from_bytes::<SerializedPackageIndex>(bytes)
+  });
+
+  if exhausted {
+    return Err(Error::Cache(format!(
+      "cached manifest exceeds the {budget}-byte decode allocation limit"
+    )));
+  }
+
+  let (index, rest) =
+    decoded.map_err(|e| Error::Cache(format!("failed to decode cached manifest: {e}")))?;
+
+  if !rest.is_empty() {
+    return Err(Error::Cache(format!(
+      "failed to decode cached manifest: {} trailing bytes",
+      rest.len()
+    )));
+  }
+
+  Ok(index)
+}
+
+/// An allocation budget for decoding the cache.
+///
+/// postcard trusts a sequence's declared length, and serde's `Vec` decoder can
+/// turn one input byte into a 24-byte `String` or `Vec`. Every cache table,
+/// every nested list, and every string therefore decodes through this module,
+/// which charges each allocation against a per-thread budget before making it
+/// and fails the decode once the budget is spent.
+#[cfg(feature = "io")]
+mod bounded {
+  use serde::Deserialize;
+  use serde::de::{self, DeserializeSeed, Deserializer, SeqAccess, Visitor};
+  use std::cell::Cell;
+  use std::fmt;
+  use std::marker::PhantomData;
+
+  thread_local! {
+    /// Bytes left to allocate, or `None` once a decode has run out.
+    static BUDGET: Cell<Option<usize>> = const { Cell::new(Some(0)) };
+  }
+
+  /// Resets the budget to zero when dropped, so a decode outside
+  /// [`with_budget`] (or after a panic) can allocate nothing.
+  struct Reset;
+
+  impl Drop for Reset {
+    fn drop(&mut self) {
+      BUDGET.with(|budget| budget.set(Some(0)));
+    }
+  }
+
+  /// Runs `decode` with `budget` bytes available to [`vec`], and reports
+  /// whether it ran out of budget.
+  pub(super) fn with_budget<R>(budget: usize, decode: impl FnOnce() -> R) -> (R, bool) {
+    BUDGET.with(|cell| cell.set(Some(budget)));
+    let _reset = Reset;
+
+    let result = decode();
+    let exhausted = BUDGET.with(|cell| cell.get().is_none());
+
+    (result, exhausted)
+  }
+
+  fn charge<E: de::Error>(bytes: usize) -> Result<(), E> {
+    BUDGET.with(
+      |budget| match budget.get().and_then(|left| left.checked_sub(bytes)) {
+        Some(left) => {
+          budget.set(Some(left));
+
+          Ok(())
+        }
+        None => {
+          budget.set(None);
+
+          Err(E::custom("cache exceeds the decode allocation limit"))
+        }
+      },
+    )
+  }
+
+  /// A cache element that charges its own heap allocations, before making
+  /// them, as it decodes.
+  pub(super) trait Budgeted<'de>: Sized {
+    fn decode<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error>;
+  }
+
+  /// Types with no heap allocation decode as usual.
+  macro_rules! inline_only {
+    ($($ty:ty),* $(,)?) => {
+      $(impl<'de> Budgeted<'de> for $ty {
+        fn decode<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+          <$ty>::deserialize(deserializer)
+        }
+      })*
+    };
+  }
+
+  inline_only!(
+    u32,
+    usize,
+    i128,
+    (usize, usize),
+    Option<bool>,
+    Option<u32>,
+    Option<u64>,
+  );
+
+  impl<'de> Budgeted<'de> for String {
+    fn decode<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+      struct BoundedString;
+
+      impl Visitor<'_> for BoundedString {
+        type Value = String;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+          f.write_str("a string")
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<String, E> {
+          charge(value.len())?;
+
+          Ok(value.to_owned())
+        }
+      }
+
+      deserializer.deserialize_string(BoundedString)
+    }
+  }
+
+  impl<'de> Budgeted<'de> for Vec<u32> {
+    fn decode<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+      vec(deserializer)
+    }
+  }
+
+  /// Decodes one element of a sequence through [`Budgeted::decode`].
+  struct Element<T>(PhantomData<T>);
+
+  impl<'de, T: Budgeted<'de>> DeserializeSeed<'de> for Element<T> {
+    type Value = T;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<T, D::Error> {
+      T::decode(deserializer)
+    }
+  }
+
+  /// Deserializes a `Vec<T>`, charging each new capacity in full before
+  /// reserving it. Elements charge their own heap bytes as they decode.
+  ///
+  /// The full new capacity is charged, not just the increase, because growing
+  /// copies into a new buffer while the old one is still allocated.
+  pub(super) fn vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+  where
+    D: Deserializer<'de>,
+    T: Budgeted<'de>,
+  {
+    struct BoundedVec<T>(PhantomData<T>);
+
+    impl<'de, T: Budgeted<'de>> Visitor<'de> for BoundedVec<T> {
+      type Value = Vec<T>;
+
+      fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a sequence")
+      }
+
+      fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<T>, A::Error> {
+        let mut items = Vec::new();
+
+        while let Some(item) = seq.next_element_seed(Element::<T>(PhantomData))? {
+          if items.len() == items.capacity() {
+            let grow = items.capacity().max(4);
+
+            charge((items.capacity() + grow).saturating_mul(size_of::<T>()))?;
+            items.reserve_exact(grow);
+          }
+
+          items.push(item);
+        }
+
+        Ok(items)
+      }
+    }
+
+    deserializer.deserialize_seq(BoundedVec(PhantomData))
+  }
 }
 
 impl PackageIndex {
@@ -1114,10 +1330,10 @@ fn decode_key(index: u32, table_len: usize) -> Result<InternKey, Error> {
 
 /// Encodes runtime timestamps to the cache's `i128` Unix-nanosecond wire form.
 ///
-/// `time::OffsetDateTime` is not a native `bincode` type, so the cache stores each
-/// timestamp as its absolute instant in nanoseconds since the Unix epoch. The
-/// offset is not preserved, which is lossless for equality/ordering (both compare
-/// the instant) and matches the UTC timestamps the Thunderstore API returns.
+/// The cache stores each timestamp as its absolute instant in nanoseconds since
+/// the Unix epoch. The offset is not preserved, which is lossless for
+/// equality/ordering (both compare the instant) and matches the UTC timestamps
+/// the Thunderstore API returns.
 #[cfg(feature = "io")]
 fn encode_dates(dates: &[OffsetDateTime]) -> Vec<i128> {
   dates.iter().map(|d| d.unix_timestamp_nanos()).collect()
@@ -2189,10 +2405,9 @@ mod tests {
 
     let serializable: SerializedPackageIndex = (&interned).into();
 
-    let binary = bincode::encode_to_vec(&serializable, bincode::config::standard()).unwrap();
+    let binary = encode_cache(&serializable).unwrap();
 
-    let (deserialized, _): (SerializedPackageIndex, usize) =
-      bincode::decode_from_slice(&binary, bincode::config::standard()).unwrap();
+    let deserialized = decode_cache(&binary, usize::MAX).unwrap();
 
     let recovered: PackageIndex = deserialized.try_into().unwrap();
 
@@ -2246,10 +2461,9 @@ mod tests {
     // The distinction also survives a serialize -> deserialize round trip.
     let serializable: SerializedPackageIndex = (&interned).into();
 
-    let binary = bincode::encode_to_vec(&serializable, bincode::config::standard()).unwrap();
+    let binary = encode_cache(&serializable).unwrap();
 
-    let (deserialized, _): (SerializedPackageIndex, usize) =
-      bincode::decode_from_slice(&binary, bincode::config::standard()).unwrap();
+    let deserialized = decode_cache(&binary, usize::MAX).unwrap();
 
     let recovered: PackageIndex = deserialized.try_into().unwrap();
     let recovered_pkg = recovered.get_package_at(0).unwrap();
@@ -2615,6 +2829,69 @@ mod tests {
 
     assert_eq!(serializable.format_version, CACHE_FORMAT_VERSION);
     assert!(PackageIndex::try_from(serializable).is_ok());
+  }
+
+  #[test]
+  #[cfg(feature = "io")]
+  fn test_decode_cache_stops_at_the_allocation_budget() {
+    // 100,000 empty strings take one byte each on disk but 24 bytes each in
+    // memory, so a 1 MiB budget runs out long before the table is decoded.
+    let blob =
+      postcard::to_allocvec(&(CACHE_FORMAT_VERSION, vec![String::new(); 100_000])).unwrap();
+
+    let result = decode_cache(&blob, 1024 * 1024);
+
+    assert!(
+      matches!(&result, Err(Error::Cache(message)) if message.contains("allocation limit")),
+      "{result:?}"
+    );
+  }
+
+  #[test]
+  #[cfg(feature = "io")]
+  fn test_decode_cache_charges_a_nested_list_before_it_grows() {
+    // Every table empty up to `categories`, which holds one inner list of a
+    // million `0u32`s: 1 MB on disk, 4 MB once decoded.
+    let mut blob = vec![CACHE_FORMAT_VERSION as u8];
+    blob.extend([0u8; 12]);
+    blob.push(1);
+    blob.extend(postcard::to_allocvec(&1_000_000usize).unwrap());
+    blob.resize(blob.len() + 1_000_000, 0);
+
+    let result = decode_cache(&blob, 1024 * 1024);
+
+    assert!(
+      matches!(&result, Err(Error::Cache(message)) if message.contains("allocation limit")),
+      "{result:?}"
+    );
+  }
+
+  #[test]
+  #[cfg(feature = "io")]
+  fn test_decode_cache_charges_strings_by_length() {
+    let blob = postcard::to_allocvec(&(CACHE_FORMAT_VERSION, vec!["x".repeat(2048)])).unwrap();
+
+    let result = decode_cache(&blob, 1024);
+
+    assert!(
+      matches!(&result, Err(Error::Cache(message)) if message.contains("allocation limit")),
+      "{result:?}"
+    );
+  }
+
+  #[test]
+  #[cfg(feature = "io")]
+  fn test_decode_cache_rejects_trailing_bytes() {
+    let pkg = create_test_package("TestMod", "TestOwner", "1.0.0");
+    let interned: PackageIndex = vec![pkg].into();
+    let mut blob = encode_cache(&(&interned).into()).unwrap();
+
+    blob.push(0);
+
+    assert!(matches!(
+      decode_cache(&blob, usize::MAX),
+      Err(Error::Cache(_))
+    ));
   }
 
   #[test]

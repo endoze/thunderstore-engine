@@ -117,7 +117,13 @@ async fn a_readme_request_that_cannot_reach_the_host_is_an_http_error() {
   let result = client.get_readme("Owner", "ModA", "1.0.0").await;
 
   assert!(
-    matches!(&result, Err(Error::Http(error)) if error.is_connect()),
+    matches!(
+      &result,
+      Err(Error::Http(error))
+        if std::error::Error::source(error)
+          .and_then(|source| source.downcast_ref::<reqwest::Error>())
+          .is_some_and(reqwest::Error::is_connect)
+    ),
     "{result:?}"
   );
 }

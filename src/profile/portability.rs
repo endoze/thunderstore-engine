@@ -228,9 +228,9 @@ const BEPINEX_CONFIG_DIR: &str = "BepInEx/config";
 /// # Errors
 ///
 /// - [`Error::Profile`] if `target_dir` has no readable
-///   `mods.yml`, or the mod list cannot be serialized.
+///   `mods.yml`, the mod list cannot be serialized, or the archive cannot be
+///   written.
 /// - [`Error::Io`] if a config file cannot be read.
-/// - [`Error::Zip`] if the archive cannot be written.
 ///
 /// # Examples
 ///
@@ -249,7 +249,7 @@ pub fn build_r2z_in(target_dir: &Path, profile_name: &str) -> Result<Vec<u8>> {
   let manifest = export_r2x_to_string(&export_format_from_mods(profile_name, &mods))?;
 
   let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
-  let options: FileOptions<'_, ()> =
+  let options: FileOptions<'_, '_, ()> =
     FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
   zip
@@ -291,7 +291,7 @@ pub fn build_r2z_in(target_dir: &Path, profile_name: &str) -> Result<Vec<u8>> {
 #[cfg(feature = "io")]
 fn add_zip_file(
   zip: &mut ZipWriter<Cursor<Vec<u8>>>,
-  options: FileOptions<'_, ()>,
+  options: FileOptions<'_, '_, ()>,
   archive_path: &str,
   source: &Path,
 ) -> Result<()> {
@@ -509,8 +509,16 @@ pub fn read_export(bytes: &[u8]) -> Result<ExportFormat> {
 /// spaces stripped: Windows silently drops those from the final path component
 /// on create, so an entry named e.g. `Evil.dll.` would otherwise land on disk as
 /// `Evil.dll` and bypass the filter on the platform that matters most here.
+///
+/// A name with a NUL is refused because no filesystem can create it, so it
+/// would fail the whole import. A name with a `:` is refused because on Windows
+/// it names an alternate data stream: `x.dll:$DATA` writes `x.dll` itself.
 #[cfg(feature = "io")]
 fn import_config_key(name: &str) -> Option<PathBuf> {
+  if name.contains(['\0', ':']) {
+    return None;
+  }
+
   let normalized = name.replace('\\', "/");
 
   if normalized.is_empty() || normalized.ends_with('/') {
@@ -628,7 +636,7 @@ pub fn extract_configs_in(target_dir: &Path, zip_bytes: &[u8]) -> Result<Vec<Pat
       .by_index(index)
       .map_err(|e| Error::Profile(format!("reading archive entry {index}: {e}")))?;
 
-    let rel = match import_config_key(entry.name()) {
+    let rel = match entry.name().ok().as_deref().and_then(import_config_key) {
       Some(rel) => rel,
       None => continue,
     };
@@ -1701,7 +1709,7 @@ mods:
 
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
     let names: Vec<String> = (0..zip.len())
-      .map(|i| zip.by_index(i).unwrap().name().replace('\\', "/"))
+      .map(|i| zip.by_index(i).unwrap().name().unwrap().replace('\\', "/"))
       .collect();
 
     assert!(names.contains(&"export.r2x".to_string()));
@@ -1849,6 +1857,41 @@ mods:
   }
 
   #[test]
+  fn import_config_key_refuses_nul_and_alternate_data_streams() {
+    for name in [
+      "x.dll:$DATA",
+      "config/a.cfg:stream",
+      "BepInEx/config/a\0.cfg",
+    ] {
+      assert_eq!(import_config_key(name), None, "{name:?} should be skipped");
+    }
+  }
+
+  #[test]
+  fn extract_configs_skips_a_nul_name_and_keeps_importing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+    let options: FileOptions<'_, '_, ()> = FileOptions::default();
+
+    for name in ["config/a.cfg", "config/b\0.cfg", "config/c.cfg"] {
+      zip.start_file(name, options).unwrap();
+      zip.write_all(b"value").unwrap();
+    }
+
+    let bytes = zip.finish().unwrap().into_inner();
+    let written = extract_configs_in(dir.path(), &bytes).unwrap();
+
+    assert_eq!(
+      written,
+      [
+        PathBuf::from("BepInEx/config/a.cfg"),
+        PathBuf::from("BepInEx/config/c.cfg"),
+      ]
+    );
+    assert!(dir.path().join("BepInEx/config/c.cfg").exists());
+  }
+
+  #[test]
   fn read_export_accepts_r2z_and_bare_r2x() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -1953,7 +1996,7 @@ mods:
   /// archive itself stays tiny while its inflated content can dwarf the caps.
   fn zip_with_one_zero_filled_entry(name: &str, inflated_len: usize) -> Vec<u8> {
     let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
-    let options: FileOptions<'_, ()> =
+    let options: FileOptions<'_, '_, ()> =
       FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
     zip.start_file(name, options).unwrap();
@@ -1983,7 +2026,7 @@ mods:
     let entries_needed = (MAX_IMPORT_TOTAL_BYTES / per_entry_len as u64) + 1;
 
     let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
-    let options: FileOptions<'_, ()> =
+    let options: FileOptions<'_, '_, ()> =
       FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     let chunk = vec![0u8; per_entry_len];
 

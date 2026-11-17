@@ -16,9 +16,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// wildcard arm.
 ///
 /// `Error` is `Clone`, so a client can keep one in its state or hand it to
-/// several listeners. Sources that are not `Clone` themselves are held in a
-/// [`Shared`]; `?` still converts them directly, and
-/// [`source`](std::error::Error::source) still downcasts to them.
+/// several listeners. An I/O source is held in a [`Shared`], which `?` still
+/// converts to directly. Failures from dependencies (HTTP, JSON, zip) are held
+/// in crate-owned types such as [`HttpError`], so no dependency type is part of
+/// this API.
 #[derive(Error, Debug, Clone)]
 #[non_exhaustive]
 pub enum Error {
@@ -29,21 +30,21 @@ pub enum Error {
   /// Error from HTTP operations.
   #[cfg(feature = "io")]
   #[error("HTTP error: {0}")]
-  Http(#[source] Shared<reqwest::Error>),
+  Http(#[source] HttpError),
 
   /// Error from JSON parsing.
   #[error("JSON error: {0}")]
-  Json(#[source] Shared<serde_json::Error>),
+  Json(#[source] JsonError),
 
-  /// Error from ZIP operations.
+  /// A zip archive could not be read or written.
   #[cfg(feature = "io")]
   #[error("ZIP error: {0}")]
-  Zip(#[source] Shared<zip::result::ZipError>),
+  Archive(#[source] ArchiveError),
 
   /// Error from header parsing.
   #[cfg(feature = "io")]
   #[error("Header error: {0}")]
-  Header(#[source] Shared<reqwest::header::ToStrError>),
+  Header(#[source] HeaderError),
 
   /// Error from parsing integers.
   #[error("Parse integer error: {0}")]
@@ -293,30 +294,75 @@ impl From<io::Error> for Error {
   }
 }
 
-#[cfg(feature = "io")]
-impl From<reqwest::Error> for Error {
-  fn from(error: reqwest::Error) -> Self {
-    Self::Http(Shared(Arc::new(error)))
-  }
+/// Defines a crate-owned, `Clone` error that wraps a dependency's error so the
+/// dependency's type stays out of the public API.
+macro_rules! opaque_error {
+  ($(#[doc = $doc:literal])* #[cfg($cfg:meta)] $name:ident($inner:ty), $ctor:ident => $variant:ident) => {
+    $(#[doc = $doc])*
+    ///
+    /// The message is the underlying library's, and
+    /// [`source`](std::error::Error::source) returns the underlying error for
+    /// logging.
+    #[cfg($cfg)]
+    #[derive(Debug, Clone)]
+    pub struct $name(Arc<$inner>);
+
+    #[cfg($cfg)]
+    impl fmt::Display for $name {
+      fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+      }
+    }
+
+    #[cfg($cfg)]
+    impl std::error::Error for $name {
+      fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+      }
+    }
+
+    #[cfg($cfg)]
+    impl Error {
+      #[cfg_attr(
+        all(not(feature = "io"), not(test)),
+        expect(dead_code, reason = "only io code converts dependency errors")
+      )]
+      pub(crate) fn $ctor(error: $inner) -> Self {
+        Self::$variant($name(Arc::new(error)))
+      }
+    }
+  };
 }
 
-impl From<serde_json::Error> for Error {
-  fn from(error: serde_json::Error) -> Self {
-    Self::Json(Shared(Arc::new(error)))
-  }
+opaque_error! {
+  /// An HTTP request or response failure, carried by [`Error::Http`].
+  #[cfg(feature = "io")]
+  HttpError(reqwest::Error), http => Http
+}
+
+opaque_error! {
+  /// A response header that is not visible ASCII, carried by [`Error::Header`].
+  #[cfg(feature = "io")]
+  HeaderError(reqwest::header::ToStrError), header => Header
+}
+
+opaque_error! {
+  /// A JSON parse or serialize failure, carried by [`Error::Json`].
+  #[cfg(all())]
+  JsonError(serde_json::Error), json => Json
+}
+
+opaque_error! {
+  /// A zip archive failure, carried by [`Error::Archive`].
+  #[cfg(feature = "io")]
+  ArchiveError(zip::result::ZipError), archive => Archive
 }
 
 #[cfg(feature = "io")]
-impl From<zip::result::ZipError> for Error {
-  fn from(error: zip::result::ZipError) -> Self {
-    Self::Zip(Shared(Arc::new(error)))
-  }
-}
-
-#[cfg(feature = "io")]
-impl From<reqwest::header::ToStrError> for Error {
-  fn from(error: reqwest::header::ToStrError) -> Self {
-    Self::Header(Shared(Arc::new(error)))
+impl HttpError {
+  /// The wrapped error, for the crate's own retry classification.
+  pub(crate) fn reqwest(&self) -> &reqwest::Error {
+    &self.0
   }
 }
 
@@ -347,11 +393,12 @@ mod tests {
   #[test]
   fn a_wrapped_source_downcasts_to_the_original_error() {
     let io = Error::from(io::Error::new(io::ErrorKind::NotFound, "gone"));
-    let json = Error::from(serde_json::from_str::<u8>("x").unwrap_err());
+    let json = Error::json(serde_json::from_str::<u8>("x").unwrap_err());
 
     let io_source =
       std::error::Error::source(&io).and_then(|source| source.downcast_ref::<io::Error>());
     let json_source = std::error::Error::source(&json)
+      .and_then(std::error::Error::source)
       .and_then(|source| source.downcast_ref::<serde_json::Error>());
 
     assert_eq!(
@@ -359,5 +406,24 @@ mod tests {
       Some(io::ErrorKind::NotFound)
     );
     assert!(json_source.is_some());
+  }
+
+  #[cfg(feature = "io")]
+  #[test]
+  fn a_zip_failure_is_an_archive_error_with_the_zip_error_as_its_source() {
+    let zip_error = zip::ZipArchive::new(std::io::Cursor::new(b"not a zip".to_vec())).unwrap_err();
+    let message = zip_error.to_string();
+
+    let err = Error::archive(zip_error);
+
+    let Error::Archive(archive) = &err else {
+      panic!("expected Error::Archive, got {err:?}");
+    };
+    assert_eq!(err.to_string(), format!("ZIP error: {message}"));
+    assert!(
+      std::error::Error::source(archive)
+        .and_then(|source| source.downcast_ref::<zip::result::ZipError>())
+        .is_some()
+    );
   }
 }

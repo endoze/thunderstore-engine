@@ -22,7 +22,7 @@ use zip::write::{FileOptions, ZipWriter};
 /// `README.md`) plus a `plugins/` folder containing the DLL and its docs.
 fn build_mod_zip() -> Vec<u8> {
   let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
-  let opts: FileOptions<'_, ()> =
+  let opts: FileOptions<'_, '_, ()> =
     FileOptions::default().compression_method(zip::CompressionMethod::Stored);
 
   let entries: [(&str, &[u8]); 5] = [

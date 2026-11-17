@@ -22,7 +22,11 @@ use std::time::Duration;
 ///
 /// The delay before the retry following a (0-based) attempt is
 /// `base_delay * 2^attempt`, capped at `max_delay`, plus a little jitter.
+///
+/// Build one from [`RetryPolicy::default`] or [`RetryPolicy::none`] and set the
+/// fields to change.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct RetryPolicy {
   /// Maximum number of retries *after* the initial attempt (so total attempts is
   /// `max_retries + 1`). Zero disables retrying.
@@ -142,6 +146,8 @@ where
 pub(crate) fn is_retryable_http(err: &Error) -> bool {
   match err {
     Error::Http(e) => {
+      let e = e.reqwest();
+
       if let Some(status) = e.status() {
         status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
       } else {

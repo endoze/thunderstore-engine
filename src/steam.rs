@@ -44,6 +44,7 @@ const SUSPECT_PREFIXES: [&str; 4] = ["/tmp", "/var/tmp", "/dev/shm", "/run/user"
 
 /// What was determined about Steam's ability to resolve a path.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Visibility {
   /// Present in the running Steam client's mount namespace.
   Reachable,
