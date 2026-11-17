@@ -19,6 +19,7 @@ const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
 /// This structure represents the manifest.json file found in mod archives,
 /// containing version information, dependencies, and package metadata.
 #[derive(Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Manifest {
   /// The version number of this mod (e.g., "1.2.3").
   pub version_number: String,

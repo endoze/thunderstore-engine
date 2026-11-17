@@ -39,7 +39,10 @@ const EXTRACT_CHUNK_SIZE: usize = 64 * 1024;
 /// are generous enough for real mod and texture packs while still rejecting
 /// pathological archives; tune them with [`extract_zip_with_limits`] when a
 /// caller needs different bounds.
+///
+/// Build one from [`ExtractLimits::default`] and set the fields to change.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct ExtractLimits {
   /// Maximum number of entries (files + directories) an archive may contain.
   pub max_entries: u64,
@@ -293,7 +296,7 @@ pub(crate) fn extract_zip_reporting(
   on_progress: &mut dyn FnMut(u64, u64),
 ) -> Result<()> {
   let file = fs::File::open(zip_path)?;
-  let mut archive = zip::ZipArchive::new(file)?;
+  let mut archive = zip::ZipArchive::new(file).map_err(Error::archive)?;
 
   if archive.len() as u64 > limits.max_entries {
     return Err(Error::ExtractLimitExceeded(format!(
@@ -312,12 +315,15 @@ pub(crate) fn extract_zip_reporting(
   for i in 0..archive.len() {
     on_progress(i as u64, entries);
 
-    let mut file_in_archive = archive.by_index(i)?;
+    let mut file_in_archive = archive.by_index(i).map_err(Error::archive)?;
     let enclosed = file_in_archive.enclosed_name();
     let outpath = match safe_join(dest_dir, enclosed.as_deref()) {
       Some(path) => path,
       None => {
-        warn!("Invalid file path in zip: {:?}", file_in_archive.name());
+        warn!(
+          "Invalid file path in zip: {:?}",
+          String::from_utf8_lossy(file_in_archive.name_raw())
+        );
         continue;
       }
     };
@@ -328,7 +334,7 @@ pub(crate) fn extract_zip_reporting(
       debug!("File {} comment: {:?}", i, comment);
     }
 
-    if file_in_archive.name().ends_with('/') {
+    if file_in_archive.name_raw().ends_with(b"/") {
       debug!("Creating directory {}", outpath.display());
       fs::create_dir_all(&outpath)?;
     } else {
@@ -693,7 +699,7 @@ mod tests {
     let file = File::create(&zip_path).unwrap();
     let mut zip = ZipWriter::new(file);
 
-    let options: FileOptions<'_, ()> =
+    let options: FileOptions<'_, '_, ()> =
       FileOptions::default().compression_method(zip::CompressionMethod::Stored);
 
     zip.start_file("valid_file.txt", options).unwrap();
@@ -726,10 +732,10 @@ mod tests {
     let file = File::create(&zip_path).unwrap();
     let mut zip = ZipWriter::new(file);
 
-    let executable: FileOptions<'_, ()> = FileOptions::default()
+    let executable: FileOptions<'_, '_, ()> = FileOptions::default()
       .compression_method(zip::CompressionMethod::Stored)
       .unix_permissions(0o755);
-    let plain: FileOptions<'_, ()> = FileOptions::default()
+    let plain: FileOptions<'_, '_, ()> = FileOptions::default()
       .compression_method(zip::CompressionMethod::Stored)
       .unix_permissions(0o644);
 
@@ -781,7 +787,7 @@ mod tests {
     let file = File::create(&zip_path).unwrap();
     let mut zip = ZipWriter::new(file);
 
-    let options: FileOptions<'_, ()> =
+    let options: FileOptions<'_, '_, ()> =
       FileOptions::default().compression_method(zip::CompressionMethod::Stored);
 
     zip.start_file("plugin.dll", options).unwrap();
@@ -816,7 +822,7 @@ mod tests {
     let file = File::create(&zip_path).unwrap();
     let mut zip = ZipWriter::new(file);
 
-    let options: FileOptions<'_, ()> = FileOptions::default()
+    let options: FileOptions<'_, '_, ()> = FileOptions::default()
       .compression_method(zip::CompressionMethod::Stored)
       .unix_permissions(0o4755);
 
@@ -849,7 +855,7 @@ mod tests {
     let file = File::create(&zip_path).unwrap();
     let mut zip = ZipWriter::new(file);
 
-    let options: FileOptions<'_, ()> =
+    let options: FileOptions<'_, '_, ()> =
       FileOptions::default().compression_method(zip::CompressionMethod::Stored);
 
     zip.add_directory("test_dir/", options).unwrap();
@@ -883,7 +889,7 @@ mod tests {
     let file = File::create(&zip_path).unwrap();
     let mut zip = ZipWriter::new(file);
 
-    let options: FileOptions<'_, ()> =
+    let options: FileOptions<'_, '_, ()> =
       FileOptions::default().compression_method(zip::CompressionMethod::Stored);
 
     zip
@@ -913,7 +919,7 @@ mod tests {
     let file = File::create(&zip_path).unwrap();
     let mut zip = ZipWriter::new(file);
 
-    let options: FileOptions<'_, ()> =
+    let options: FileOptions<'_, '_, ()> =
       FileOptions::default().compression_method(zip::CompressionMethod::Stored);
 
     // Larger than EXTRACT_CHUNK_SIZE so the streaming loop runs many iterations.
@@ -975,7 +981,7 @@ mod tests {
     let file = File::create(&zip_path).unwrap();
     let mut zip = ZipWriter::new(file);
 
-    let options: FileOptions<'_, ()> =
+    let options: FileOptions<'_, '_, ()> =
       FileOptions::default().compression_method(zip::CompressionMethod::Stored);
 
     // Stored compression keeps the payload as raw bytes in the local entry, so
@@ -1022,7 +1028,7 @@ mod tests {
     let file = File::create(zip_path).unwrap();
     let mut zip = ZipWriter::new(file);
 
-    let options: FileOptions<'_, ()> =
+    let options: FileOptions<'_, '_, ()> =
       FileOptions::default().compression_method(zip::CompressionMethod::Stored);
 
     for (name, contents) in entries {

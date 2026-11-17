@@ -130,9 +130,18 @@ impl Ecosystem {
   /// trust — see the [`DEFAULT_ECOSYSTEM_URL`] trust note. The response body is
   /// size-bounded (see `MAX_ECOSYSTEM_BYTES`) so a misbehaving endpoint cannot
   /// force unbounded allocation.
+  ///
+  /// The request goes through `client`'s HTTP connection and uses its retry
+  /// policy. `url` is fetched as given, not relative to the client's base URL.
   #[cfg(feature = "io")]
-  pub async fn fetch_latest(client: &reqwest::Client, url: &str) -> Result<Self> {
-    Self::fetch_latest_bounded(client, url, MAX_ECOSYSTEM_BYTES, &RetryPolicy::default()).await
+  pub async fn fetch_latest(client: &crate::client::ThunderstoreClient, url: &str) -> Result<Self> {
+    Self::fetch_latest_bounded(
+      client.http(),
+      url,
+      MAX_ECOSYSTEM_BYTES,
+      client.retry_policy(),
+    )
+    .await
   }
 
   /// [`fetch_latest`](Self::fetch_latest) with an explicit body-size cap and
@@ -148,7 +157,13 @@ impl Ecosystem {
     use futures::StreamExt;
 
     let body = retry_http(retry, async || {
-      let response = client.get(url).send().await?.error_for_status()?;
+      let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(Error::http)?
+        .error_for_status()
+        .map_err(Error::http)?;
 
       let mut cap = SizeCap::new("ecosystem schema", max_bytes);
 
@@ -160,7 +175,7 @@ impl Ecosystem {
       let mut body: Vec<u8> = Vec::new();
 
       while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
+        let chunk = chunk.map_err(Error::http)?;
 
         cap.add(chunk.len() as u64)?;
 
@@ -1067,7 +1082,13 @@ mod tests {
 
     let url = format!("{}/schema", server.url());
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let client = reqwest::Client::new();
+    let cache = tempfile::tempdir().unwrap();
+    let client = crate::client::ThunderstoreClient::builder()
+      .base_url(server.url())
+      .community("valheim")
+      .cache_dir(cache.path())
+      .build()
+      .unwrap();
     let eco = rt.block_on(Ecosystem::fetch_latest(&client, &url)).unwrap();
 
     assert_eq!(eco.schema_version, "0.3.0");

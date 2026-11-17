@@ -193,7 +193,7 @@ pub fn loader_zip() -> Vec<u8> {
 
 fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
   let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
-  let options: FileOptions<'_, ()> =
+  let options: FileOptions<'_, '_, ()> =
     FileOptions::default().compression_method(zip::CompressionMethod::Stored);
 
   for (name, body) in entries {

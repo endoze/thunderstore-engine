@@ -12,7 +12,7 @@ be shared across projects.
 
 ## What it provides
 
-- **`client`**: async Thunderstore API client with a `zstd` + `bincode`
+- **`client`**: async Thunderstore API client with a `zstd` + `postcard`
   package-index cache (per community), keyed by a `Last-Modified` freshness
   check. UI-agnostic progress via the `progress` traits, and per-operation
   progress events and cancellation via `progress::Operation`.
@@ -116,7 +116,7 @@ Each `io` function with a pure counterpart reads its inputs and calls that
 counterpart, so the two decide identically. To depend on the pure part only:
 
 ```toml
-thunderstore-engine = { version = "0.3", default-features = false }
+thunderstore-engine = { version = "0.5", default-features = false }
 ```
 
 Cargo merges features across everything built together, so a crate that must
@@ -132,7 +132,7 @@ build dependency. Either one turns on `io`. Pick exactly one:
 - `native-tls`: links the platform's TLS stack instead:
 
   ```toml
-  thunderstore-engine = { version = "0.1", default-features = false, features = ["native-tls"] }
+  thunderstore-engine = { version = "0.5", default-features = false, features = ["native-tls"] }
   ```
 
 ### `test-support`
@@ -145,7 +145,7 @@ so a client's tests can run the install pipeline with no network access.
 
 ```toml
 [dev-dependencies]
-thunderstore-engine = { version = "0.3", features = ["test-support"] }
+thunderstore-engine = { version = "0.5", features = ["test-support"] }
 ```
 
 `test-support` turns on `io`, so it needs a TLS backend like any `io` build.
@@ -154,7 +154,7 @@ also get the default `rustls-tls`:
 
 ```toml
 [dev-dependencies]
-thunderstore-engine = { version = "0.3", default-features = false, features = ["native-tls", "test-support"] }
+thunderstore-engine = { version = "0.5", default-features = false, features = ["native-tls", "test-support"] }
 ```
 
 ## Refreshing the bundled ecosystem snapshot

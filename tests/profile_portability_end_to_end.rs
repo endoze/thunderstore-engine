@@ -13,7 +13,7 @@ use zip::write::{FileOptions, ZipWriter};
 
 fn build_mod_zip() -> Vec<u8> {
   let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
-  let opts: FileOptions<'_, ()> =
+  let opts: FileOptions<'_, '_, ()> =
     FileOptions::default().compression_method(zip::CompressionMethod::Stored);
 
   for (name, body) in [
@@ -602,7 +602,7 @@ fn adopted_mods_yml(full_name: &str, owner: &str, display: &str, version: &str) 
 /// the reason a reinstall is the only way to get an exact file list.
 fn build_loader_zip() -> Vec<u8> {
   let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
-  let opts: FileOptions<'_, ()> =
+  let opts: FileOptions<'_, '_, ()> =
     FileOptions::default().compression_method(zip::CompressionMethod::Stored);
 
   for (name, body) in [
@@ -851,7 +851,7 @@ fn adopting_a_directory_does_not_reinstall_a_loader_that_already_has_a_record() 
 
 fn build_mod_zip_named(dll_name: &str) -> Vec<u8> {
   let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
-  let opts: FileOptions<'_, ()> =
+  let opts: FileOptions<'_, '_, ()> =
     FileOptions::default().compression_method(zip::CompressionMethod::Stored);
 
   zip.start_file("manifest.json", opts).unwrap();
@@ -1002,7 +1002,7 @@ fn import_r2z_in_keeps_a_disabled_entry_disabled_despite_a_later_dependency_inst
 /// ships with a default value.
 fn build_mod_zip_with_config() -> Vec<u8> {
   let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
-  let opts: FileOptions<'_, ()> =
+  let opts: FileOptions<'_, '_, ()> =
     FileOptions::default().compression_method(zip::CompressionMethod::Stored);
 
   for (name, body) in [

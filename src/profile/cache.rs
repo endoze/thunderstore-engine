@@ -68,7 +68,7 @@ mod tests {
 
   fn build_zip() -> Vec<u8> {
     let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
-    let opts: FileOptions<'_, ()> =
+    let opts: FileOptions<'_, '_, ()> =
       FileOptions::default().compression_method(zip::CompressionMethod::Stored);
 
     zip.start_file("manifest.json", opts).unwrap();

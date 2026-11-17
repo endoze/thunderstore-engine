@@ -1,0 +1,85 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en-US
+early_access: false
+enable_free_tier: true
+
+reviews:
+  profile: assertive
+  request_changes_workflow: false
+  high_level_summary: true
+  collapse_walkthrough: true
+  sequence_diagrams: false
+  poem: false
+  in_progress_fortune: false
+  suggested_labels: false
+  suggested_reviewers: false
+  path_filters:
+    - "!Cargo.lock"
+    - "!target/**"
+    - "!coverage/**"
+    - "!CHANGELOG.md"
+  path_instructions:
+    - path: "src/**/*.rs"
+      instructions: |
+        Public items need rustdoc covering the contract: purpose, invariants,
+        errors, panics, and an example where it helps. Inline `//` comments are
+        only warranted for a why the code cannot state (a workaround and its
+        reason, a drop-order dependency, a deliberate fail-closed choice).
+        Flag inline comments that restate what the code does or describe a
+        dependency's internals.
+
+        Game-agnostic Thunderstore library used by valheim-mod-manager. Flag any
+        public API change: changed signatures, removed items, and dependency
+        types in public signatures (dependency errors stay behind crate-owned
+        types such as `HttpError`).
+        Mod archives and imported profiles are untrusted: entry paths must go
+        through `enclosed_name` and `safe_join`, setuid/setgid bits are never
+        applied, and the size and entry limits stay enforced. Disk and network
+        code is gated on the `io` feature, and exactly one of `rustls-tls` or
+        `native-tls` may be on. Errors go through the crate `Error` enum.
+
+        Do not comment on style that `cargo fmt` (2-space indent) or
+        `cargo clippy --all-targets --features test-support -- -D warnings`
+        already enforces.
+    - path: "tests/**/*.rs"
+      instructions: |
+        Check that tests assert behavior rather than restating the
+        implementation, and that new public API or bugfixes come with
+        coverage. Tests run with `--features test-support` and with
+        `--no-default-features`; `--all-features` does not build because it
+        enables both TLS backends.
+    - path: ".github/workflows/**"
+      instructions: |
+        Every third-party action must be pinned to a full commit SHA with the
+        version in a trailing comment (`uses: owner/action@<sha> # vX.Y.Z`).
+        release.yml is hand-maintained: dist can't generate a release workflow for
+        a library crate, so don't suggest regenerating it. dist alone creates GitHub Releases (release-plz.toml keeps `git_release_enable = false`).
+  auto_review:
+    enabled: true
+    drafts: false
+    auto_incremental_review: true
+    # Stacked PRs target the branch below them, not just master.
+    base_branches:
+      - ".*"
+  tools:
+    clippy:
+      enabled: true
+    actionlint:
+      enabled: true
+    yamllint:
+      enabled: true
+    gitleaks:
+      enabled: true
+    markdownlint:
+      enabled: true
+
+chat:
+  art: false
+  auto_reply: true
+  allow_non_org_members: false
+
+knowledge_base:
+  learnings:
+    scope: local
+  issues:
+    scope: local

@@ -2,7 +2,7 @@
 //!
 //! [`ThunderstoreClient`](crate::client::ThunderstoreClient) fetches a community's package index
 //! (`/c/<community>/api/v1/package/`) and caches it on disk compressed with
-//! `zstd` + `bincode`, keyed by a `Last-Modified` freshness check. It also
+//! `zstd` + `postcard`, keyed by a `Last-Modified` freshness check. It also
 //! downloads package archives with bounded concurrency. All progress is
 //! reported through [`crate::progress`] so the crate stays UI-agnostic.
 //!
@@ -11,12 +11,11 @@
 #![deny(missing_docs)]
 
 use crate::error::{Error, Result};
-use crate::models::{Package, PackageIndex, SerializedPackageIndex};
+use crate::models::{Package, PackageIndex, SerializedPackageIndex, decode_cache, encode_cache};
 use crate::progress::{NoopProgress, ProgressReporter};
 use crate::retry::{RetryPolicy, retry_http};
 use crate::util::{SizeCap, io_context};
 
-use chrono::prelude::*;
 use futures::stream::StreamExt;
 use reqwest::Client;
 use reqwest::header;
@@ -26,13 +25,19 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc2822;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Default Thunderstore host used when no `base_url` is supplied.
 const DEFAULT_BASE_URL: &str = "https://thunderstore.io";
 const LAST_MODIFIED_FILENAME: &str = "last_modified";
-const API_MANIFEST_FILENAME: &str = "api_manifest.bin.zst";
+const API_MANIFEST_FILENAME: &str = "api_manifest.postcard.zst";
+
+/// The bincode cache written before 0.5. It is never read: a client that finds
+/// only this file treats the cache as missing, and the next download removes it.
+const LEGACY_API_MANIFEST_FILENAME: &str = "api_manifest.bin.zst";
 
 /// Subdirectory under `cache_dir` that holds the per-index (per-community) index
 /// cache. Each community's manifest lives in its own subfolder keyed by a CRC32 of
@@ -59,7 +64,7 @@ const DEFAULT_MAX_MANIFEST_BYTES: u64 = 512 * 1024 * 1024;
 /// Fallback ceiling on the *decompressed* size of a cached index read back from
 /// disk, used only when neither the read cap nor the download cap is customised.
 ///
-/// The interned-`bincode` cache is smaller than the JSON it was built from, so a
+/// The interned-`postcard` cache is smaller than the JSON it was built from, so a
 /// manifest that passes the download cap always fits under an equal read cap. To
 /// make that guarantee automatic — so a manifest that downloads successfully can
 /// never become permanently unreadable from cache — the read cap *defaults to
@@ -67,20 +72,19 @@ const DEFAULT_MAX_MANIFEST_BYTES: u64 = 512 * 1024 * 1024;
 /// this const is only the last-resort fallback. Override it with
 /// [`ThunderstoreClientBuilder::manifest_max_decompressed_bytes`].
 ///
-/// Security: this caps how many bytes are inflated from a `zstd`/`bincode` cache
+/// Security: this caps how many bytes are inflated from a `zstd`/`postcard` cache
 /// (e.g. one planted in a shared cache dir) before decoding begins. Decoding is
 /// separately bounded by [`MAX_DECODE_ALLOC`], so a crafted high-ratio file cannot
 /// exhaust memory even under a generous cap.
 const DEFAULT_MAX_MANIFEST_DECOMPRESSED_BYTES: usize = 512 * 1024 * 1024;
 
-/// Compile-time ceiling on the total allocation `bincode`'s native decoder will
-/// commit while decoding a cached index. Because the cache uses native `Decode`,
-/// every container claims `len * size_of` against this budget up front, so a
-/// crafted high-ratio cache cannot amplify a small file into an unbounded
-/// allocation — decode errors out instead. This is a fixed structural bound that,
-/// unlike the (configurable) decompressed-size cap, never scales up with the
-/// download cap, and it sits far above any real community's cache so it never
-/// rejects a legitimate one.
+/// Compile-time ceiling on the total allocation committed while decoding a
+/// cached index. Every table charges its capacity and its strings against this
+/// budget as it decodes, so a crafted high-ratio cache cannot amplify a small
+/// file into an unbounded allocation; decode errors out instead. This is a fixed
+/// structural bound that, unlike the (configurable) decompressed-size cap, never
+/// scales up with the download cap, and it sits far above any real community's
+/// cache so it never rejects a legitimate one.
 const MAX_DECODE_ALLOC: usize = 1024 * 1024 * 1024;
 
 /// Ceiling on the `last_modified` freshness marker read from disk. The marker is
@@ -136,6 +140,16 @@ pub struct ThunderstoreClient {
 }
 
 impl ThunderstoreClient {
+  /// The underlying HTTP client, for other modules' requests.
+  pub(crate) fn http(&self) -> &Client {
+    &self.http
+  }
+
+  /// The retry policy this client was built with.
+  pub(crate) fn retry_policy(&self) -> &RetryPolicy {
+    &self.retry
+  }
+
   /// Returns a builder for configuring a [`ThunderstoreClient`].
   ///
   /// `cache_dir` is the only required setting. Nothing is read, written, or sent
@@ -422,11 +436,13 @@ impl ThunderstoreClient {
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .body(payload.to_vec())
         .send()
-        .await?
-        .error_for_status()?;
+        .await
+        .map_err(Error::http)?
+        .error_for_status()
+        .map_err(Error::http)?;
 
       let body = read_capped_body(response, Some(MAX_PROFILE_CODE_BYTES)).await?;
-      let parsed: ProfileCodeResponse = serde_json::from_slice(&body)?;
+      let parsed: ProfileCodeResponse = serde_json::from_slice(&body).map_err(Error::json)?;
 
       Ok(parsed.key)
     })
@@ -456,7 +472,14 @@ impl ThunderstoreClient {
     let url = format!("{}/{}/get/{}/", self.base_url, PROFILE_API_PATH, code);
 
     let body = retry_http(&self.retry, || async {
-      let response = self.http.get(&url).send().await?.error_for_status()?;
+      let response = self
+        .http
+        .get(&url)
+        .send()
+        .await
+        .map_err(Error::http)?
+        .error_for_status()
+        .map_err(Error::http)?;
 
       read_capped_body(response, Some(MAX_PROFILE_CODE_BYTES)).await
     })
@@ -493,14 +516,18 @@ impl ThunderstoreClient {
     );
 
     retry_http(&self.retry, || async {
-      let response = self.http.get(&url).send().await?;
+      let response = self.http.get(&url).send().await.map_err(Error::http)?;
 
       if response.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
       }
 
-      let body = read_capped_body(response.error_for_status()?, Some(MAX_README_BYTES)).await?;
-      let parsed: ReadmeResponse = serde_json::from_slice(&body)?;
+      let body = read_capped_body(
+        response.error_for_status().map_err(Error::http)?,
+        Some(MAX_README_BYTES),
+      )
+      .await?;
+      let parsed: ReadmeResponse = serde_json::from_slice(&body).map_err(Error::json)?;
 
       Ok(Some(parsed.markdown))
     })
@@ -622,7 +649,7 @@ impl ThunderstoreClientBuilder {
   ///
   /// By default (when this is left unset) the read cap tracks
   /// [`manifest_max_bytes`](Self::manifest_max_bytes), i.e. the download cap. The
-  /// interned-`bincode` cache is always smaller than the JSON it was built from, so
+  /// interned-`postcard` cache is always smaller than the JSON it was built from, so
   /// tracking the download cap guarantees any manifest that downloads successfully
   /// can be read back from cache rather than being silently re-downloaded on every
   /// run.
@@ -727,7 +754,7 @@ impl ThunderstoreClientBuilder {
       http = http.user_agent(user_agent);
     }
 
-    let http = http.build()?;
+    let http = http.build().map_err(Error::http)?;
     let progress = self.progress.unwrap_or_else(|| Arc::new(NoopProgress));
 
     Ok(ThunderstoreClient {
@@ -843,7 +870,7 @@ fn validate_package_segment(segment: &str) -> Result<()> {
 ///
 /// An explicit `configured` value wins. Otherwise the read-back cap tracks the
 /// `download_cap` so any manifest that passes the (JSON) download cap fits under
-/// it once interned — the bincode cache is always smaller than the JSON — and can
+/// it once interned — the postcard cache is always smaller than the JSON — and can
 /// never become unreadable from cache. With neither set, the fallback
 /// [`DEFAULT_MAX_MANIFEST_DECOMPRESSED_BYTES`] applies.
 fn resolve_decompressed_cap(configured: Option<u64>, download_cap: Option<u64>) -> usize {
@@ -866,7 +893,7 @@ fn api_manifest_path(cache_dir: &Path) -> PathBuf {
 /// Reads the cached API manifest from disk using the fallback decompressed-size
 /// cap ([`DEFAULT_MAX_MANIFEST_DECOMPRESSED_BYTES`]).
 ///
-/// The cache is a `zstd` + `bincode`-encoded interned manifest. A corrupt or
+/// The cache is a `zstd` + `postcard`-encoded interned manifest. A corrupt or
 /// truncated file is reported as an error rather than panicking, and the
 /// decompressed size is hard-capped. That cap — not any per-container decode limit
 /// — is what bounds allocation, so a crafted cache planted in a shared cache dir
@@ -890,7 +917,7 @@ async fn get_manifest_from_disk_with_limit(
     return Err(Error::Cache("No cached manifest found".to_string()));
   }
 
-  // The zstd inflate + bincode decode are blocking CPU/IO work, so they run on a
+  // The zstd inflate + postcard decode are blocking CPU/IO work, so they run on a
   // blocking thread rather than stalling the async runtime.
   tokio::task::spawn_blocking(move || decode_cached_manifest(&path, max_decompressed))
     .await
@@ -899,7 +926,7 @@ async fn get_manifest_from_disk_with_limit(
 
 /// Whether a cache dated `local` is still fresh given the server's `network`
 /// last-modified time — i.e. the server has nothing newer than what is cached.
-fn is_fresh(network: DateTime<FixedOffset>, local: DateTime<FixedOffset>) -> bool {
+fn is_fresh(network: OffsetDateTime, local: OffsetDateTime) -> bool {
   network <= local
 }
 
@@ -923,10 +950,9 @@ async fn load_cached_index(index_dir: &Path, max_decompressed: usize) -> Option<
 ///
 /// The decode streams straight from the file with a hard cap on the decompressed
 /// output, so the inflated bytes are never larger than `max_decompressed` before
-/// [`PackageIndex::validate`] (which runs only after a full decode) sees them. The
-/// `bincode` serde deserializer can still expand those bytes into larger `Vec`
-/// backing stores, so it is this decompressed-size cap that ultimately bounds
-/// allocation for a high-ratio file planted in a shared cache dir.
+/// [`PackageIndex::validate`] (which runs only after a full decode) sees them.
+/// Decoding those bytes into tables is then bounded by [`MAX_DECODE_ALLOC`], so a
+/// high-ratio file planted in a shared cache dir cannot exhaust memory.
 fn decode_cached_manifest(path: &Path, max_decompressed: usize) -> Result<PackageIndex> {
   let limit = max_decompressed as u64;
   let file = std::fs::File::open(path)?;
@@ -947,17 +973,7 @@ fn decode_cached_manifest(path: &Path, max_decompressed: usize) -> Result<Packag
     });
   }
 
-  // Native `bincode::Decode` (not the serde bridge): its `with_limit` makes the
-  // decoder claim `len * size_of` up front for every container, so a crafted cache
-  // cannot amplify a small input into a huge allocation — decode fails once the
-  // running total would exceed [`MAX_DECODE_ALLOC`]. That structural ceiling holds
-  // regardless of the (configurable, larger) decompressed-size cap above.
-  let config = bincode::config::standard().with_limit::<MAX_DECODE_ALLOC>();
-  let (serializable, _): (SerializedPackageIndex, usize) =
-    bincode::decode_from_slice(&decompressed_data, config)
-      .map_err(|e| Error::Cache(format!("failed to decode cached manifest: {}", e)))?;
-
-  serializable.try_into()
+  decode_cache(&decompressed_data, MAX_DECODE_ALLOC)?.try_into()
 }
 
 /// Downloads the manifest from the API server.
@@ -971,24 +987,31 @@ async fn get_manifest_from_network(
   max_bytes: Option<u64>,
   retry: &RetryPolicy,
   progress: &dyn ProgressReporter,
-) -> Result<(Vec<Package>, DateTime<FixedOffset>)> {
+) -> Result<(Vec<Package>, OffsetDateTime)> {
   let handle = progress.begin("Downloading Api Manifest", None);
 
   // Retry only the transient network parts; a missing header, oversize body, or
   // JSON parse error is terminal and returns on the first attempt.
   let result = retry_http(retry, || async {
-    let response = http.get(api_url).send().await?.error_for_status()?;
+    let response = http
+      .get(api_url)
+      .send()
+      .await
+      .map_err(Error::http)?
+      .error_for_status()
+      .map_err(Error::http)?;
     let last_modified_str = response
       .headers()
       .get(header::LAST_MODIFIED)
       .ok_or(Error::MissingHeader("Last-Modified".to_string()))?
-      .to_str()?;
-    let last_modified = DateTime::parse_from_rfc2822(last_modified_str)
+      .to_str()
+      .map_err(Error::header)?;
+    let last_modified = OffsetDateTime::parse(last_modified_str, &Rfc2822)
       .map_err(|e| Error::InvalidHeader(format!("invalid Last-Modified header: {}", e)))?;
 
     let raw_response_data = read_capped_body(response, max_bytes).await?;
 
-    let packages: Vec<Package> = serde_json::from_slice(&raw_response_data)?;
+    let packages: Vec<Package> = serde_json::from_slice(&raw_response_data).map_err(Error::json)?;
 
     Ok((packages, last_modified))
   })
@@ -1024,7 +1047,7 @@ async fn read_capped_body(response: reqwest::Response, max_bytes: Option<u64>) -
   let mut body: Vec<u8> = Vec::new();
 
   while let Some(chunk) = stream.next().await {
-    let chunk = chunk?;
+    let chunk = chunk.map_err(Error::http)?;
 
     if let Some(cap) = cap.as_mut() {
       cap.add(chunk.len() as u64)?;
@@ -1037,7 +1060,7 @@ async fn read_capped_body(response: reqwest::Response, max_bytes: Option<u64>) -
 }
 
 /// Interns the packages into a [`PackageIndex`] and encodes the on-disk cache
-/// blob (the serializable view, `bincode`-encoded) in one CPU-bound pass.
+/// blob (the serializable view, `postcard`-encoded) in one CPU-bound pass.
 ///
 /// Pure: no I/O. Runs inside `spawn_blocking` on the caching path, and is
 /// directly unit-testable without a server or temp directory.
@@ -1045,8 +1068,7 @@ fn encode_manifest_cache(packages: Vec<Package>) -> Result<(PackageIndex, Vec<u8
   let manifest: PackageIndex = packages.into();
   let serializable: SerializedPackageIndex = (&manifest).into();
 
-  let binary_data = bincode::encode_to_vec(&serializable, bincode::config::standard())
-    .map_err(|e| Error::Cache(format!("failed to encode manifest cache: {}", e)))?;
+  let binary_data = encode_cache(&serializable)?;
 
   Ok((manifest, binary_data))
 }
@@ -1069,7 +1091,7 @@ async fn get_manifest_from_network_and_cache(
     get_manifest_from_network(http, api_url, max_manifest_bytes, retry, progress).await?;
 
   // Interning every package string, building the serializable view, and the
-  // bincode encode are all CPU-bound, so they run on a blocking thread rather than
+  // postcard encode are all CPU-bound, so they run on a blocking thread rather than
   // stalling the async runtime — mirroring the decode-path offload above.
   let (manifest, binary_data) =
     tokio::task::spawn_blocking(move || encode_manifest_cache(packages))
@@ -1078,17 +1100,23 @@ async fn get_manifest_from_network_and_cache(
 
   write_cache_to_disk(api_manifest_path(cache_dir), &binary_data, true).await?;
 
+  // Best-effort: a leftover legacy file is never read, it only wastes disk.
+  let _ = fs::remove_file(cache_dir.join(LEGACY_API_MANIFEST_FILENAME)).await;
+
   // Only now that the manifest content is durably on disk do we advance the
   // freshness marker. The marker write is best-effort: the manifest is already
   // persisted, so a failure here just leaves a missing/stale marker that triggers
   // a harmless re-fetch on the next call rather than discarding valid cached data.
-  if let Err(err) = write_cache_to_disk(
-    last_modified_path(cache_dir),
-    last_modified_from_network.to_rfc2822().as_bytes(),
-    false,
-  )
-  .await
-  {
+  let marker_written = match last_modified_from_network.format(&Rfc2822) {
+    Ok(marker) => {
+      write_cache_to_disk(last_modified_path(cache_dir), marker.as_bytes(), false).await
+    }
+    Err(err) => Err(Error::Cache(format!(
+      "formatting last_modified marker: {err}"
+    ))),
+  };
+
+  if let Err(err) = marker_written {
     tracing::warn!(
       "Failed to write last_modified marker ({}); cached manifest kept, will re-fetch",
       err
@@ -1099,7 +1127,7 @@ async fn get_manifest_from_network_and_cache(
 }
 
 /// Retrieves the last modified date from the local cache file.
-async fn local_last_modified(cache_dir: &Path) -> Result<DateTime<FixedOffset>> {
+async fn local_last_modified(cache_dir: &Path) -> Result<OffsetDateTime> {
   let path = last_modified_path(cache_dir);
 
   if let Ok(file) = fs::File::open(&path).await {
@@ -1118,7 +1146,7 @@ async fn local_last_modified(cache_dir: &Path) -> Result<DateTime<FixedOffset>> 
 
     let contents = String::from_utf8_lossy(&buf);
 
-    match DateTime::parse_from_rfc2822(contents.trim()) {
+    match OffsetDateTime::parse(contents.trim(), &Rfc2822) {
       Ok(last_modified) => Ok(last_modified),
       Err(err) => {
         tracing::warn!(
@@ -1138,18 +1166,19 @@ async fn local_last_modified(cache_dir: &Path) -> Result<DateTime<FixedOffset>> 
 
 /// The Unix epoch as a fixed-offset timestamp, used as the "unknown / very old"
 /// sentinel for cache freshness so any real server timestamp is newer.
-fn epoch() -> DateTime<FixedOffset> {
-  let dt = DateTime::from_timestamp(0, 0)
-    .expect("timestamp 0 is valid")
-    .naive_utc();
-  let offset = FixedOffset::east_opt(0).expect("zero offset is valid");
-
-  DateTime::<FixedOffset>::from_naive_utc_and_offset(dt, offset)
+fn epoch() -> OffsetDateTime {
+  OffsetDateTime::UNIX_EPOCH
 }
 
 /// Retrieves the last modified date from the API server via a `HEAD` request.
-async fn network_last_modified(http: &Client, api_url: &str) -> Result<DateTime<FixedOffset>> {
-  let response = http.head(api_url).send().await?.error_for_status()?;
+async fn network_last_modified(http: &Client, api_url: &str) -> Result<OffsetDateTime> {
+  let response = http
+    .head(api_url)
+    .send()
+    .await
+    .map_err(Error::http)?
+    .error_for_status()
+    .map_err(Error::http)?;
 
   let last_modified = response
     .headers()
@@ -1157,8 +1186,9 @@ async fn network_last_modified(http: &Client, api_url: &str) -> Result<DateTime<
     .ok_or(Error::MissingHeader(
       "Last-Modified for API manifest head request".to_string(),
     ))?;
-  let last_modified_date = DateTime::parse_from_rfc2822(last_modified.to_str()?)
-    .map_err(|e| Error::InvalidHeader(format!("invalid Last-Modified header: {}", e)))?;
+  let last_modified_date =
+    OffsetDateTime::parse(last_modified.to_str().map_err(Error::header)?, &Rfc2822)
+      .map_err(|e| Error::InvalidHeader(format!("invalid Last-Modified header: {}", e)))?;
 
   Ok(last_modified_date)
 }
@@ -1463,7 +1493,13 @@ async fn download_file(
     // failure re-inc'ing re-downloaded bytes cannot overshoot the total.
     handle.set_position(0);
 
-    let response = client.get(url).send().await?.error_for_status()?;
+    let response = client
+      .get(url)
+      .send()
+      .await
+      .map_err(Error::http)?
+      .error_for_status()
+      .map_err(Error::http)?;
 
     // `Content-Length` is optional: servers using chunked transfer encoding omit
     // it. When present it gives the progress total and a completeness check; when
@@ -1491,7 +1527,7 @@ async fn download_file(
     let mut written: u64 = 0;
 
     while let Some(result) = response_data.next().await {
-      let chunk = result?;
+      let chunk = result.map_err(Error::http)?;
 
       written += chunk.len() as u64;
 
@@ -1715,8 +1751,8 @@ mod tests {
 
   #[test]
   fn is_fresh_compares_last_modified() {
-    let older = DateTime::parse_from_rfc2822("Wed, 21 Feb 2024 15:30:45 +0000").unwrap();
-    let newer = DateTime::parse_from_rfc2822("Thu, 22 Feb 2024 15:30:45 +0000").unwrap();
+    let older = OffsetDateTime::parse("Wed, 21 Feb 2024 15:30:45 +0000", &Rfc2822).unwrap();
+    let newer = OffsetDateTime::parse("Thu, 22 Feb 2024 15:30:45 +0000", &Rfc2822).unwrap();
 
     // Server has nothing newer than the cache => fresh (serve cache).
     assert!(is_fresh(older, older));
@@ -1838,8 +1874,7 @@ mod tests {
     let package = sample_package("TestMod", "TestOwner-TestMod", "TestOwner");
 
     let packages = vec![package];
-    let binary_data =
-      bincode::serde::encode_to_vec(&packages, bincode::config::standard()).unwrap();
+    let binary_data = serde_json::to_vec(&packages).unwrap();
 
     let rt = Runtime::new().unwrap();
     let result = rt.block_on(write_cache_to_disk(&api_manifest_path, &binary_data, true));
@@ -1849,8 +1884,7 @@ mod tests {
 
     let compressed_data = std::fs::read(&api_manifest_path).unwrap();
     let decompressed_data = zstd::decode_all(compressed_data.as_slice()).unwrap();
-    let (decoded, _): (Vec<Package>, usize) =
-      bincode::serde::decode_from_slice(&decompressed_data, bincode::config::standard()).unwrap();
+    let decoded: Vec<Package> = serde_json::from_slice(&decompressed_data).unwrap();
 
     assert_eq!(decoded.len(), 1);
     assert_eq!(decoded[0].full_name, Some("TestOwner-TestMod".to_string()));
@@ -1889,7 +1923,7 @@ mod tests {
     let packages = vec![package];
     let interned_manifest: PackageIndex = packages.into();
     let serializable: SerializedPackageIndex = (&interned_manifest).into();
-    let binary_data = bincode::encode_to_vec(&serializable, bincode::config::standard()).unwrap();
+    let binary_data = encode_cache(&serializable).unwrap();
     let compressed_data = zstd::encode_all(binary_data.as_slice(), 9).unwrap();
     let mut file = File::create(cache_dir.join(API_MANIFEST_FILENAME)).unwrap();
     file.write_all(&compressed_data).unwrap();
@@ -1936,7 +1970,7 @@ mod tests {
 
     assert!(result.is_ok());
     if let Ok(parsed_date) = result {
-      let expected_date = DateTime::parse_from_rfc2822(test_date).unwrap();
+      let expected_date = OffsetDateTime::parse(test_date, &Rfc2822).unwrap();
       assert_eq!(parsed_date, expected_date);
     }
 
@@ -1971,7 +2005,7 @@ mod tests {
     if let Ok((packages, last_modified)) = result {
       assert_eq!(packages.len(), 1);
       assert_eq!(packages[0].full_name, Some("Owner-ModA".to_string()));
-      let expected_date = DateTime::parse_from_rfc2822(test_date).unwrap();
+      let expected_date = OffsetDateTime::parse(test_date, &Rfc2822).unwrap();
       assert_eq!(last_modified, expected_date);
     }
 
@@ -1985,7 +2019,7 @@ mod tests {
     let package = sample_package("CachedMod", "CachedOwner-CachedMod", "CachedOwner");
     let interned_manifest: PackageIndex = vec![package].into();
     let serializable: SerializedPackageIndex = (&interned_manifest).into();
-    let binary_data = bincode::encode_to_vec(&serializable, bincode::config::standard()).unwrap();
+    let binary_data = encode_cache(&serializable).unwrap();
     let compressed_data = zstd::encode_all(binary_data.as_slice(), 9).unwrap();
 
     File::create(index_dir.join(API_MANIFEST_FILENAME))
@@ -2019,8 +2053,8 @@ mod tests {
       .build()
       .unwrap();
 
-    let now = chrono::Utc::now().with_timezone(&chrono::FixedOffset::east_opt(0).unwrap());
-    seed_index_cache(&client.index_cache_dir(), &now.to_rfc2822());
+    let now = OffsetDateTime::now_utc();
+    seed_index_cache(&client.index_cache_dir(), &now.format(&Rfc2822).unwrap());
 
     let rt = Runtime::new().unwrap();
     let manifest = rt.block_on(client.get_manifest()).unwrap();
@@ -2307,8 +2341,8 @@ mod tests {
       .unwrap();
 
     // A fresh cache is seeded that would otherwise be served; refresh ignores it.
-    let now = chrono::Utc::now().with_timezone(&chrono::FixedOffset::east_opt(0).unwrap());
-    seed_index_cache(&client.index_cache_dir(), &now.to_rfc2822());
+    let now = OffsetDateTime::now_utc();
+    seed_index_cache(&client.index_cache_dir(), &now.format(&Rfc2822).unwrap());
 
     let rt = Runtime::new().unwrap();
     let manifest = rt.block_on(client.refresh_index()).unwrap();
@@ -2476,7 +2510,7 @@ mod tests {
     let interned: PackageIndex = vec![sample_package("X", "O-X", "O")].into();
     let mut serializable: SerializedPackageIndex = (&interned).into();
     serializable.format_version = 99;
-    let binary_data = bincode::encode_to_vec(&serializable, bincode::config::standard()).unwrap();
+    let binary_data = encode_cache(&serializable).unwrap();
     let compressed = zstd::encode_all(binary_data.as_slice(), 9).unwrap();
 
     File::create(index_dir.join(API_MANIFEST_FILENAME))
@@ -2484,17 +2518,135 @@ mod tests {
       .write_all(&compressed)
       .unwrap();
 
-    let now = chrono::Utc::now().with_timezone(&chrono::FixedOffset::east_opt(0).unwrap());
+    let now = OffsetDateTime::now_utc();
 
     File::create(index_dir.join(LAST_MODIFIED_FILENAME))
       .unwrap()
-      .write_all(now.to_rfc2822().as_bytes())
+      .write_all(now.format(&Rfc2822).unwrap().as_bytes())
       .unwrap();
 
     let rt = Runtime::new().unwrap();
     let manifest = rt.block_on(client.get_manifest()).unwrap();
 
     // The network copy (Owner-ModA) replaced the unreadable cache.
+    assert_eq!(
+      manifest.resolve_full_name_at(0),
+      Some("Owner-ModA".to_string())
+    );
+
+    head.assert();
+    get.assert();
+  }
+
+  /// A version-2 bincode cache as 0.4 wrote it: a zstd frame whose first byte
+  /// is the format version.
+  fn write_legacy_bincode_cache(index_dir: &Path) {
+    std::fs::create_dir_all(index_dir).unwrap();
+    std::fs::write(
+      index_dir.join(LEGACY_API_MANIFEST_FILENAME),
+      zstd::encode_all(&[2u8, 1, 0, 0][..], 9).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+      index_dir.join(LAST_MODIFIED_FILENAME),
+      OffsetDateTime::now_utc().format(&Rfc2822).unwrap(),
+    )
+    .unwrap();
+  }
+
+  #[test]
+  fn test_get_manifest_replaces_a_legacy_bincode_cache() {
+    let mut server = Server::new();
+    let temp_dir = tempdir().unwrap();
+    let head = server.mock("HEAD", "/pkg/").expect(0).create();
+    let get = server
+      .mock("GET", "/pkg/")
+      .with_status(200)
+      .with_header("Content-Type", "application/json")
+      .with_header("Last-Modified", "Wed, 21 Feb 2024 15:30:45 GMT")
+      .with_body(sample_manifest_json())
+      .create();
+
+    let client = ThunderstoreClient::builder()
+      .package_index_url(format!("{}/pkg/", server.url()))
+      .cache_dir(temp_dir.path())
+      .build()
+      .unwrap();
+    let index_dir = client.index_cache_dir();
+
+    write_legacy_bincode_cache(&index_dir);
+
+    let rt = Runtime::new().unwrap();
+    let manifest = rt.block_on(client.get_manifest()).unwrap();
+
+    assert_eq!(
+      manifest.resolve_full_name_at(0),
+      Some("Owner-ModA".to_string())
+    );
+    assert!(!index_dir.join(LEGACY_API_MANIFEST_FILENAME).exists());
+    assert!(api_manifest_path(&index_dir).exists());
+
+    head.assert();
+    get.assert();
+  }
+
+  #[test]
+  fn cached_index_treats_a_legacy_bincode_cache_as_missing() {
+    let temp_dir = tempdir().unwrap();
+
+    let client = ThunderstoreClient::builder()
+      .package_index_url("http://127.0.0.1:9/pkg/")
+      .cache_dir(temp_dir.path())
+      .build()
+      .unwrap();
+
+    write_legacy_bincode_cache(&client.index_cache_dir());
+
+    let rt = Runtime::new().unwrap();
+
+    assert!(rt.block_on(client.cached_index()).unwrap().is_none());
+  }
+
+  #[test]
+  fn test_get_manifest_rebuilds_a_garbage_cache() {
+    let mut server = Server::new();
+    let temp_dir = tempdir().unwrap();
+    let test_date = "Wed, 21 Feb 2024 15:30:45 GMT";
+    let head = server
+      .mock("HEAD", "/pkg/")
+      .with_status(200)
+      .with_header("Last-Modified", test_date)
+      .create();
+    let get = server
+      .mock("GET", "/pkg/")
+      .with_status(200)
+      .with_header("Content-Type", "application/json")
+      .with_header("Last-Modified", test_date)
+      .with_body(sample_manifest_json())
+      .create();
+
+    let client = ThunderstoreClient::builder()
+      .package_index_url(format!("{}/pkg/", server.url()))
+      .cache_dir(temp_dir.path())
+      .build()
+      .unwrap();
+    let index_dir = client.index_cache_dir();
+
+    std::fs::create_dir_all(&index_dir).unwrap();
+    std::fs::write(
+      api_manifest_path(&index_dir),
+      zstd::encode_all(&b"not a postcard cache"[..], 9).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+      index_dir.join(LAST_MODIFIED_FILENAME),
+      OffsetDateTime::now_utc().format(&Rfc2822).unwrap(),
+    )
+    .unwrap();
+
+    let rt = Runtime::new().unwrap();
+    let manifest = rt.block_on(client.get_manifest()).unwrap();
+
     assert_eq!(
       manifest.resolve_full_name_at(0),
       Some("Owner-ModA".to_string())
@@ -2587,7 +2739,7 @@ mod tests {
 
     let interned: PackageIndex = vec![sample_package("X", "O-X", "O")].into();
     let serializable: SerializedPackageIndex = (&interned).into();
-    let binary_data = bincode::encode_to_vec(&serializable, bincode::config::standard()).unwrap();
+    let binary_data = encode_cache(&serializable).unwrap();
     let compressed = zstd::encode_all(binary_data.as_slice(), 9).unwrap();
 
     File::create(cache_dir.join(API_MANIFEST_FILENAME))
@@ -2665,7 +2817,7 @@ mod tests {
 
     let interned: PackageIndex = packages.into();
     let serializable: SerializedPackageIndex = (&interned).into();
-    let binary_data = bincode::encode_to_vec(&serializable, bincode::config::standard()).unwrap();
+    let binary_data = encode_cache(&serializable).unwrap();
     let decompressed_len = binary_data.len();
     let compressed = zstd::encode_all(binary_data.as_slice(), 9).unwrap();
 
