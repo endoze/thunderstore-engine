@@ -16,7 +16,6 @@ keywords = ["thunderstore", "mod", "manager", "bepinex", "modding"]
 exclude = [
   ".github/",
   "dist-workspace.toml",
-  "cliff.toml",
   "tarpaulin.toml",
   "rustfmt.toml",
   "deny.toml",

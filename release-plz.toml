@@ -1,5 +1,4 @@
 [workspace]
-changelog_config = "cliff.toml"
 changelog_update = true
 # Dependabot (with a cooldown) owns dependency updates; release PRs only release.
 dependencies_update = false
@@ -10,3 +9,16 @@ pr_labels = ["release"]
 allow_dirty = false
 publish_allow_dirty = false
 semver_check = false
+
+[changelog]
+# release-plz's default parsers, plus skips for Dependabot's grouped bumps.
+commit_parsers = [
+  { message = "^chore\\(deps\\)", skip = true },
+  { message = "^ci\\(deps\\)", skip = true },
+  { message = "^feat", group = "added" },
+  { message = "^changed", group = "changed" },
+  { message = "^deprecated", group = "deprecated" },
+  { message = "^fix", group = "fixed" },
+  { message = "^security", group = "security" },
+  { message = "^.*", group = "other" },
+]
