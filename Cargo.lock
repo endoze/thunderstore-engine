@@ -1855,7 +1855,7 @@ dependencies = [
 
 [[package]]
 name = "thunderstore-engine"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "base64",
  "crc32fast",
