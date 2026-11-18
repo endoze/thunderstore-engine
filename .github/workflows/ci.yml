@@ -34,6 +34,9 @@ jobs:
       # Not --all-features: that turns on both TLS backends, which src/lib.rs rejects.
       - name: Clippy
         run: cargo clippy --all-targets --features test-support --locked -- -D warnings
+      # Builds the crate as published; some cargo warnings only appear there.
+      - name: Verify package
+        run: cargo package --locked
 
   msrv:
     name: Minimum Rust version
